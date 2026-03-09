@@ -532,6 +532,9 @@ impl<'a> Parser<'a> {
         match token {
             Token::String(value) => Ok(sdf::Value::String(value.to_owned())),
             Token::Identifier(value) | Token::NamespacedIdentifier(value) => Ok(sdf::Value::Token(value.to_owned())),
+            Token::AssetRef(value) => Ok(sdf::Value::AssetPath(value.to_owned())),
+            Token::PathRef(value) => Ok(sdf::Value::Token(value.to_owned())),
+            Token::None => Ok(sdf::Value::Token("None".to_owned())),
             Token::Number(raw) => {
                 if let Ok(int) = raw.parse::<i64>() {
                     Ok(sdf::Value::Int64(int))
@@ -783,6 +786,14 @@ impl<'a> Parser<'a> {
                 ensure!(list_op.is_none(), "doc metadata does not support list ops");
                 let value = self.parse_token::<String>().context("Unable to parse doc metadata")?;
                 spec.add(FieldKey::Documentation, sdf::Value::String(value));
+            }
+            n if n == FieldKey::Payload.as_str() => {
+                // Payload is like references — parse as reference list
+                let references = self.parse_reference_list().context("Unable to parse payload")?;
+                let list_op = self
+                    .apply_list_op(list_op, references)
+                    .context("Unable to build payload listOp")?;
+                spec.add(FieldKey::Payload, sdf::Value::ReferenceListOp(list_op));
             }
             _other => {
                 // Skip unknown prim metadata — consume the value to continue parsing
