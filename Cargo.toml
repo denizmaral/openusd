@@ -9,6 +9,9 @@ description = "Rust native USD library"
 categories = ["graphics", "rendering", "rendering::data-formats"]
 keywords = ["usd", "usda", "usdc", "usdz", "pxr"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 anyhow = "1.0.79"
 bytemuck = { version = "1.14.0", features = ["derive"] }
@@ -18,3 +21,11 @@ num-traits = "0.2.17"
 half = { version = "2.3.1", features = ["bytemuck", "num-traits"] }
 logos = "0.16.0"
 zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+js-sys = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true

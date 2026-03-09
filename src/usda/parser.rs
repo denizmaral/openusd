@@ -784,7 +784,12 @@ impl<'a> Parser<'a> {
                 let value = self.parse_token::<String>().context("Unable to parse doc metadata")?;
                 spec.add(FieldKey::Documentation, sdf::Value::String(value));
             }
-            other => bail!("Unsupported prim metadata: {other}"),
+            _other => {
+                // Skip unknown prim metadata — consume the value to continue parsing
+                let _value = self
+                    .parse_property_metadata_value()
+                    .context("Unable to skip unknown prim metadata value")?;
+            }
         }
 
         Ok(())
