@@ -33,6 +33,11 @@ impl<R> CrateData<R>
 where
     R: io::Read + io::Seek,
 {
+    /// Return all paths stored in this crate.
+    pub fn all_paths(&self) -> Vec<sdf::Path> {
+        self.data.keys().cloned().collect()
+    }
+
     /// Read binary data from any reader.
     pub fn open(reader: R, safe: bool) -> Result<Self> {
         let mut file = CrateFile::open(reader)?;

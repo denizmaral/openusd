@@ -15,36 +15,36 @@ use crate::usda;
 use crate::usdc;
 
 #[derive(Serialize)]
-struct MeshData {
-    name: String,
-    points: Vec<f32>,       // flat [x,y,z, x,y,z, ...]
-    indices: Vec<i32>,       // triangle indices
+pub struct MeshData {
+    pub name: String,
+    pub points: Vec<f32>,       // flat [x,y,z, x,y,z, ...]
+    pub indices: Vec<i32>,       // triangle indices
     #[serde(skip_serializing_if = "Option::is_none")]
-    display_color: Option<[f32; 3]>,
-    double_sided: bool,
+    pub display_color: Option<[f32; 3]>,
+    pub double_sided: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    transform: Option<Vec<f64>>, // 4x4 matrix, 16 elements
+    pub transform: Option<Vec<f64>>, // 4x4 matrix, 16 elements
     #[serde(skip_serializing_if = "Option::is_none")]
-    diffuse_texture: Option<String>,
+    pub diffuse_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    normal_texture: Option<String>,
+    pub normal_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mr_texture: Option<String>,       // metallic-roughness combined
+    pub mr_texture: Option<String>,       // metallic-roughness combined
     #[serde(skip_serializing_if = "Option::is_none")]
-    emissive_texture: Option<String>,
+    pub emissive_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    occlusion_texture: Option<String>,
+    pub occlusion_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    texcoords: Option<Vec<f32>>, // flat [u,v, u,v, ...] UV coordinates
+    pub texcoords: Option<Vec<f32>>, // flat [u,v, u,v, ...] UV coordinates
 }
 
 #[derive(Serialize)]
-struct ParseResult {
-    meshes: Vec<MeshData>,
-    up_axis: String,
-    meters_per_unit: f64,
+pub struct ParseResult {
+    pub meshes: Vec<MeshData>,
+    pub up_axis: String,
+    pub meters_per_unit: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Parse USD binary (USDC) or text (USDA) file bytes and extract mesh data.
@@ -70,7 +70,7 @@ pub fn parse_usd_meshes(data: &[u8]) -> String {
     }
 }
 
-fn parse_usd_meshes_inner(data: &[u8]) -> Result<ParseResult> {
+pub fn parse_usd_meshes_inner(data: &[u8]) -> Result<ParseResult> {
     // Detect format: USDC binary starts with "PXR-USDC", USDA is text
     let is_usdc = data.len() >= 8 && &data[0..8] == b"PXR-USDC";
 
@@ -154,6 +154,28 @@ fn walk_prims(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Recurse into variant sets (selected variants only)
+    // Variant paths in USDC are stored as: /Prim/{variantSet=selection}
+    let variant_selection = get_variant_selection(data, path);
+    let variant_set_children = get_token_vec_field(data, path, "variantSetChildren")
+        .unwrap_or_default();
+    for vs_name in &variant_set_children {
+        if let Some(selected) = variant_selection.get(vs_name) {
+            let variant_path_str = format!("{}/{{{}={}}}", path, vs_name, selected);
+            if let Ok(variant_path) = sdf::path(&variant_path_str) {
+                // The variant prim acts as an invisible scope — walk its children
+                let vc = get_token_vec_field(data, &variant_path, "primChildren")
+                    .unwrap_or_default();
+                for vc_name in &vc {
+                    let vc_path_str = format!("{}/{}", variant_path, vc_name);
+                    if let Ok(vc_path) = sdf::path(&vc_path_str) {
+                        walk_prims(data, &vc_path, &vc_name, world_transform.as_ref(), meshes);
+                    }
+                }
+            }
         }
     }
 
@@ -1144,6 +1166,14 @@ fn multiply_4x4(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
 
 // Helper functions for reading common field types
 
+fn get_variant_selection(data: &mut dyn AbstractData, path: &sdf::Path) -> std::collections::HashMap<String, String> {
+    let value = data.get(path, "variantSelection").ok();
+    match value.map(|v| v.into_owned()) {
+        Some(Value::VariantSelectionMap(m)) => m,
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 fn get_string_field(data: &mut dyn AbstractData, path: &sdf::Path, field: &str) -> Option<String> {
     let value = data.get(path, field).ok()?;
     match value.into_owned() {
@@ -1381,5 +1411,76 @@ mod tests {
 
         println!("\n========== Summary: {} OK, {} errors out of {} files ==========\n",
             total_ok, total_err, files.len());
+    }
+
+    #[test]
+    fn test_parse_threejs_usdz_multi_file() {
+        // Three.js USDZExporter creates USDZ with separate geometry files:
+        //   model.usda (scene hierarchy with references)
+        //   geometries/Geometry_NNN.usd (actual mesh data)
+        //   textures/Texture_NNN.png (texture images)
+        // The WASM parser processes one file at a time, so the JS side must
+        // resolve references. This test verifies that individual geometry files
+        // inside a Three.js USDZ parse correctly.
+        let path = "C:/Users/mad/Downloads/Lantern.glb.three.usdz";
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("SKIP: {} not found: {}", path, e);
+                return;
+            }
+        };
+
+        let cursor = std::io::Cursor::new(&data);
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+
+        let mut geometry_files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut root_usda: Option<String> = None;
+
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            println!("  USDZ entry: {} (size={})", name, f.size());
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+            if name == "model.usda" || (name.ends_with(".usda") && root_usda.is_none()) {
+                root_usda = Some(String::from_utf8_lossy(&buf).to_string());
+            }
+            if name.starts_with("geometries/") && (name.ends_with(".usd") || name.ends_with(".usda")) {
+                geometry_files.push((name, buf));
+            }
+        }
+
+        // Verify root USDA has references but no meshes
+        let root = root_usda.expect("No root USDA found in USDZ");
+        assert!(root.contains("prepend references"), "Root USDA should have references");
+        let root_result = parse_usd_meshes_inner(root.as_bytes()).unwrap();
+        println!("Root USDA: meshes={} error={:?}", root_result.meshes.len(), root_result.error);
+        assert_eq!(root_result.meshes.len(), 0,
+            "Root USDA should have 0 meshes (geometry is in referenced files)");
+
+        // Parse each geometry file individually
+        assert!(!geometry_files.is_empty(), "Expected geometry files in USDZ");
+        println!("\nParsing {} geometry files:", geometry_files.len());
+
+        let mut total_meshes = 0;
+        for (name, buf) in &geometry_files {
+            let result = parse_usd_meshes_inner(buf).unwrap();
+            println!("  {}: meshes={} error={:?}", name, result.meshes.len(), result.error);
+            assert!(result.error.is_none(), "Parse error for {}: {:?}", name, result.error);
+            assert!(result.meshes.len() > 0, "Expected meshes in {}", name);
+            for m in &result.meshes {
+                println!("    mesh: {} pts={} idx={} uv={}",
+                    m.name, m.points.len()/3, m.indices.len(),
+                    m.texcoords.as_ref().map(|t| t.len()/2).unwrap_or(0));
+                assert!(m.points.len() >= 9, "Mesh should have at least 3 vertices");
+                assert!(m.indices.len() >= 3, "Mesh should have at least 1 triangle");
+            }
+            total_meshes += result.meshes.len();
+        }
+
+        println!("\nTotal: {} geometry files, {} meshes", geometry_files.len(), total_meshes);
+        assert_eq!(geometry_files.len(), 3, "Expected 3 geometry files (Body, Chain, Lantern)");
+        assert_eq!(total_meshes, 3, "Expected 3 meshes total");
     }
 }
