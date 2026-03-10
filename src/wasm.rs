@@ -25,7 +25,15 @@ struct MeshData {
     #[serde(skip_serializing_if = "Option::is_none")]
     transform: Option<Vec<f64>>, // 4x4 matrix, 16 elements
     #[serde(skip_serializing_if = "Option::is_none")]
-    diffuse_texture: Option<String>, // texture asset path for diffuse color
+    diffuse_texture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normal_texture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mr_texture: Option<String>,       // metallic-roughness combined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emissive_texture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occlusion_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     texcoords: Option<Vec<f32>>, // flat [u,v, u,v, ...] UV coordinates
 }
@@ -227,8 +235,8 @@ fn extract_mesh(
         })
         .unwrap_or(false);
 
-    // Read material binding to find diffuse texture
-    let diffuse_texture = read_material_texture(data, path);
+    // Read material binding to find all textures
+    let mat_textures = read_material_textures(data, path);
 
     // Check if this is a skinned mesh (has skel:skeleton binding)
     let is_skinned = path.append_property("skel:skeleton").ok()
@@ -264,7 +272,11 @@ fn extract_mesh(
         display_color,
         double_sided,
         transform: None,
-        diffuse_texture,
+        diffuse_texture: mat_textures.diffuse,
+        normal_texture: mat_textures.normal,
+        mr_texture: mat_textures.mr,
+        emissive_texture: mat_textures.emissive,
+        occlusion_texture: mat_textures.occlusion,
         texcoords: final_texcoords,
     })
 }
@@ -394,12 +406,60 @@ fn expand_face_varying(
     (new_points, new_indices, Some(new_uvs))
 }
 
-/// Follow material:binding → material → PreviewSurface → diffuseColor texture.
-/// Only returns textures connected to inputs:diffuseColor, not normal maps etc.
-fn read_material_texture(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<String> {
-    // Read material:binding relationship target
-    let binding_path = prim_path.append_property("material:binding").ok()?;
-    let target_value = data.get(&binding_path, "targetPaths").ok()?;
+#[derive(Default)]
+struct MaterialTextures {
+    diffuse: Option<String>,
+    normal: Option<String>,
+    mr: Option<String>,        // metallic-roughness (often packed)
+    emissive: Option<String>,
+    occlusion: Option<String>,
+}
+
+/// Follow a connection from a PreviewSurface input to the connected texture's inputs:file.
+fn follow_connection(data: &mut dyn AbstractData, shader_path: &sdf::Path, input_name: &str) -> Option<String> {
+    // USDC convention: connectionPaths on the property itself
+    let conn_val = shader_path.append_property(input_name).ok()
+        .and_then(|p| data.get(&p, "connectionPaths").ok());
+    // USDA convention: connectionPaths on "input_name.connect"
+    let conn_val = if conn_val.is_none() {
+        let connect_name = format!("{}.connect", input_name);
+        shader_path.append_property(&connect_name).ok()
+            .and_then(|p| data.get(&p, "connectionPaths").ok())
+    } else {
+        conn_val
+    };
+    let conn_val = conn_val?;
+    if let Value::PathListOp(list_op) = conn_val.into_owned() {
+        let items = if !list_op.explicit_items.is_empty() {
+            list_op.explicit_items
+        } else if !list_op.prepended_items.is_empty() {
+            list_op.prepended_items
+        } else {
+            return None;
+        };
+        if let Some(target) = items.first() {
+            let target_str = target.as_str();
+            let prim_part = target_str.split('.').next().unwrap_or(target_str);
+            if let Ok(tex_prim_path) = sdf::path(prim_part) {
+                return read_asset_path(data, &tex_prim_path, "inputs:file");
+            }
+        }
+    }
+    None
+}
+
+/// Follow material:binding → material → PreviewSurface → all texture channels.
+fn read_material_textures(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> MaterialTextures {
+    let mut result = MaterialTextures::default();
+
+    let binding_path = match prim_path.append_property("material:binding").ok() {
+        Some(p) => p,
+        None => return result,
+    };
+    let target_value = match data.get(&binding_path, "targetPaths").ok() {
+        Some(v) => v,
+        None => return result,
+    };
     let material_path_str = match target_value.into_owned() {
         Value::PathListOp(list_op) => {
             let items = if !list_op.explicit_items.is_empty() {
@@ -407,22 +467,25 @@ fn read_material_texture(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> 
             } else if !list_op.prepended_items.is_empty() {
                 list_op.prepended_items
             } else {
-                return None;
+                return result;
             };
-            items.first()?.as_str().to_string()
+            match items.first() {
+                Some(p) => p.as_str().to_string(),
+                None => return result,
+            }
         }
-        _ => return None,
+        _ => return result,
     };
 
-    let mat_path = sdf::path(&material_path_str).ok()?;
+    let mat_path = match sdf::path(&material_path_str).ok() {
+        Some(p) => p,
+        None => return result,
+    };
 
-    // Find shader children of the material
     let shader_children = get_token_vec_field(data, &mat_path, "primChildren")
         .unwrap_or_default();
 
-    // First pass: find the UsdPreviewSurface shader and check if diffuseColor is connected
-    let mut diffuse_texture_path: Option<String> = None;
-
+    // Find the UsdPreviewSurface and read all texture connections
     for shader_name in &shader_children {
         let shader_path_str = format!("{}/{}", mat_path, shader_name);
         let shader_path = match sdf::path(&shader_path_str) {
@@ -430,57 +493,35 @@ fn read_material_texture(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> 
             Err(_) => continue,
         };
 
-        // Check if this is a UsdPreviewSurface
         let info_id = read_token_prop(data, &shader_path, "info:id");
         if info_id.as_deref() == Some("UsdPreviewSurface") {
-            // Check if inputs:diffuseColor has a connection
-            if let Ok(dc_path) = shader_path.append_property("inputs:diffuseColor") {
-                if let Ok(conn_val) = data.get(&dc_path, "connectionPaths") {
-                    // Has a connection — extract the target path
-                    if let Value::PathListOp(list_op) = conn_val.into_owned() {
-                        let items = if !list_op.explicit_items.is_empty() {
-                            list_op.explicit_items
-                        } else if !list_op.prepended_items.is_empty() {
-                            list_op.prepended_items
-                        } else {
-                            continue;
-                        };
-                        if let Some(target) = items.first() {
-                            // Target is like /Material/DiffuseTexture.outputs:rgb
-                            // Extract the prim path (before the dot)
-                            let target_str = target.as_str();
-                            let prim_part = target_str.split('.').next().unwrap_or(target_str);
-                            if let Ok(tex_prim_path) = sdf::path(prim_part) {
-                                diffuse_texture_path = read_asset_path(data, &tex_prim_path, "inputs:file");
-                            }
-                        }
-                    }
-                }
-            }
-            // If no connection, diffuseColor is a plain color — no texture
+            result.diffuse = follow_connection(data, &shader_path, "inputs:diffuseColor");
+            result.normal = follow_connection(data, &shader_path, "inputs:normal");
+            result.emissive = follow_connection(data, &shader_path, "inputs:emissiveColor");
+            result.occlusion = follow_connection(data, &shader_path, "inputs:occlusion");
+            // Metallic and roughness are often packed in one texture
+            result.mr = follow_connection(data, &shader_path, "inputs:metallic")
+                .or_else(|| follow_connection(data, &shader_path, "inputs:roughness"));
             break;
         }
     }
 
-    if diffuse_texture_path.is_some() {
-        return diffuse_texture_path;
-    }
-
-    // Fallback: return any texture found in shader children.
-    // For visualization, showing any texture (even normal maps) is better than none.
-    for shader_name in &shader_children {
-        let shader_path_str = format!("{}/{}", mat_path, shader_name);
-        let shader_path = match sdf::path(&shader_path_str) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        if let Some(tex) = read_asset_path(data, &shader_path, "inputs:file") {
-            return Some(tex);
+    // Fallback: if no diffuse found, try any texture in shader children
+    if result.diffuse.is_none() {
+        for shader_name in &shader_children {
+            let shader_path_str = format!("{}/{}", mat_path, shader_name);
+            let shader_path = match sdf::path(&shader_path_str) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(tex) = read_asset_path(data, &shader_path, "inputs:file") {
+                result.diffuse = Some(tex);
+                break;
+            }
         }
     }
 
-    None
+    result
 }
 
 /// Read a token/string property (like info:id) from a prim.
@@ -869,6 +910,10 @@ fn extract_parametric(
         double_sided,
         transform: None,
         diffuse_texture: None,
+        normal_texture: None,
+        mr_texture: None,
+        emissive_texture: None,
+        occlusion_texture: None,
         texcoords: None,
     })
 }
@@ -1195,7 +1240,7 @@ mod tests {
         // USDZ is a zip-like archive; parse_usd_meshes_inner expects raw USDC/USDA data.
         // We need to extract the USDC from the USDZ first.
         // USDZ is an uncompressed zip; the first file is usually the USDC.
-        let result = parse_usd_meshes_inner(&data);
+        let _result = parse_usd_meshes_inner(&data);
         // USDZ won't parse directly — the JS extracts the USDC first.
         // Let's manually find the USDC in the zip.
         let cursor = std::io::Cursor::new(&data);
@@ -1223,6 +1268,37 @@ mod tests {
         // Check texture is found
         let has_texture = result.meshes.iter().any(|m| m.diffuse_texture.is_some());
         assert!(has_texture, "Expected at least one mesh with a diffuse texture");
+    }
+
+    #[test]
+    fn test_parse_damaged_helmet_usdz() {
+        let data = std::fs::read(
+            "C:/Users/mad/Documents/GitHub/assets/test_assets/USDZ/DamagedHelmet/DamagedHelmet.usdz"
+        ).unwrap();
+        let cursor = std::io::Cursor::new(&data);
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+        let mut scene_data = None;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            if name.ends_with(".usdc") || name.ends_with(".usd") || name.ends_with(".usda") {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+                scene_data = Some(buf);
+                break;
+            }
+        }
+        let scene_data = scene_data.expect("No USD scene found in USDZ");
+        let result = parse_usd_meshes_inner(&scene_data).unwrap();
+        let m = &result.meshes[0];
+        println!("diffuse={:?} normal={:?} mr={:?} emissive={:?} ao={:?}",
+            m.diffuse_texture, m.normal_texture, m.mr_texture,
+            m.emissive_texture, m.occlusion_texture);
+        assert!(m.diffuse_texture.as_deref().unwrap().contains("albedo"));
+        assert!(m.normal_texture.as_deref().unwrap().contains("normal"));
+        assert!(m.mr_texture.as_deref().unwrap().contains("metalRoughness"));
+        assert!(m.emissive_texture.as_deref().unwrap().contains("emissive"));
+        assert!(m.occlusion_texture.as_deref().unwrap().contains("AO"));
     }
 
     #[test]
