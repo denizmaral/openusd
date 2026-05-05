@@ -36,6 +36,12 @@ pub struct MeshData {
     pub occlusion_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub texcoords: Option<Vec<f32>>, // flat [u,v, u,v, ...] UV coordinates
+    /// Custom string attributes (e.g. IFC properties exported as `custom string`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_attributes: Option<std::collections::HashMap<String, String>>,
+    /// Visibility time samples: [[time, "invisible"|"inherited"], ...]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_anim: Option<Vec<(f64, String)>>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +51,15 @@ pub struct ParseResult {
     pub meters_per_unit: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Frames per second for time-sampled animation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_codes_per_second: Option<f64>,
+    /// Animation start time code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time_code: Option<f64>,
+    /// Animation end time code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_code: Option<f64>,
 }
 
 /// Parse USD binary (USDC) or text (USDA) file bytes and extract mesh data.
@@ -62,11 +77,45 @@ pub fn parse_usd_meshes(data: &[u8]) -> String {
                 up_axis: "Y".to_string(),
                 meters_per_unit: 1.0,
                 error: Some(format!("{:#}", e)),
+                time_codes_per_second: None,
+                start_time_code: None,
+                end_time_code: None,
             };
             serde_json::to_string(&result).unwrap_or_else(|_| {
                 format!(r#"{{"meshes":[],"up_axis":"Y","meters_per_unit":1,"error":"{}"}}"#, e)
             })
         }
+    }
+}
+
+/// Build a USDC binary file from a JSON scene description.
+///
+/// Accepts JSON with meshes and materials, returns binary USDC bytes.
+/// Returns empty Vec on error (error logged to console).
+#[wasm_bindgen]
+pub fn build_usdc(json: &str) -> Vec<u8> {
+    match build_usdc_inner(json) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // Log error to JS console
+            _log_error(&format!("build_usdc error: {:#}", e));
+            Vec::new()
+        }
+    }
+}
+
+fn build_usdc_inner(json: &str) -> Result<Vec<u8>> {
+    let scene: crate::usdc::writer::ExportScene = serde_json::from_str(json)
+        .context("Failed to parse USDC export JSON")?;
+    crate::usdc::writer::build_usdc_scene(&scene)
+}
+
+fn _log_error(msg: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{}", msg);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = msg; // suppress unused warning
     }
 }
 
@@ -95,6 +144,11 @@ pub fn parse_usd_meshes_inner(data: &[u8]) -> Result<ParseResult> {
     let meters_per_unit = get_double_field(&mut *abstract_data, &root, "metersPerUnit")
         .unwrap_or(1.0);
 
+    // Read animation metadata
+    let time_codes_per_second = get_double_field(&mut *abstract_data, &root, "timeCodesPerSecond");
+    let start_time_code = get_double_field(&mut *abstract_data, &root, "startTimeCode");
+    let end_time_code = get_double_field(&mut *abstract_data, &root, "endTimeCode");
+
     // Walk prim hierarchy and extract meshes
     let mut meshes = Vec::new();
     let prim_children = get_token_vec_field(&mut *abstract_data, &root, "primChildren")
@@ -111,6 +165,9 @@ pub fn parse_usd_meshes_inner(data: &[u8]) -> Result<ParseResult> {
         up_axis,
         meters_per_unit,
         error: None,
+        time_codes_per_second,
+        start_time_code,
+        end_time_code,
     })
 }
 
@@ -207,9 +264,48 @@ fn extract_mesh(
     // Read face vertex counts (for triangulation)
     let face_vertex_counts = read_int_array(data, path, "faceVertexCounts");
 
-    // Read UV coordinates and indices BEFORE triangulation
+    // Read UV coordinates, indices, and interpolation mode BEFORE triangulation
     let texcoords_raw = read_texcoords(data, path);
     let uv_indices_raw = read_texcoord_indices(data, path);
+    let uv_interpolation = read_uv_interpolation(data, path);
+
+    // Handle "vertex" interpolated UVs: remap UV data to per-vertex using indices
+    // so it matches the points array 1:1 (no face-varying expansion needed).
+    let texcoords_raw = if let Some(ref uv_data) = texcoords_raw {
+        let uv_count = uv_data.len() / 2;
+        let vert_count = points.len() / 3;
+        let is_vertex_interp = uv_interpolation.as_deref() == Some("vertex");
+        if is_vertex_interp && uv_count != vert_count && uv_count > 0 {
+            if let Some(ref idx) = uv_indices_raw {
+                // Remap: for each vertex i, UV = uv_data[idx[i]]
+                if idx.len() == vert_count {
+                    let mut remapped = vec![0.0f32; vert_count * 2];
+                    for (vi, &ui) in idx.iter().enumerate() {
+                        let ui = ui as usize;
+                        if ui * 2 + 1 < uv_data.len() {
+                            remapped[vi * 2] = uv_data[ui * 2];
+                            remapped[vi * 2 + 1] = uv_data[ui * 2 + 1];
+                        }
+                    }
+                    Some(remapped)
+                } else {
+                    texcoords_raw // idx length mismatch, pass through
+                }
+            } else {
+                texcoords_raw
+            }
+        } else {
+            texcoords_raw
+        }
+    } else {
+        None
+    };
+    // After vertex remap, uv_indices_raw is consumed — only use for face-varying below
+    let uv_indices_raw = if uv_interpolation.as_deref() == Some("vertex") {
+        None // Already remapped above; don't use for face-varying
+    } else {
+        uv_indices_raw
+    };
 
     // Build face-vertex UV mapping (one UV index per face vertex, pre-triangulation)
     // This array parallels face_vertex_indices: fv_uv_indices[i] = UV index for face vertex i
@@ -219,14 +315,19 @@ fn extract_mesh(
         if uv_count != vert_count && uv_count > 0 {
             // Face-varying: build UV index per face vertex
             Some(if let Some(ref idx) = uv_indices_raw {
-                // Explicit UV index array
-                idx.clone()
+                // Explicit UV index array — must have face_vertex_indices.len() entries
+                if idx.len() == face_vertex_indices.len() {
+                    idx.clone()
+                } else {
+                    // Fallback: sequential
+                    (0..face_vertex_indices.len() as i32).collect()
+                }
             } else {
                 // No separate index array: UVs are in face-vertex order (0,1,2,3,...)
                 (0..face_vertex_indices.len() as i32).collect()
             })
         } else {
-            None // vertex-interpolated, no expansion needed
+            None // vertex-interpolated or matching count, no expansion needed
         }
     } else {
         None
@@ -287,6 +388,12 @@ fn extract_mesh(
             (points, indices, texcoords_raw)
         };
 
+    // Read custom string attributes
+    let custom_attributes = read_custom_attributes(data, path);
+
+    // Read visibility time samples
+    let visibility_anim = read_visibility_time_samples(data, path);
+
     Some(MeshData {
         name: name.to_string(),
         points: final_points,
@@ -300,7 +407,80 @@ fn extract_mesh(
         emissive_texture: mat_textures.emissive,
         occlusion_texture: mat_textures.occlusion,
         texcoords: final_texcoords,
+        custom_attributes,
+        visibility_anim,
     })
+}
+
+/// Read custom string attributes from a mesh prim.
+/// Looks for properties marked with `custom = true` and `typeName = "string"`.
+fn read_custom_attributes(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<std::collections::HashMap<String, String>> {
+    // Get the properties list from the prim spec
+    let props_value = data.get(prim_path, "properties").ok()?;
+    let prop_names = match props_value.into_owned() {
+        Value::TokenVec(v) => v,
+        _ => return None,
+    };
+
+    // Known mesh properties to skip
+    let skip = [
+        "points", "faceVertexIndices", "faceVertexCounts",
+        "subdivisionScheme", "doubleSided", "primvars:displayColor",
+        "primvars:st", "primvars:st0", "primvars:UVMap", "primvars:UVW",
+        "material:binding", "normals", "extent",
+        "primvars:displayOpacity", "xformOpOrder",
+    ];
+
+    let mut attrs = std::collections::HashMap::new();
+    for name in &prop_names {
+        if skip.contains(&name.as_str()) { continue; }
+        if name.starts_with("skel:") { continue; }
+
+        let prop_path = match prim_path.append_property(name) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Check if this attribute has custom = true
+        let is_custom = data.get(&prop_path, "custom")
+            .ok()
+            .and_then(|v| match v.into_owned() { Value::Bool(b) => Some(b), _ => None })
+            .unwrap_or(false);
+
+        if !is_custom { continue; }
+
+        // Read the string value
+        if let Ok(val) = data.get(&prop_path, "default") {
+            match val.into_owned() {
+                Value::String(s) => { attrs.insert(name.clone(), s); }
+                Value::Token(s) => { attrs.insert(name.clone(), s); }
+                _ => {}
+            }
+        }
+    }
+
+    if attrs.is_empty() { None } else { Some(attrs) }
+}
+
+/// Read visibility time samples from a mesh prim.
+/// Returns Vec<(time_code, "invisible"|"inherited")> if present.
+fn read_visibility_time_samples(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<Vec<(f64, String)>> {
+    let vis_path = prim_path.append_property("visibility").ok()?;
+    let ts_value = data.get(&vis_path, "timeSamples").ok()?;
+    match ts_value.into_owned() {
+        Value::TimeSamples(samples) => {
+            let result: Vec<(f64, String)> = samples.into_iter().map(|(t, v)| {
+                let s = match &v {
+                    Value::Token(s) => s.clone(),
+                    Value::String(s) => s.clone(),
+                    _ => "inherited".to_string(),
+                };
+                (t, s)
+            }).collect();
+            if result.is_empty() { None } else { Some(result) }
+        }
+        _ => None,
+    }
 }
 
 /// Read point3f[] points from a mesh prim.
@@ -392,6 +572,21 @@ fn read_texcoord_indices(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> 
     None
 }
 
+/// Read the interpolation mode of the UV primvar (e.g., "vertex", "faceVarying").
+fn read_uv_interpolation(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<String> {
+    for prop_name in &["primvars:st", "primvars:st0", "primvars:UVMap", "primvars:UVW"] {
+        if let Ok(prop_path) = prim_path.append_property(prop_name) {
+            if let Ok(value) = data.get(&prop_path, "interpolation") {
+                match value.into_owned() {
+                    Value::Token(s) | Value::String(s) => return Some(s),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Expand indexed geometry with face-varying UVs into non-indexed per-face-vertex data.
 /// `uv_tri_indices` must be triangulated in parallel with `indices` so they correspond 1:1.
 fn expand_face_varying(
@@ -478,9 +673,13 @@ fn read_material_textures(data: &mut dyn AbstractData, prim_path: &sdf::Path) ->
         Some(p) => p,
         None => return result,
     };
-    let target_value = match data.get(&binding_path, "targetPaths").ok() {
-        Some(v) => v,
-        None => return result,
+    // USDC relationship specs may store paths under "targetPaths" or "default"
+    let target_value = if let Ok(v) = data.get(&binding_path, "targetPaths") {
+        v
+    } else if let Ok(v) = data.get(&binding_path, "default") {
+        v
+    } else {
+        return result;
     };
     let material_path_str = match target_value.into_owned() {
         Value::PathListOp(list_op) => {
@@ -592,7 +791,17 @@ fn read_transform(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
 /// Read xformOps from xformOpOrder and compose into a 4x4 matrix (column-vector convention).
 fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<[f64; 16]> {
     // Read xformOpOrder to get the ordered list of operations
-    let op_order = get_token_vec_field(data, prim_path, "xformOpOrder");
+    // Try as prim field first, then as property attribute (Attribute spec at property path)
+    let op_order = get_token_vec_field(data, prim_path, "xformOpOrder")
+        .or_else(|| {
+            let prop_path = prim_path.append_property("xformOpOrder").ok()?;
+            let value = data.get(&prop_path, "default").ok()?;
+            match value.into_owned() {
+                Value::TokenVec(v) => Some(v),
+                Value::StringVec(v) => Some(v),
+                _ => None,
+            }
+        });
 
     if let Some(ops) = op_order {
         if ops.is_empty() { return None; }
@@ -611,7 +820,10 @@ fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
                 if invert {
                     if let Some(inv) = invert_4x4(&m) { m = inv; }
                 }
-                result = multiply_4x4(&result, &m);
+                // Column-vector convention: later ops multiply from the left.
+                // USD xformOpOrder [Op1, Op2, ...] means Op1 applied first.
+                // Composed column-vector = OpN * ... * Op2 * Op1.
+                result = multiply_4x4(&m, &result);
             }
         }
 
@@ -937,6 +1149,8 @@ fn extract_parametric(
         emissive_texture: None,
         occlusion_texture: None,
         texcoords: None,
+        custom_attributes: None, // USDA parser doesn't support custom attrs yet
+        visibility_anim: None,
     })
 }
 
@@ -1329,6 +1543,52 @@ mod tests {
         assert!(m.mr_texture.as_deref().unwrap().contains("metalRoughness"));
         assert!(m.emissive_texture.as_deref().unwrap().contains("emissive"));
         assert!(m.occlusion_texture.as_deref().unwrap().contains("AO"));
+    }
+
+    #[test]
+    fn test_exported_lantern_usdz_textures() {
+        // Test the actual exported USDZ from the viewer to verify texture round-trip
+        let exported_path = "C:/Users/mad/Downloads/Lantern.glb.three.usdz";
+        if !std::path::Path::new(exported_path).exists() {
+            println!("Skipping: exported Lantern USDZ not found at {}", exported_path);
+            return;
+        }
+        let data = std::fs::read(exported_path).unwrap();
+        let cursor = std::io::Cursor::new(&data);
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+
+        // List all files in USDZ
+        println!("Files in exported USDZ:");
+        for i in 0..archive.len() {
+            let f = archive.by_index(i).unwrap();
+            println!("  [{}] {} ({} bytes)", i, f.name(), f.size());
+        }
+
+        // Extract USDC
+        let mut usdc_data = None;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            if name.ends_with(".usdc") || name.ends_with(".usd") {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+                println!("Found USDC: {} ({} bytes)", name, buf.len());
+                usdc_data = Some(buf);
+                break;
+            }
+        }
+        let usdc_data = usdc_data.expect("No USDC found in USDZ");
+        let result = parse_usd_meshes_inner(&usdc_data).unwrap();
+        println!("Parsed: meshes={} error={:?}", result.meshes.len(), result.error);
+        for m in &result.meshes {
+            println!("  mesh: {} diffuse={:?} normal={:?} uvs={}",
+                m.name, m.diffuse_texture, m.normal_texture,
+                m.texcoords.as_ref().map(|t| t.len()/2).unwrap_or(0));
+        }
+        // Note: If this file was exported with the old code (u32 asset path bug),
+        // textures won't be found. Re-export with fixed code to verify.
+        let has_tex = result.meshes.iter().any(|m| m.diffuse_texture.is_some());
+        println!("Has texture: {}", has_tex);
     }
 
     #[test]

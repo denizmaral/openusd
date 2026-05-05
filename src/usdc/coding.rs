@@ -82,6 +82,90 @@ where
     Ok(output)
 }
 
+/// Encode a slice of integers using USD's delta + variable-width integer coding.
+///
+/// This is the inverse of `decode_ints`. The format:
+/// 1. Common value (i32 or i64 depending on T size)
+/// 2. Code bytes (2 bits per integer, 4 integers per byte)
+/// 3. Data bytes (variable-width deltas)
+pub fn encode_ints<T: PrimInt + 'static>(values: &[T]) -> Vec<u8>
+where
+    T: AsPrimitive<i64>,
+{
+    let count = values.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let is_64_bit = mem::size_of::<T>() == 8;
+
+    // Compute deltas from running sum.
+    let mut deltas = Vec::with_capacity(count);
+    let mut prev: i64 = 0;
+    for &v in values {
+        let cur: i64 = v.as_();
+        deltas.push(cur - prev);
+        prev = cur;
+    }
+
+    // Find most common delta.
+    let mut freq: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for &d in &deltas {
+        *freq.entry(d).or_insert(0) += 1;
+    }
+    let common_value = *freq.iter().max_by_key(|(_, c)| *c).unwrap().0;
+
+    // Classify each delta and build code bytes + data bytes.
+    let num_code_bytes = (count * 2).div_ceil(8);
+    let mut codes = vec![0u8; num_code_bytes];
+    let mut data_bytes = Vec::new();
+
+    for (i, &delta) in deltas.iter().enumerate() {
+        let code_byte_idx = i / 4;
+        let code_bit_pos = (i % 4) * 2;
+
+        let code = if delta == common_value {
+            COMMON
+        } else if is_64_bit {
+            if delta >= i16::MIN as i64 && delta <= i16::MAX as i64 {
+                data_bytes.extend_from_slice(&(delta as i16).to_le_bytes());
+                SMALL
+            } else if delta >= i32::MIN as i64 && delta <= i32::MAX as i64 {
+                data_bytes.extend_from_slice(&(delta as i32).to_le_bytes());
+                MEDIUM
+            } else {
+                data_bytes.extend_from_slice(&delta.to_le_bytes());
+                LARGE
+            }
+        } else {
+            if delta >= i8::MIN as i64 && delta <= i8::MAX as i64 {
+                data_bytes.extend_from_slice(&(delta as i8).to_le_bytes());
+                SMALL
+            } else if delta >= i16::MIN as i64 && delta <= i16::MAX as i64 {
+                data_bytes.extend_from_slice(&(delta as i16).to_le_bytes());
+                MEDIUM
+            } else {
+                data_bytes.extend_from_slice(&(delta as i32).to_le_bytes());
+                LARGE
+            }
+        };
+
+        codes[code_byte_idx] |= code << code_bit_pos;
+    }
+
+    // Assemble output: common_value + codes + data.
+    let mut output = Vec::with_capacity(mem::size_of::<T>() + codes.len() + data_bytes.len());
+    if is_64_bit {
+        output.extend_from_slice(&common_value.to_le_bytes());
+    } else {
+        output.extend_from_slice(&(common_value as i32).to_le_bytes());
+    }
+    output.extend_from_slice(&codes);
+    output.extend_from_slice(&data_bytes);
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +194,37 @@ mod tests {
         let input = decode_ints::<u32>(&output, 7).expect("Failed to decode integers");
 
         assert_eq!(input.as_slice(), &[123_u32, 124, 125, 100125, 100125, 100126, 100126])
+    }
+
+    #[test]
+    fn test_encode_roundtrip_u32() {
+        let original: Vec<u32> = vec![123, 124, 125, 100125, 100125, 100126, 100126];
+        let encoded = encode_ints(&original);
+        let decoded = decode_ints::<u32>(&encoded, original.len()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_roundtrip_i32() {
+        let original: Vec<i32> = vec![1, 2, 4, 5, -3, 4, 5, -2, 3, 0];
+        let encoded = encode_ints(&original);
+        let decoded = decode_ints::<i32>(&encoded, original.len()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_roundtrip_zeros() {
+        let original: Vec<u32> = vec![0, 0, 0, 0, 0];
+        let encoded = encode_ints(&original);
+        let decoded = decode_ints::<u32>(&encoded, original.len()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_roundtrip_sequential() {
+        let original: Vec<u32> = (0..20).collect();
+        let encoded = encode_ints(&original);
+        let decoded = decode_ints::<u32>(&encoded, original.len()).unwrap();
+        assert_eq!(decoded, original);
     }
 }
