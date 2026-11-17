@@ -1,0 +1,1127 @@
+//! Dependency discovery (C++ `UsdUtilsComputeAllDependencies`): the walk from
+//! a root layer over every file it reaches.
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ops::Deref;
+
+use super::walk::{AssetKind, Visit, visit_asset_paths};
+use crate::sdf;
+use crate::usd::Stage;
+use crate::{Error, Result, ar, pcp};
+
+/// The layers and assets a layer depends on, as C++
+/// `UsdUtilsComputeAllDependencies` reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dependencies {
+    /// The layers reached through sublayers, references, payloads and
+    /// layer-valued asset paths, by identifier: the root first, the rest
+    /// sorted.
+    pub layers: Vec<String>,
+    /// The other assets the layers name, by resolved path, sorted.
+    pub assets: Vec<String>,
+    /// The asset paths that did not resolve, anchored to the layer authoring
+    /// them, sorted.
+    pub unresolved: Vec<String>,
+}
+
+/// The layer a dependency walk starts from.
+#[derive(Debug, Clone, Copy)]
+pub enum Root<'a> {
+    /// The layer an asset path names: one the stage holds under that
+    /// identifier, otherwise the one the stage's resolver opens.
+    Path(&'a str),
+    /// A layer in hand, which the stage need not hold, such as a layer a stage
+    /// was flattened into. It is walked as it is in memory. The paths it
+    /// authors are anchored to the location it was read from. An anonymous
+    /// layer was read from nowhere, and its relative paths resolve against
+    /// the current directory first, as in C++.
+    Layer(&'a sdf::Layer),
+}
+
+impl<'a> From<&'a str> for Root<'a> {
+    fn from(path: &'a str) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl<'a> From<&'a String> for Root<'a> {
+    fn from(path: &'a String) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl<'a> From<&'a sdf::Layer> for Root<'a> {
+    fn from(layer: &'a sdf::Layer) -> Self {
+        Self::Layer(layer)
+    }
+}
+
+/// Computes every layer and asset `root` depends on through `stage`'s
+/// resolver, as C++ `UsdUtilsComputeAllDependencies` does through the global
+/// one.
+///
+/// Every variant is followed, not only the selected one, and deleted reference
+/// and payload items are left out, as is the `assetInfo:identifier` of a prim,
+/// which names the asset itself. A layer `stage` already holds is read as it
+/// is in memory, unsaved edits included, as C++ reads a layer already open in
+/// its layer registry; any other is read through the resolver without joining
+/// the stage. A package is opened at its root layer and followed like any
+/// layer. The layers and assets inside it are reported by their
+/// package-relative path.
+///
+/// A UDIM path names the tiles the resolver finds, each an asset, and is
+/// unresolved where it finds none. Clip templates, which C++ expands by
+/// listing the filesystem, and variable expressions, which C++ anchors
+/// unevaluated and reports unresolved, return
+/// [`DependencyError`](super::DependencyError).
+pub fn all_dependencies<'a>(stage: &Stage, root: impl Into<Root<'a>>) -> Result<Dependencies> {
+    let graph = stage.layer_view()?;
+    let policy = Discover {
+        inactive: false,
+        open_packages: true,
+    };
+    let discovery = discover(&graph, root.into(), policy)?;
+    let mut dependencies = Dependencies::default();
+    for source in &discovery.sources {
+        match &source.content {
+            Content::Layer { .. } | Content::Package { .. } => dependencies.layers.push(source.identifier.clone()),
+            Content::Asset(resolved) => dependencies.assets.push(resolved.to_string()),
+            Content::Tiles(_) => {}
+        }
+    }
+    dependencies.unresolved = discovery
+        .unresolved
+        .into_iter()
+        .map(|(identifier, _)| identifier)
+        .collect();
+    dependencies.layers[1..].sort();
+    dependencies.assets.sort();
+    dependencies.unresolved.sort();
+    Ok(dependencies)
+}
+
+/// What [`discover`] does with the paths it meets, beyond the walk's own
+/// choices in [`Visit::DISCOVER`].
+#[derive(Clone, Copy)]
+pub(super) struct Discover {
+    /// Record the targets of deleted and reordered list-op items too: they
+    /// add no opinion, but a delete must still find its target once both are
+    /// packaged.
+    pub inactive: bool,
+    /// Open a package at its root layer and follow what it authors, as C++
+    /// `SdfLayer::FindOrOpen` does with one. Off, a package is taken whole,
+    /// with the layers the stage holds inside it walked in their own scope.
+    pub open_packages: bool,
+}
+
+/// Every file reachable from the roots of one scope, in the order found: the
+/// scope of a root layer, or of a package, whose scope holds the layers the
+/// stage has inside it and what they reach outside it.
+pub(super) struct Discovery<'a> {
+    /// The files found, the roots first; a layer's uses index into here.
+    pub sources: Vec<Source<'a>>,
+    /// The identifiers that did not resolve, each once, with what it was
+    /// taken for; a package's scope reports into its enclosing one too.
+    pub unresolved: Vec<(String, AssetKind)>,
+}
+
+/// A file [`discover`] reached, by canonical identifier.
+pub(super) struct Source<'a> {
+    pub identifier: String,
+    pub placement: Placement,
+    pub content: Content<'a>,
+}
+
+/// Where a [`Source`] goes in its package.
+pub(super) enum Placement {
+    /// The root layer, at the name the package is given.
+    Root,
+    /// An existing entry of a package the stage holds a layer in, at its own
+    /// name.
+    Entry(String),
+    /// A file the layer source `by` named as `path` (the package's own path
+    /// for a path into a package), placed where that path leads when it can
+    /// be.
+    Named { by: usize, path: String },
+    /// A UDIM tile found through its set, the source `of`, at the name its
+    /// set's entry gives tile `number`.
+    Tile { of: usize, number: u16 },
+}
+
+/// What a [`Source`] holds.
+pub(super) enum Content<'a> {
+    /// A layer, with what each path it authors names, by authored path. A
+    /// path that did not resolve has no entry.
+    Layer {
+        layer: SourceLayer<'a>,
+        uses: HashMap<String, Use>,
+    },
+    /// A package taken whole, at its location, with its own scope: the layers
+    /// the stage holds inside it and what they reach outside it, empty when
+    /// it holds none.
+    Package {
+        resolved: ar::ResolvedPath,
+        inside: Discovery<'a>,
+    },
+    /// Any other file, at its location.
+    Asset(ar::ResolvedPath),
+    /// A set of UDIM tiles, each by number with the source it is, placed by
+    /// this one where it was found through it; stored as no entry itself.
+    Tiles(Vec<(u16, usize)>),
+}
+
+/// What a path a layer authors names, as its [`Content::Layer`] records it.
+pub(super) struct Use {
+    /// The source the path names.
+    pub source: usize,
+    /// For a path into a package that names the source as that package, the
+    /// path inside it as the resolver's identifier spells it, which a
+    /// rewrite keeps.
+    pub packaged: Option<String>,
+}
+
+impl Content<'_> {
+    /// Where the source was found, or `None` for a layer that was never read
+    /// from anywhere.
+    pub(super) fn location(&self) -> Option<&str> {
+        match self {
+            Self::Layer { layer, .. } => layer.resolved_path(),
+            Self::Package { resolved, .. } | Self::Asset(resolved) => resolved.to_str(),
+            Self::Tiles(_) => None,
+        }
+    }
+
+    /// The location the paths a layer source authors are anchored to.
+    fn anchor(&self) -> Option<ar::ResolvedPath> {
+        match self {
+            Self::Layer { layer, .. } => layer.anchor_location(),
+            Self::Package { .. } | Self::Asset(_) | Self::Tiles(_) => None,
+        }
+    }
+}
+
+/// Walks from `root` over every file it reaches through `graph`'s resolver,
+/// breadth first, visiting each layer once. A root layer in hand and a layer
+/// `graph` holds are walked as they are in memory; any other is read through
+/// the resolver. The root failing to resolve is an error; any other file
+/// failing to is recorded.
+pub(super) fn discover<'a>(graph: &'a pcp::LayerView<'a>, root: Root<'a>, policy: Discover) -> Result<Discovery<'a>> {
+    // One cache scope spans the discovery. Each package it reads into is
+    // opened once.
+    let _scope = ar::CacheScope::begin();
+    let (identifier, layer) = match root {
+        Root::Path(asset_path) => {
+            let identifier = root_identifier(graph, asset_path);
+            let Some(layer) = SourceLayer::open(graph, &identifier)? else {
+                return Err(Error::UnresolvedAsset(asset_path.to_owned()));
+            };
+            (identifier, layer)
+        }
+        Root::Layer(layer) => (layer.identifier().to_owned(), SourceLayer::Live(layer)),
+    };
+    let root = Source {
+        identifier,
+        placement: Placement::Root,
+        content: Content::Layer {
+            layer,
+            uses: HashMap::new(),
+        },
+    };
+    discover_scope(graph, policy, vec![root], None)
+}
+
+/// The identifier of the root layer `asset_path` names: a layer `graph`
+/// holds under that exact identifier, otherwise the canonical identifier.
+fn root_identifier(graph: &pcp::LayerGraph, asset_path: &str) -> String {
+    if graph.id_of(asset_path).is_some() {
+        return asset_path.to_owned();
+    }
+    sdf::absolute_path_at(graph.layer_registry(), None, asset_path)
+}
+
+/// Walks from `roots` over every file they reach, breadth first. In the scope
+/// of `package`, a path leading back inside it names an entry already in
+/// place and is left as authored.
+fn discover_scope<'a>(
+    graph: &'a pcp::LayerView<'a>,
+    policy: Discover,
+    roots: Vec<Source<'a>>,
+    package: Option<String>,
+) -> Result<Discovery<'a>> {
+    let mut discoverer = Discoverer {
+        graph,
+        policy,
+        package,
+        index: HashMap::new(),
+        udim_sets: HashMap::new(),
+        queue: VecDeque::new(),
+        sources: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    for root in roots {
+        discoverer.admit(root);
+    }
+    // TODO(rayon): the layers queued at one level open independently of each
+    // other; open them in parallel and visit them in queue order.
+    while let Some(current) = discoverer.queue.pop_front() {
+        for (path, kind) in discoverer.authored_in(current)? {
+            discoverer.follow(current, path, kind)?;
+        }
+    }
+    Ok(Discovery {
+        sources: discoverer.sources,
+        unresolved: discoverer.unresolved,
+    })
+}
+
+/// The scope of the package at `package`: the layers `graph` holds directly
+/// inside it, at their entries, and the packages nested in it that hold such
+/// layers deeper down, each with its own scope; then what those layers reach
+/// outside the package. Empty when the stage holds no layer inside it.
+fn discover_inside<'a>(graph: &'a pcp::LayerView<'a>, policy: Discover, package: &str) -> Result<Discovery<'a>> {
+    let prefix = format!("{}[", package.trim_end_matches(']'));
+    let mut roots = Vec::new();
+    let mut nested = BTreeSet::new();
+    for &id in graph.all_ids() {
+        let layer = graph.layer(id);
+        let Some(rest) = layer.resolved_path().and_then(|real| real.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let entry = rest.trim_end_matches(']');
+        match entry.split_once('[') {
+            Some((package, _)) => {
+                nested.insert(package.to_owned());
+            }
+            // A layer is keyed by its entry's path, as a path leading back
+            // to it is located, whatever identifier it opened under.
+            None => roots.push(Source {
+                identifier: ar::nest_packaged_path(package, entry),
+                placement: Placement::Entry(entry.to_owned()),
+                content: Content::Layer {
+                    layer: SourceLayer::Live(layer),
+                    uses: HashMap::new(),
+                },
+            }),
+        }
+    }
+    for name in nested {
+        let identifier = ar::nest_packaged_path(package, &name);
+        let inside = discover_inside(graph, policy, &identifier)?;
+        roots.push(Source {
+            placement: Placement::Entry(name),
+            content: Content::Package {
+                resolved: ar::ResolvedPath::new(&identifier),
+                inside,
+            },
+            identifier,
+        });
+    }
+    discover_scope(graph, policy, roots, Some(package.to_owned()))
+}
+
+/// The state of one [`discover_scope`] walk.
+struct Discoverer<'a> {
+    graph: &'a pcp::LayerView<'a>,
+    policy: Discover,
+    /// The scope's package.
+    package: Option<String>,
+    /// The source index of each identifier found.
+    index: HashMap<String, usize>,
+    /// Each UDIM set probed, by the anchor of the layer authoring it and its
+    /// anchored identifier, or `None` where no tile of it resolves. A set
+    /// authored by several layers that anchor it alike is probed once.
+    udim_sets: HashMap<(Option<ar::ResolvedPath>, String), Option<UdimSet>>,
+    /// The layer sources still to walk.
+    queue: VecDeque<usize>,
+    sources: Vec<Source<'a>>,
+    unresolved: Vec<(String, AssetKind)>,
+}
+
+/// What discovery found for a UDIM set.
+struct UdimSet {
+    /// The set's identifier: the first tile's with the pattern put back,
+    /// which names the tiles' directory as their own identifiers do.
+    identifier: String,
+    /// The numbers of the tiles found.
+    numbers: Vec<u16>,
+}
+
+/// Where a path a layer authors leads: the source it names, as
+/// [`Discoverer::add`] admits one.
+struct Located {
+    /// The path's canonical identifier, anchored to the layer authoring it,
+    /// which an unresolved path is reported as.
+    target: String,
+    /// The identifier the source is indexed by: the target's own, the
+    /// package's for a path into one, the entry's for a path leading back
+    /// inside the scope's package, or the set's for a set of tiles.
+    identifier: String,
+    /// Where the source goes in its package.
+    placement: Placement,
+    /// What the source is admitted as.
+    admit: Admission,
+    /// Whether the whole path has to resolve for it to name the source, as
+    /// a path into a package does, other than a set of tiles, which
+    /// resolves through them.
+    probe: bool,
+    /// For a path into a package that names the source as that package, the
+    /// path inside it as the resolver's identifier spells it.
+    packaged: Option<String>,
+}
+
+/// What a located source is admitted as.
+#[derive(Clone, Copy)]
+enum Admission {
+    /// A layer, opened and walked.
+    Layer,
+    /// A package, carried whole, with the scope of the layers the stage
+    /// holds inside it.
+    Package,
+    /// Any other file, at its location.
+    Asset,
+    /// A set of UDIM tiles, stored as no entry itself.
+    Tiles,
+}
+
+impl From<AssetKind> for Admission {
+    fn from(kind: AssetKind) -> Self {
+        match kind {
+            AssetKind::Layer => Self::Layer,
+            AssetKind::Package => Self::Package,
+            AssetKind::Asset => Self::Asset,
+        }
+    }
+}
+
+impl<'a> Discoverer<'a> {
+    /// Follows `path`, authored in the layer source `current` as `kind`:
+    /// records what it names and queues a layer found through it. A UDIM
+    /// path names the set of its tiles, a source of its own placed by the
+    /// ordinary rule; each tile newly found through it is placed by the set,
+    /// so a rewrite of the path reaches its tiles where they went.
+    fn follow(&mut self, current: usize, path: String, kind: AssetKind) -> Result<()> {
+        let tiles = self.udim_tiles(current, &path, kind);
+        if tiles.is_empty() {
+            if let Some((found, _)) = self.add(current, &path, kind)? {
+                self.uses_of(current).insert(path, found);
+            }
+            return Ok(());
+        }
+        let Some((set, new_set)) = self.add(current, &path, kind)? else {
+            return Ok(());
+        };
+        let mut found_tiles = Vec::with_capacity(tiles.len());
+        for (number, tile) in tiles {
+            let Some((found, added)) = self.add(current, &tile, AssetKind::Asset)? else {
+                continue;
+            };
+            if added
+                && matches!(self.sources[found.source].content, Content::Asset(_))
+                && matches!(self.sources[found.source].placement, Placement::Named { .. })
+            {
+                self.sources[found.source].placement = Placement::Tile { of: set.source, number };
+            }
+            found_tiles.push((number, found.source));
+        }
+        if new_set && let Content::Tiles(tiles) = &mut self.sources[set.source].content {
+            *tiles = found_tiles;
+        }
+        self.uses_of(current).insert(path, set);
+        Ok(())
+    }
+
+    /// The tiles `path`, authored in the layer source `referrer` as `kind`,
+    /// names: for an asset path with a UDIM pattern, the number and authored
+    /// path of each tile found beside the first one the layer reaches (C++
+    /// `_GetUdimTiles`); empty for any other path, and where none resolves.
+    /// A set is probed once, however many layers author it; each tile is
+    /// resolved again by [`add`](Self::add), as C++ resolves
+    /// the authored tile paths it hands back. Only a path of asset kind is
+    /// expanded; C++ expands any asset value's path, a layer-named one
+    /// included, and neither expands an arc's.
+    fn udim_tiles(&mut self, referrer: usize, path: &str, kind: AssetKind) -> Vec<(u16, String)> {
+        if kind != AssetKind::Asset {
+            return Vec::new();
+        }
+        let Some(udim) = ar::UdimPath::parse(path) else {
+            return Vec::new();
+        };
+        let registry = self.graph.layer_registry();
+        let anchor = self.sources[referrer].content.anchor();
+        let anchored: &dyn Fn(&str) -> String = &|path| registry.absolute_path(anchor.as_ref(), path);
+        // A search path anchors to the same spelling from every layer, so the
+        // anchor is part of the key.
+        let key = (anchor.clone(), anchored(path));
+        self.udim_sets
+            .entry(key)
+            .or_insert_with(|| {
+                // One scope over the probe for the first tile and the walk of
+                // the rest: a packaged set opens its package once.
+                let _scope = ar::CacheScope::begin();
+                let first = udim.tiles(registry, anchor.as_ref().map(|_| anchored)).next()?;
+                let identifier = udim.with_pattern(&anchored(&udim.tile(first.number)))?;
+                let resolved = udim.with_pattern(first.path.to_str()?)?;
+                let numbers = ar::UdimPath::parse(&resolved)?
+                    .resolve_tiles(registry, None)
+                    .iter()
+                    .map(|tile| tile.number)
+                    .collect();
+                Some(UdimSet { identifier, numbers })
+            })
+            .iter()
+            .flat_map(|set| set.numbers.iter().map(|&number| (number, udim.tile(number))))
+            .collect()
+    }
+
+    /// What `path`, authored in the layer source `current` as `kind`, names,
+    /// with whether it was admitted now: a source already found, or one
+    /// admitted and, for a layer, queued; `None` when the path does not
+    /// resolve, which is recorded.
+    fn add(&mut self, current: usize, path: &str, kind: AssetKind) -> Result<Option<(Use, bool)>> {
+        let located = self.locate(current, path, kind);
+        if located.probe && self.graph.layer_registry().resolve(&located.target).is_none() {
+            self.record_unresolved(located.target, kind);
+            return Ok(None);
+        }
+        let (index, added) = if let Some(&index) = self.index.get(&located.identifier) {
+            (index, false)
+        } else {
+            let Some(content) = self.content_of(&located)? else {
+                self.record_unresolved(located.target, kind);
+                return Ok(None);
+            };
+            let source = Source {
+                identifier: located.identifier,
+                placement: located.placement,
+                content,
+            };
+            // A layer already found under another spelling of its location
+            // is that source. The index records this spelling for it too.
+            if let Some(&index) = source.real_path().and_then(|real| self.index.get(real)) {
+                self.index.insert(source.identifier, index);
+                (index, false)
+            } else {
+                (self.admit(source), true)
+            }
+        };
+        Ok(Some((
+            Use {
+                source: index,
+                packaged: located.packaged,
+            },
+            added,
+        )))
+    }
+
+    /// The paths the layer source `current` authors, each once, with what it
+    /// names: every path, or only the ones that add an opinion.
+    fn authored_in(&self, current: usize) -> Result<Vec<(String, AssetKind)>> {
+        let Content::Layer { layer, uses } = &self.sources[current].content else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        visit_asset_paths(layer.data(), layer.identifier(), Visit::DISCOVER, |asset| {
+            if (asset.applied || self.policy.inactive)
+                && !uses.contains_key(asset.path)
+                && !found.iter().any(|(path, _)| path == asset.path)
+            {
+                found.push((asset.path.to_owned(), asset.kind));
+            }
+            Ok(None)
+        })?;
+        Ok(found)
+    }
+
+    /// The uses of the layer source `current`.
+    fn uses_of(&mut self, current: usize) -> &mut HashMap<String, Use> {
+        match &mut self.sources[current].content {
+            Content::Layer { uses, .. } => uses,
+            Content::Package { .. } | Content::Asset(_) | Content::Tiles(_) => unreachable!("only a layer is walked"),
+        }
+    }
+
+    /// Where `path`, authored in the layer source `referrer` as `kind`,
+    /// leads. A path into a package names the package, unless packages are
+    /// opened as layers; a path leading back inside the scope's package
+    /// names the entry there, in place already.
+    fn locate(&self, referrer: usize, path: &str, kind: AssetKind) -> Located {
+        let registry = self.graph.layer_registry();
+        let anchor = self.sources[referrer].content.anchor();
+        let anchored = |path: &str| registry.absolute_path(anchor.as_ref(), path);
+        let target = anchored(path);
+        let set = self
+            .udim_sets
+            .get(&(anchor.clone(), target.clone()))
+            .and_then(Option::as_ref);
+        let (identifier, placement, admit, packaged) = if let Some(package) = &self.package
+            && let Some(part) = packaged_part(&target, package)
+        {
+            // The first packaged part names the entry, deeper ones a path
+            // into a package nested there.
+            let (name, packaged) = match ar::split_package_relative_path_outer(&part) {
+                Some((name, deeper)) => (name, Some(deeper)),
+                None => (part, None),
+            };
+            // An entry the stage holds no layer in is copied as it is, a
+            // layer among them.
+            let admit = if packaged.is_some() || kind == AssetKind::Package {
+                Admission::Package
+            } else if set.is_some() {
+                Admission::Tiles
+            } else {
+                Admission::Asset
+            };
+            (
+                ar::nest_packaged_path(package, &name),
+                Placement::Entry(name),
+                admit,
+                packaged,
+            )
+        } else {
+            let named = |path: String| Placement::Named { by: referrer, path };
+            match ar::split_package_relative_path_outer(path) {
+                Some((package, inner)) if !self.policy.open_packages => {
+                    let identifier = anchored(&package);
+                    // The packaged path is read back from the resolver's
+                    // identifier, which spells it as the entry name it reaches.
+                    let packaged = packaged_part(&target, &identifier).unwrap_or(inner);
+                    (identifier, named(package), Admission::Package, Some(packaged))
+                }
+                _ if self.policy.open_packages && kind == AssetKind::Package => {
+                    (target.clone(), named(path.to_owned()), Admission::Layer, None)
+                }
+                _ => match set {
+                    Some(set) => (set.identifier.clone(), named(path.to_owned()), Admission::Tiles, None),
+                    None => (target.clone(), named(path.to_owned()), kind.into(), None),
+                },
+            }
+        };
+        Located {
+            probe: packaged.is_some() && set.is_none(),
+            target,
+            identifier,
+            placement,
+            admit,
+            packaged,
+        }
+    }
+
+    /// What the source at `located` holds, read through the resolver;
+    /// `None` where it does not resolve. A set of tiles resolves through its
+    /// tiles, probed already; a package is walked in a scope of its own.
+    fn content_of(&self, located: &Located) -> Result<Option<Content<'a>>> {
+        let registry = self.graph.layer_registry();
+        let content = match located.admit {
+            Admission::Layer => {
+                let Some(layer) = SourceLayer::open(self.graph, &located.identifier)? else {
+                    return Ok(None);
+                };
+                Content::Layer {
+                    layer,
+                    uses: HashMap::new(),
+                }
+            }
+            Admission::Asset => {
+                let Some(resolved) = registry.resolve(&located.identifier) else {
+                    return Ok(None);
+                };
+                Content::Asset(resolved)
+            }
+            Admission::Tiles => Content::Tiles(Vec::new()),
+            Admission::Package => {
+                let Some(resolved) = registry.resolve(&located.identifier) else {
+                    return Ok(None);
+                };
+                Content::Package {
+                    resolved,
+                    inside: discover_inside(self.graph, self.policy, &located.identifier)?,
+                }
+            }
+        };
+        Ok(Some(content))
+    }
+
+    /// Admits `source`, queueing a layer to be walked; what a package's own
+    /// scope could not resolve is this scope's to report too. Returns the
+    /// source's index.
+    fn admit(&mut self, source: Source<'a>) -> usize {
+        if let Content::Package { inside, .. } = &source.content {
+            for (unresolved, kind) in &inside.unresolved {
+                self.record_unresolved(unresolved.clone(), *kind);
+            }
+        }
+        let index = self.sources.len();
+        if source.is_layer() {
+            self.queue.push_back(index);
+        }
+        if let Some(real) = source.real_path()
+            && real != source.identifier
+        {
+            self.index.entry(real.to_owned()).or_insert(index);
+        }
+        self.index.insert(source.identifier.clone(), index);
+        self.sources.push(source);
+        index
+    }
+
+    fn record_unresolved(&mut self, identifier: String, kind: AssetKind) {
+        if !self.unresolved.iter().any(|(found, _)| *found == identifier) {
+            self.unresolved.push((identifier, kind));
+        }
+    }
+}
+
+impl Source<'_> {
+    fn is_layer(&self) -> bool {
+        matches!(self.content, Content::Layer { .. })
+    }
+
+    /// The file a layer source was read from. A path anchored elsewhere can
+    /// spell this location for a layer whose identifier differs from it, such
+    /// as one found through a search path or a root in hand. `None` for a
+    /// layer read from inside a package: C++ opens it as a layer apart from
+    /// its package.
+    fn real_path(&self) -> Option<&str> {
+        let Content::Layer { layer, .. } = &self.content else {
+            return None;
+        };
+        layer.resolved_path().filter(|real| !ar::is_package_relative_path(real))
+    }
+
+    /// Whether the source is stored as an entry of its own: a set of tiles is
+    /// not, its tiles are.
+    pub(super) fn stored(&self) -> bool {
+        !matches!(self.content, Content::Tiles(_))
+    }
+}
+
+/// A layer read for the dependency walk: one the stage's registry holds, or
+/// one read through its resolver.
+///
+/// TODO(perf): the walk holds the registry's layers borrowed through its
+/// `LayerView`, so a layer it reads cannot join the registry and the next walk
+/// reads it again. Holding the walk's layers as handles read one at a time
+/// would let it find-or-open each (C++ `SdfLayer::FindOrOpen`).
+pub(super) enum SourceLayer<'a> {
+    Live(&'a sdf::Layer),
+    Read(Box<sdf::Layer>),
+}
+
+impl<'a> SourceLayer<'a> {
+    /// The layer at `identifier`, as the registry holds it (C++
+    /// `SdfLayer::FindOrOpen`), or `None` when it does not resolve.
+    fn open(graph: &'a pcp::LayerView<'a>, identifier: &str) -> Result<Option<Self>> {
+        if let Some(id) = graph.id_of(identifier) {
+            return Ok(Some(Self::Live(graph.layer(id))));
+        }
+        if let Some(layer) = graph.held(identifier, None) {
+            return Ok(Some(Self::Live(layer)));
+        }
+        if sdf::Layer::is_anonymous_identifier(identifier) {
+            return Ok(None);
+        }
+        let registry = graph.layer_registry();
+        let _scope = ar::CacheScope::begin();
+        let Some(resolved) = registry.resolve_layer(identifier) else {
+            return Ok(None);
+        };
+        if let Some(layer) = graph.held(identifier, resolved.to_str()) {
+            return Ok(Some(Self::Live(layer)));
+        }
+        Ok(Some(Self::Read(Box::new(registry.read_layer(identifier, resolved)?))))
+    }
+}
+
+impl Deref for SourceLayer<'_> {
+    type Target = sdf::Layer;
+
+    fn deref(&self) -> &sdf::Layer {
+        match self {
+            Self::Live(layer) => layer,
+            Self::Read(layer) => layer,
+        }
+    }
+}
+
+/// The packaged path the identifier `target` holds inside the package whose
+/// identifier is `package`, or `None` when `target` is not a path into it.
+fn packaged_part(target: &str, package: &str) -> Option<String> {
+    // A package nested in another closes its own brackets after the part.
+    let base = package.trim_end_matches(']');
+    let closing = package.len() - base.len() + 1;
+    let rest = target.strip_prefix(base)?.strip_prefix('[')?;
+    let (part, tail) = rest.split_at_checked(rest.len().checked_sub(closing)?)?;
+    tail.bytes().all(|byte| byte == b']').then(|| part.to_owned())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::fs;
+    use std::path::{MAIN_SEPARATOR, Path};
+
+    use super::*;
+    use crate::sdf::FieldKey;
+    use crate::usd_utils::{DependencyError, modify_asset_paths};
+    use crate::usdz::ArchiveWriter;
+    use crate::vt::Value;
+
+    /// Writes `contents` to `path` under `dir`, creating its directories.
+    pub(crate) fn write(dir: &Path, path: &str, contents: &str) {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    /// Opens a stage on the file at `path` under `dir`, returning the root's
+    /// path with it.
+    pub(crate) fn open(dir: &Path, path: &str) -> Result<(String, Stage)> {
+        let root = dir.join(path).to_str().unwrap().to_owned();
+        let stage = Stage::open(&root)?;
+        Ok((root, stage))
+    }
+
+    const ROOT: &str = r#"#usda 1.0
+(
+    customLayerData = {
+        asset icon = @./meta.png@
+    }
+    subLayers = [@./layers/sub.usda@]
+)
+
+def "A" (
+    delete references = @./deleted.usda@
+    prepend references = @./ref.usda@</A>
+)
+{
+    asset sampled.timeSamples = {
+        1: @./sample.png@,
+    }
+    asset[] textures = [@./tex.png@, @./missing.png@]
+}
+
+def "P" (
+    prepend payload = @../outside/payload.usda@</P>
+)
+{
+}
+
+def "V" (
+    variants = {
+        string v = "one"
+    }
+    prepend variantSets = "v"
+)
+{
+    variantSet "v" = {
+        "one" (
+            prepend references = @./one.usda@</V>
+        ) {
+        }
+        "two" (
+            prepend references = @./two.usda@</V>
+        ) {
+        }
+    }
+}
+
+def "M" (
+    prepend references = @./missing.usda@
+)
+{
+}
+
+def "N" (
+    prepend references = @./pkg.usdz@
+)
+{
+}
+"#;
+
+    /// The scene `dependencies_match_cpp` walks: every kind of dependency, a
+    /// missing layer and texture, a layer outside the root's directory and a
+    /// package.
+    fn scene(dir: &Path) -> String {
+        write(dir, "scene/root.usda", ROOT);
+        write(
+            dir,
+            "scene/layers/sub.usda",
+            "#usda 1.0\ndef \"S\" {\n    asset t = @../sub_tex.png@\n}\n",
+        );
+        write(
+            dir,
+            "scene/ref.usda",
+            "#usda 1.0\ndef \"A\" {\n    asset t = @./ref_tex.png@\n}\n",
+        );
+        for name in ["deleted", "one", "two"] {
+            write(dir, &format!("scene/{name}.usda"), "#usda 1.0\ndef \"V\" {\n}\n");
+        }
+        write(dir, "outside/payload.usda", "#usda 1.0\ndef \"P\" {\n}\n");
+        for name in ["meta", "sample", "tex", "sub_tex", "ref_tex"] {
+            write(dir, &format!("scene/{name}.png"), "PNG");
+        }
+        let mut package = ArchiveWriter::create(dir.join("scene/pkg.usdz")).unwrap();
+        package
+            .add_layer(
+                "inner.usda",
+                b"#usda 1.0\n(defaultPrim = \"N\")\ndef \"N\" {\n    asset t = @./inside.png@\n}\n",
+            )
+            .unwrap();
+        package.add_layer("inside.png", b"PNG").unwrap();
+        package.finish().unwrap();
+        dir.join("scene/root.usda").to_str().unwrap().to_owned()
+    }
+
+    fn relative(dir: &Path, paths: &[String]) -> Vec<String> {
+        let base = format!("{}{}", fs::canonicalize(dir).unwrap().display(), MAIN_SEPARATOR);
+        let mut paths: Vec<_> = paths
+            .iter()
+            .map(|path| path.replace(&base, "").replace('\\', "/"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// The fixture C++ 25.05 was run on gives these sets from
+    /// `UsdUtils.ComputeAllDependencies("scene/root.usda")`.
+    #[test]
+    fn dependencies_match_cpp() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = scene(dir.path());
+        let stage = Stage::open(&root)?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(
+            relative(dir.path(), &dependencies.layers),
+            [
+                "outside/payload.usda",
+                "scene/layers/sub.usda",
+                "scene/one.usda",
+                "scene/pkg.usdz",
+                "scene/ref.usda",
+                "scene/root.usda",
+                "scene/two.usda",
+            ]
+        );
+        assert!(Path::new(&dependencies.layers[0]).ends_with("scene/root.usda"));
+        assert_eq!(
+            relative(dir.path(), &dependencies.assets),
+            [
+                "scene/meta.png",
+                "scene/pkg.usdz[inside.png]",
+                "scene/ref_tex.png",
+                "scene/sample.png",
+                "scene/sub_tex.png",
+                "scene/tex.png",
+            ]
+        );
+        assert_eq!(
+            relative(dir.path(), &dependencies.unresolved),
+            ["scene/missing.png", "scene/missing.usda"]
+        );
+        Ok(())
+    }
+
+    /// A layer the stage holds is walked as it is in memory, so an unsaved
+    /// edit's dependency is found.
+    #[test]
+    fn unsaved_edits_are_walked() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(dir.path(), "root.usda", "#usda 1.0\ndef \"A\" {\n}\n");
+        write(dir.path(), "extra.usda", "#usda 1.0\ndef \"E\" {\n}\n");
+        let (_, stage) = open(dir.path(), "root.usda")?;
+        let root = stage.root_layer();
+        let identifier = root.identifier().to_owned();
+        root.edit(|edit| {
+            edit.data_mut().set_field(
+                &sdf::Path::abs_root(),
+                FieldKey::SubLayers.as_str(),
+                Value::StringVec(vec!["./extra.usda".into()]),
+            );
+            Ok(())
+        })?;
+        let dependencies = all_dependencies(&stage, &identifier)?;
+        assert_eq!(relative(dir.path(), &dependencies.layers), ["extra.usda", "root.usda"]);
+        Ok(())
+    }
+
+    /// A layer outside the stage that another stage on its registry holds is
+    /// walked as that stage has it, unsaved edits included.
+    #[test]
+    fn held_layer_unsaved() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"P\" {\n    asset a = @./dep.usda@\n}\n",
+        );
+        write(dir.path(), "dep.usda", "#usda 1.0\n");
+        write(dir.path(), "extra.usda", "#usda 1.0\n");
+        let registry = sdf::LayerRegistry::default();
+        let dep = dir.path().join("dep.usda").to_str().unwrap().to_owned();
+        let other = Stage::builder().registry(registry.clone()).open(&dep)?;
+        let dep = other.root_layer().identifier().to_owned();
+        other.edit_layer(&dep, |e| {
+            e.pseudo_root_mut()?.set_sublayers(["./extra.usda"]);
+            Ok(())
+        })?;
+        let root = dir.path().join("root.usda").to_str().unwrap().to_owned();
+        let stage = Stage::builder().registry(registry).open(&root)?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(
+            relative(dir.path(), &dependencies.layers),
+            ["dep.usda", "extra.usda", "root.usda"],
+            "the walk reads the sublayer only the held layer names"
+        );
+        Ok(())
+    }
+
+    /// A prim's `assetInfo:identifier` names the asset itself. The walk skips
+    /// it while the rest of the `assetInfo` is followed; a rewrite still
+    /// visits it.
+    #[test]
+    fn asset_info_identifier_skipped() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" (\n    assetInfo = {\n        asset identifier = @./nowhere.usda@\n        asset icon = @./missing.png@\n    }\n)\n{\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(relative(dir.path(), &dependencies.layers), ["root.usda"]);
+        assert_eq!(relative(dir.path(), &dependencies.unresolved), ["missing.png"]);
+
+        let mut seen = Vec::new();
+        modify_asset_paths(
+            &stage.layer(&dependencies.layers[0])?.unwrap(),
+            |path| {
+                seen.push(path.to_owned());
+                path.to_owned()
+            },
+            true,
+        )?;
+        seen.sort();
+        assert_eq!(seen, ["./missing.png", "./nowhere.usda"]);
+        Ok(())
+    }
+
+    /// A deleted item adds no dependency. An expression in one is left alone.
+    #[test]
+    fn deleted_expression_ignored() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" (\n    delete references = @`\"./${NAME}.usda\"`@\n)\n{\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(relative(dir.path(), &dependencies.layers), ["root.usda"]);
+        assert!(dependencies.unresolved.is_empty(), "{:?}", dependencies.unresolved);
+        Ok(())
+    }
+
+    /// A deleted reference adds no dependency, its metadata included: an
+    /// expression in its `customData` is neither reported nor refused.
+    #[test]
+    fn deleted_reference_metadata_ignored() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" (\n    delete references = @./gone.usda@ (\n        customData = {\n            asset icon = @`\"./${X}.png\"`@\n        }\n    )\n)\n{\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert!(dependencies.assets.is_empty(), "{:?}", dependencies.assets);
+        assert!(dependencies.unresolved.is_empty(), "{:?}", dependencies.unresolved);
+        Ok(())
+    }
+
+    /// An empty clip template, which C++ skips, is not refused.
+    #[test]
+    fn empty_clip_template_allowed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" (\n    clips = {\n        dictionary default = {\n            string templateAssetPath = \"\"\n        }\n    }\n)\n{\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        assert_eq!(all_dependencies(&stage, &root)?.layers.len(), 1);
+        Ok(())
+    }
+
+    /// A variable expression is refused, naming the path.
+    #[test]
+    fn expressions_are_unsupported() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" {\n    asset t = @`\"./${NAME}.png\"`@\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let error = all_dependencies(&stage, &root).unwrap_err();
+        assert!(
+            matches!(&error, Error::Dependency(DependencyError::Unsupported { kind, .. }) if *kind == "variable expression"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A UDIM path names the tiles found beside it, within the tile range;
+    /// one with no tiles is unresolved as authored.
+    #[test]
+    fn udim_tiles_are_dependencies() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "scene/root.usda",
+            "#usda 1.0\ndef \"A\" {\n    asset t = @./tex.<UDIM>.png@\n    asset m = @./missing.<UDIM>.png@\n}\n",
+        );
+        for name in ["tex.1001.png", "tex.1002.png", "tex.1101.png"] {
+            write(dir.path(), &format!("scene/{name}"), "PNG");
+        }
+        let (root, stage) = open(dir.path(), "scene/root.usda")?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(
+            relative(dir.path(), &dependencies.assets),
+            ["scene/tex.1001.png", "scene/tex.1002.png"]
+        );
+        assert_eq!(
+            relative(dir.path(), &dependencies.unresolved),
+            ["scene/missing.<UDIM>.png"]
+        );
+        Ok(())
+    }
+
+    /// One UDIM search path authored by layers in two directories names each
+    /// layer's own tiles.
+    #[test]
+    fn udim_search_path_per_layer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\n(\n    subLayers = [@a/a.usda@, @b/b.usda@]\n)\n",
+        );
+        for (layer, tile) in [("a", "1001"), ("b", "1002")] {
+            write(
+                dir.path(),
+                &format!("{layer}/{layer}.usda"),
+                &format!(
+                    "#usda 1.0\ndef \"{}\" {{\n    asset t = @tex/wood.<UDIM>.png@\n}}\n",
+                    layer.to_uppercase()
+                ),
+            );
+            write(dir.path(), &format!("{layer}/tex/wood.{tile}.png"), "PNG");
+        }
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let dependencies = all_dependencies(&stage, &root)?;
+        assert_eq!(
+            relative(dir.path(), &dependencies.assets),
+            ["a/tex/wood.1001.png", "b/tex/wood.1002.png"]
+        );
+        Ok(())
+    }
+}

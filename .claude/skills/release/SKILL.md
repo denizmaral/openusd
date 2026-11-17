@@ -1,0 +1,69 @@
+---
+name: release
+description: Publish a new release of the openusd workspace crates. Use when cutting a release, bumping the version, or publishing to crates.io.
+argument-hint: "[version] [highlights or other instructions]"
+disable-model-invocation: true
+allowed-tools: Bash(cargo *) Bash(git *) Bash(gh *)
+---
+
+Publish a new release of the openusd workspace. Every crate in `crates/`
+shares one version, one tag, and one set of release notes, and they publish
+together. The version argument is: $ARGUMENTS
+
+Follow these steps:
+
+1. **Validate version**: The arguments may include a version, highlights for the changelog, and/or other instructions — parse them out.
+   - If a version is given, it must follow semver (e.g. `0.3.0`) and must NOT include a `v` prefix.
+   - If no version is given, default to the next minor version above the current `version` in the root Cargo.toml's `[workspace.package]`: bump the minor component and reset the patch to `0` (e.g. `0.3.0` → `0.4.0`, `0.9.1` → `0.10.0`, `1.2.3` → `1.3.0`).
+   - Treat any non-version text in the arguments as guidance for the changelog summary or extra instructions to follow during the release.
+
+2. **Pre-flight checks**: Run these in parallel and stop if any fail:
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   - `cargo fmt --all -- --check --files-with-diff`
+   - `cargo test --workspace --all-targets --all-features`
+
+3. **Generate changelog**:
+   - Run `git describe --tags --abbrev=0` to find the previous tag, then `git log <prev_tag>..HEAD --pretty=format:"- %s (%h)"` to list commits.
+   - Start with a brief, natural summary (2-4 sentences). Write it like a human would in a project update — e.g. "This release introduces the PCP composition engine with full LIVRPS arc support including relocates." Don't enumerate changes in the summary — capture the overall narrative in plain language. Revise the summary with the `writing-review` skill before showing it.
+   - After the summary, add a "Compliance" section. Introduce it with "New [AOUSD Core Spec](docs/aousd_core_spec_1.0.1.pdf) coverage in this release:" then list newly covered spec items. Check ROADMAP.md for features marked with `main` (about to become this version). Format each item as `` `<section>` <name> `` (e.g. `` `10.3.2.6` Relocates ``). Skip this section if no new spec coverage was added.
+   - Then list the detailed changes: group commits by area (composition engine, text parser, binary reader, stage, asset resolution, etc.) and then by type (features, fixes, dependencies). Keep each commit as its own line — do not merge distinct features into one bullet.
+   - Filter out noise (formatting, CI, README updates, CLAUDE.md).
+   - Wrap code identifiers (types, functions, methods, traits, modules, flags, etc.) and crate names/versions in backticks, e.g. `- Add \`ListOp::compose_over\` for list-edit composition (82845fd)`.
+   - Credit external contributors on their own lines: append `by @<handle>` after the hash of every commit whose author is not the maintainer (`mxpv`), e.g. `- Complete UsdShade NodeDef source queries (e10cd18) by @NicTanghe`. The maintainer's commits carry no credit. List the authors with `git log <prev_tag>..HEAD --format='%h %an'`, and take the handle from GitHub, not from the git author name: `gh api repos/mxpv/openusd/commits/<hash> --jq .author.login`, falling back to the author of the pull request (`gh api repos/mxpv/openusd/commits/<hash>/pulls --jq '.[].user.login'`) when the commit's email is not linked to an account. Ask the user for a handle neither call returns.
+   - Write the changelog to a temp file (e.g. `/tmp/CHANGELOG-<version>.md`), NOT to the repo. It is only used for the GitHub release notes.
+   - Show the changelog to the user **in full and verbatim** — every section and every
+     bullet, exactly as it will appear in the release — and wait for confirmation.
+     Do NOT substitute a digest: a paraphrase of the summary, a count of the
+     bullets, or a list of section names is not the changelog. The user is
+     approving text that will be published under their name, so they have to
+     see all of it. Length is not a reason to abbreviate; print it anyway.
+   - Before showing it, verify every commit in the range is either present in the
+     changelog or deliberately filtered as noise, and that no listed hash is one
+     the range does not contain.
+
+4. **Bump version and commit**: The version lives in three places in the root Cargo.toml and all must move together:
+   - `[workspace.package] version` — the version every crate inherits.
+   - `[workspace.dependencies] openusd.version` — what `openusd-schemas` requires of `openusd`. A stale value here publishes a crate that depends on the previous release.
+   - `[workspace.dependencies] openusd-build.version` — what `openusd-schemas` requires of its build dependency `openusd-build`, stale in the same way.
+
+   Then update the dependency examples to the new version (use the `major.minor` form, e.g. `openusd = "0.5"` for `0.5.0`) in all four READMEs: `README.md`, `crates/openusd/README.md`, `crates/openusd-schemas/README.md` (which pins `openusd` and `openusd-schemas`), and `crates/openusd-build/README.md` (which pins `openusd` and `openusd-build`). Stage the root Cargo.toml and the four READMEs (Cargo.lock is gitignored). Commit with message `Bump crate version to <version>`.
+
+5. **Tag**: Create tag `v<version>` on the version bump commit. Do NOT move the tag later — it must stay on this commit.
+
+6. **Update roadmap**: In ROADMAP.md, replace every occurrence of the literal string `` `main` `` with `` `<version>` `` — this includes both the Version column cells and any `` `main` — `` annotations inside the Notes column. Use the Edit tool to make each replacement individually and precisely, since a shell one-liner mangles the backticks. After editing, run `grep -n '`main`' ROADMAP.md` to confirm zero matches remain, then show the full `git diff ROADMAP.md` to the user and wait for confirmation before staging or committing anything. Commit with message `Update ROADMAP` only after the user approves the diff.
+
+7. **Publish to crates.io**: Run `cargo publish --workspace` from the repository root. It publishes every member in dependency order, so `openusd` lands before `openusd-build`, and both before `openusd-schemas`, which builds with `openusd-build`. Wait for confirmation from the user before running this step.
+
+   If any workspace member has never been published, warn the user first: creating a crate needs a crates.io token with the `publish-new` scope, and a token restricted to a crate list must include the new name. A token that can update the existing crates will publish those and then fail the new one with `403 Forbidden: this token does not have the required permissions`.
+
+   Publishing is NOT atomic. If it fails partway, some crates are published at the new version and others are not. Report exactly which succeeded, and resume with `cargo publish -p <crate>` for each one that did not — do NOT re-run `cargo publish --workspace`, which fails on the members already uploaded, and never retry blindly: a published version cannot be replaced or re-uploaded, only yanked.
+
+8. **Push**: Run `git push --atomic origin HEAD v<version>` to push commits and tag together. Wait for confirmation from the user before running this step.
+
+9. **Create GitHub release**: Run `gh release create v<version> --notes-file /tmp/CHANGELOG-<version>.md --latest`.
+
+Important:
+- Always wait for user confirmation before publishing to crates.io (step 7) and pushing (step 8).
+- Always wait for user confirmation before committing the ROADMAP update (step 6).
+- Run `--dry-run` only when the user asks for a dry run.
+- Do NOT add "Co-Authored-By" or "Generated with Claude Code" to commits or the release.

@@ -1,0 +1,959 @@
+//! Typed views for USD's standard schemas, over a composed
+//! [`Stage`](openusd::usd::Stage).
+//!
+//! Ask a `Mesh` for its points, a `Camera` for its focal length, a `Material`
+//! for the shader on its surface output, a `Skeleton` for its joints and
+//! skinning weights — as Rust types, rather than by attribute name and hand
+//! decoding. Every view authors as well as reads.
+//!
+//! Every view is generated at build time by
+//! [`openusd-build`](https://docs.rs/openusd-build) from the definitions this
+//! crate vendors under `schemas/<library>/schema.usda`, copied from OpenUSD
+//! v26.05: a family's views, the tokens it names things by, and the schema
+//! data a registry reads its fallbacks and inheritance from. What is
+//! hand-written beside them is what a property cannot say — a transform
+//! stack, a skinning topology, a render spec.
+//!
+//! Each family is feature-gated, so a caller compiles only the domains it
+//! reads. A family that builds on another's views enables it:
+//!
+//! | Feature | Module | Schemas | Beyond the views |
+//! |---------|--------|---------|------------------|
+//! | `geom`    | `geom`    | `UsdGeom`     | `ImageableExt` (visibility / purpose down namespace), `XformableExt` (the transform stack), `Primvar` and the `PrimvarsAPI` queries (indexed values, inheritance down namespace), the token enums |
+//! | `lux`     | `lux`     | `UsdLux`      | the token enums, light lists and their cache, lights and filters as shading nodes; needs `geom`, `shade` |
+//! | `media`   | `media`   | `UsdMedia`    | asset-preview thumbnails, which live in `assetInfo`; needs `geom` |
+//! | `physics` | `physics` | `UsdPhysics`  | the token enums, a rigid body's mass properties from its colliders, the parser that describes a stage's physics objects to a simulator; needs `geom`, `shade` |
+//! | `proc`    | `proc`    | `UsdProc`     | needs `geom` |
+//! | `render`  | `render`  | `UsdRender`   | the computed render spec, aperture conforming, the stage's settings prim; needs `geom`, `shade` |
+//! | `semantics` | `semantics` | `UsdSemantics` | the taxonomies a prim is labelled under, and the labels it carries under one of them over time and down namespace |
+//! | `shade`   | `shade`   | `UsdShade`    | the `Connectable` interface, connection resolution, material terminals, material bindings and their `materialBind` subsets, the `UsdPreviewSurface` reader; needs `geom` |
+//! | `skel`    | `skel`    | `UsdSkel`     | the skinning toolkit: topology, animation mapping, resolvers, pure-math LBS; needs `geom` |
+//! | `ui`      | `ui`      | `UsdUI`       | |
+//! | `vol`     | `vol`     | `UsdVol`      | a volume's field relationships, which no property declares; needs `geom` |
+//!
+//! # The registry
+//!
+//! A view answers through the stage's [`SchemaRegistry`]: it is what makes a
+//! prim a `Mesh`, what resolves the fallback a schema declares for an
+//! unauthored property, and what answers
+//! [`is_a`](openusd::usd::Prim::is_a) along a schema's inheritance. Hand
+//! [`schema_registry`] to the stage, or register [`ALL`] on a builder of your
+//! own where a caller adds families beside these. A stage opened without it
+//! knows only the core `usd` family, so the typed `get` constructors answer
+//! `None`.
+//!
+//! # Conventions
+//!
+//! Every schema is a view named after it and a `<Class>Schema` trait carrying
+//! its own accessors, so `Mesh` reads through `MeshSchema` and inherits the
+//! rest from the trait of each class behind it: reading `mesh.points_attr()`
+//! needs `PointBasedSchema` in scope. A property is reached through a
+//! `foo_attr()` / `create_foo_attr()` pair, named by the schema's own
+//! `apiName`. An applied API schema is applied to a prim
+//! (`TagAPI::apply(&prim)`) and read back with `get` — or, where it takes an
+//! instance name, `from_prim(&prim, "front")`.
+//!
+//! An abstract class — `Gprim`, `Imageable`, `Xformable` — has a view of its
+//! own, for a prim whose concrete type a caller does not care about:
+//! `Gprim::get(&stage, path)` answers for a prim of any type under it, and
+//! reads the properties they all share. It defines nothing, no prim being of
+//! that type itself.
+
+#[cfg(any(feature = "skel", feature = "vol"))]
+use std::borrow::Cow;
+use std::error::Error;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
+
+use openusd::usd::{self, SchemaRegistry};
+use openusd::{sdf, tf, vt};
+
+// The macros below generate paths into the core crate. Reaching it through
+// `$crate::openusd` keeps them bound to this crate's dependency rather than
+// to whatever `openusd` names at the expansion site.
+pub(crate) use ::openusd;
+
+/// Any failure a schema view can report: a schema-domain failure of its own,
+/// or a core failure ([`Core`](Self::Core)) from the composed queries and
+/// authoring calls the view is built on.
+///
+/// The schemas module is layered on the core the way a separate crate would
+/// be, so the core's [`Error`](openusd::Error) knows nothing of this type; this
+/// enum wraps the core error instead.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchemaError {
+    /// A core failure underneath the schema view.
+    #[error(transparent)]
+    Core(#[from] openusd::Error),
+
+    /// An xformOp names no kind this schema knows, so it has no value type
+    /// and would contribute nothing to the transform stack.
+    #[error("`{op}` is not an xformOp kind")]
+    UnknownXformOp {
+        /// The kind the op token named, with its `xformOp:` prefix and any
+        /// `:suffix` removed.
+        op: String,
+    },
+
+    /// An xformOp's matrix is singular, so the transform stack cannot be
+    /// inverted through it.
+    #[error("xformOp `{op}` matrix is singular and cannot be inverted")]
+    SingularTransform {
+        /// The offending op's attribute name.
+        op: String,
+    },
+
+    /// An xformOp is added to a stack whose `xformOpOrder` already lists it.
+    #[error("xformOp `{op}` is already in xformOpOrder")]
+    XformOpExists {
+        /// The op's `xformOpOrder` entry.
+        op: String,
+    },
+
+    /// A prim's whole transform stack is replaced at an edit target a
+    /// stronger site overrides, so the `xformOpOrder` authored there would
+    /// not be the one read.
+    #[error("{prim} takes its xformOpOrder from {layer}, which is stronger than the edit target")]
+    XformOpOrderShadowed {
+        /// The prim whose stack was to be replaced.
+        prim: sdf::Path,
+        /// Identifier of the layer holding the stronger opinion.
+        layer: String,
+    },
+
+    /// A world-space transform is to be authored on a prim whose parent's
+    /// transform has no inverse, so no local transform gives it.
+    #[error("the parent transform of {prim} is singular and cannot be inverted")]
+    SingularParentTransform {
+        /// The prim whose local transform was to be authored.
+        prim: sdf::Path,
+    },
+
+    /// A prim's transform is asked for as a translate, a rotate, a scale and
+    /// a pivot, and the prim is not transformable or its `xformOpOrder` is
+    /// not that shape.
+    #[error("{prim} has no transform stack XformCommonAPI can author")]
+    IncompatibleXformable {
+        /// The prim whose stack does not fit.
+        prim: sdf::Path,
+    },
+
+    /// A rotation is authored in one axis order on a prim whose stack
+    /// already rotates in another.
+    #[error("{prim} rotates with `{existing}`, not the `{requested}` asked for")]
+    RotationOrderMismatch {
+        /// The prim whose rotate op is of another order.
+        prim: sdf::Path,
+        /// The op type token of the order asked for.
+        requested: &'static str,
+        /// The op type token of the rotate op the stack lists.
+        existing: &'static str,
+    },
+
+    /// A value is set through an inverse xformOp, which reads the value of
+    /// the op it inverts and holds none of its own.
+    #[error("xformOp `{op}` is an inverse op and takes no value")]
+    InverseXformOp {
+        /// The op's `xformOpOrder` entry.
+        op: String,
+    },
+
+    /// A mask keeps or drops each element of an array, so it is as long as
+    /// the array has elements.
+    #[error("a mask of {mask} elements does not fit an array of {len} values at element size {element_size}")]
+    MaskSizeMismatch {
+        /// How many elements the mask covers.
+        mask: usize,
+        /// How many values the array holds.
+        len: usize,
+        /// How many values make up one element.
+        element_size: usize,
+    },
+
+    /// A shading connection chain exceeds the resolver's depth bound,
+    /// indicating a cycle or a pathologically deep graph.
+    #[error("connection chain at {attribute} is deeper than {max} hops")]
+    ConnectionDepthExceeded {
+        /// The attribute whose resolution hit the bound.
+        attribute: sdf::Path,
+        /// The bound that was hit.
+        max: usize,
+    },
+
+    /// A volume field relationship needs a non-empty field name.
+    #[error("Volume field name must not be empty")]
+    EmptyFieldName,
+
+    /// A volume field target is neither a prim nor a property directly on
+    /// one (C++ `SdfPath::IsPrimPath` and `IsPrimPropertyPath`).
+    #[error("Volume field target {path} is neither a prim nor a prim property")]
+    FieldTarget {
+        /// The refused target.
+        path: sdf::Path,
+    },
+
+    /// A dictionary of UI hints holds an entry whose value is not of the type
+    /// every entry of it takes.
+    #[error("uiHints `{key}` entry {entry:?} holds a value of the wrong type")]
+    HintEntryType {
+        /// The hint the dictionary is.
+        key: &'static str,
+        /// The entry holding the wrong type.
+        entry: String,
+    },
+
+    /// A labels query needs a taxonomy to read labels under.
+    #[error("Labels query taxonomy must not be empty")]
+    EmptyTaxonomy,
+
+    /// A labels query over an interval needs one that holds a time.
+    #[error("Labels query interval must not be empty")]
+    EmptyInterval,
+
+    /// A physics parse needs at least one include path to walk from.
+    #[error("Physics parse include paths must not be empty")]
+    EmptyIncludePaths,
+
+    /// A render context that is neither the universal context nor a
+    /// namespaced identifier.
+    #[error("invalid render context {context:?}")]
+    InvalidRenderContext {
+        /// The rejected context string.
+        context: String,
+    },
+
+    /// A collection binding name that is not one plain identifier, which would
+    /// change the token count that tells a binding relationship's role.
+    #[error("`{name}` is not a binding name: one identifier with no `:`")]
+    InvalidBindingName {
+        /// The rejected name.
+        name: String,
+    },
+
+    /// The `materialBind` family of subsets is given the unrestricted type,
+    /// under which one element could be bound to several materials.
+    #[error("the materialBind subsets of {prim} cannot be unrestricted")]
+    UnrestrictedBindFamily {
+        /// The prim whose subsets they are.
+        prim: sdf::Path,
+    },
+
+    /// A name that no primvar can have: one ending in `:indices`, which names
+    /// the indices attribute a primvar keeps beside it.
+    #[error("`{name}` is not a primvar name: `indices` is reserved for a primvar's indices attribute")]
+    InvalidPrimvarName {
+        /// The rejected name, as given.
+        name: String,
+    },
+
+    /// A primvar's element size counts the values that make up one element,
+    /// so it is at least one.
+    #[error("primvar {primvar} has element size {element_size}, which must be at least 1")]
+    InvalidElementSize {
+        /// The primvar's attribute path.
+        primvar: sdf::Path,
+        /// The rejected element size.
+        element_size: i32,
+    },
+
+    /// Only an array-valued primvar is indexed.
+    #[error("primvar {primvar} of type `{type_name}` is not an array, so it takes no indices")]
+    PrimvarNotArray {
+        /// The primvar's attribute path.
+        primvar: sdf::Path,
+        /// The type the primvar is declared as, empty where nothing declares
+        /// it.
+        type_name: tf::Token,
+    },
+
+    /// An indexed primvar whose indices read no value at the time asked for.
+    #[error("primvar {primvar} is indexed, but its indices hold no `int[]` value at the time read")]
+    PrimvarIndicesMissing {
+        /// The primvar's attribute path.
+        primvar: sdf::Path,
+    },
+
+    /// An indexed primvar whose indices reach outside its values.
+    #[error("primvar {primvar} has {error}")]
+    PrimvarIndexOutOfRange {
+        /// The primvar's attribute path.
+        primvar: sdf::Path,
+        /// The indices that reach outside.
+        error: Box<PrimvarIndexError>,
+    },
+
+    /// Only a `string` or `string[]` primvar takes an id target.
+    #[error("primvar {primvar} of type `{type_name}` takes no id target: only a string or string[] primvar does")]
+    IdTargetType {
+        /// The primvar's attribute path.
+        primvar: sdf::Path,
+        /// The type the primvar is declared as, empty where nothing declares
+        /// it.
+        type_name: tf::Token,
+    },
+
+    /// A tetrahedron of a tet mesh names a point the mesh does not have.
+    #[error("tetrahedron {tet} of {prim} has vertex index {index}, outside the mesh's {points} points")]
+    TetVertexOutOfRange {
+        /// The tet mesh.
+        prim: sdf::Path,
+        /// The tetrahedron's position in `tetVertexIndices`.
+        tet: usize,
+        /// The first of its four indices that is out of range.
+        index: i32,
+        /// How many points the mesh has at the time read.
+        points: usize,
+    },
+
+    /// An attribute a computation starts from reads no value at the time
+    /// asked about.
+    #[error("{attribute} holds no value to compute from")]
+    NoValue {
+        /// The attribute read.
+        attribute: sdf::Path,
+    },
+
+    /// A per-instance array of a point instancer does not hold one element
+    /// for each instance.
+    #[error("{attribute} holds {found} elements for {expected} instances")]
+    InstanceCountMismatch {
+        /// The attribute read.
+        attribute: sdf::Path,
+        /// How many elements it holds.
+        found: usize,
+        /// How many instances `protoIndices` names.
+        expected: usize,
+    },
+
+    /// The widths an extent is computed from are not one for each point.
+    #[error("{found} widths for {expected} points")]
+    WidthCountMismatch {
+        /// How many widths there are.
+        found: usize,
+        /// How many points there are.
+        expected: usize,
+    },
+
+    /// An extents hint holds an extent for one purpose at least, and for
+    /// each purpose at most.
+    #[error("{prim} takes an extents hint of 1 to {max} extents, not {found}")]
+    ExtentsHintCount {
+        /// The model the hint is authored on.
+        prim: sdf::Path,
+        /// How many extents were given.
+        found: usize,
+        /// How many purposes there are to hold an extent for.
+        max: usize,
+    },
+
+    /// A constraint target is asked to be created on a prim that is not a
+    /// model. Only a model publishes constraint targets.
+    #[error("{prim} is not a model, and only a model has constraint targets")]
+    ConstraintTargetOffModel {
+        /// The prim.
+        prim: sdf::Path,
+    },
+
+    /// The attribute a constraint target would be is declared to hold
+    /// something other than a matrix.
+    #[error("{attribute} of type `{type_name}` is no constraint target: only a matrix-valued attribute is")]
+    ConstraintTargetType {
+        /// The attribute's path.
+        attribute: sdf::Path,
+        /// The type the attribute is declared as, empty where the property
+        /// is a relationship.
+        type_name: tf::Token,
+    },
+
+    /// The positions instance transforms are computed from are not one for
+    /// each instance.
+    #[error("{found} positions for {expected} instances")]
+    PositionCountMismatch {
+        /// How many positions there are.
+        found: usize,
+        /// How many instances the prototype indices name.
+        expected: usize,
+    },
+
+    /// One of the times instance transforms were asked for is the default
+    /// time and another is numeric. C++ `ComputeInstanceTransformsAtTimes`
+    /// refuses the mix: values read at their defaults cannot be carried to a
+    /// time, nor sampled ones to none.
+    #[error("the times asked of {prim} mix the default time with numeric ones")]
+    DefaultTimeMismatch {
+        /// The point instancer.
+        prim: sdf::Path,
+    },
+
+    /// A prim resets the transform stack beneath a prim whose own transform
+    /// has no inverse, a scale of zero along an axis say. The prim is where
+    /// its own transform puts it, and no point of the flattened space above
+    /// it is there, so a bound in that space cannot hold it. The prim's own
+    /// bound is still answered.
+    #[error("{prim} resets the transform stack beneath {ancestor}, whose transform has no inverse to place it by")]
+    ResetBeneathFlattened {
+        /// The prim that resets the transform stack.
+        prim: sdf::Path,
+        /// The prim that holds it, whose place in the world has no inverse.
+        ancestor: sdf::Path,
+    },
+
+    /// An index names no instance of a point instancer.
+    #[error("{prim} has no instance at index {index}, among its {instances} instances")]
+    InstanceIndexOutOfRange {
+        /// The point instancer.
+        prim: sdf::Path,
+        /// The index asked for.
+        index: usize,
+        /// How many instances the instancer holds at the times asked for.
+        instances: usize,
+    },
+
+    /// A point instancer is held by one of its own prototypes, directly or
+    /// through the prototypes of an instancer between them. Its extent is
+    /// the bound of those prototypes, which would hold the extent itself.
+    #[error("{prim} is bounded by prototypes that hold it")]
+    InstancerCycle {
+        /// The point instancer.
+        prim: sdf::Path,
+    },
+
+    /// A point instancer asked for its prototypes' transforms targets no
+    /// prototype.
+    #[error("{prim} targets no prototypes")]
+    NoPrototypes {
+        /// The point instancer.
+        prim: sdf::Path,
+    },
+
+    /// An element of a point instancer's `protoIndices` names no target of
+    /// its `prototypes` relationship.
+    #[error("{prim} has prototype index {index}, outside its {prototypes} prototypes")]
+    PrototypeIndexOutOfRange {
+        /// The point instancer.
+        prim: sdf::Path,
+        /// The first index that is out of range.
+        index: i32,
+        /// How many prototypes the instancer targets.
+        prototypes: usize,
+    },
+
+    /// Hermite curve data that does not pair each point with a tangent:
+    /// arrays of different lengths, or an interleaved array of odd length.
+    #[error("hermite curve data holds {points} points and {tangents} tangents, which do not pair up")]
+    UnpairedHermiteData {
+        /// How many points the data holds.
+        points: usize,
+        /// How many tangents the data holds.
+        tangents: usize,
+    },
+
+    /// A joint index above `i32::MAX`, which the `int[]` joint indices
+    /// primvar cannot hold.
+    #[error("joint index {joint} of {prim} does not fit the `int` it is authored as")]
+    JointIndexOverflow {
+        /// The prim whose influences were being authored.
+        prim: sdf::Path,
+        /// The joint index asked for.
+        joint: usize,
+    },
+
+    /// A skinning bake reaching a SkelRoot or skinned prim that is an
+    /// instance or an instance proxy, which the bake cannot write into.
+    #[error("{prim} is instanced, and a skinning bake cannot write into an instance")]
+    BakeInstanced {
+        /// The instanced prim.
+        prim: sdf::Path,
+    },
+
+    /// A skinning bake output whose destination layer already holds a spec
+    /// of another type for it.
+    #[error("{attribute} is `{found}` in the bake's layer, not the `{expected}` the bake writes")]
+    BakeSpecType {
+        /// The output attribute.
+        attribute: sdf::Path,
+        /// The type its spec has.
+        found: tf::Token,
+        /// The type the bake writes.
+        expected: tf::Token,
+    },
+
+    /// A skinning bake destination outside the stage's root layer stack.
+    #[error("layer {layer} is not in the stage's root layer stack, so a skinning bake cannot write to it")]
+    BakeLayer {
+        /// The destination layer's identifier.
+        layer: String,
+    },
+
+    /// A skinning bake given roots or bindings from more than one stage.
+    #[error("{prim} belongs to another stage than the rest of the skinning bake")]
+    BakeStages {
+        /// The first prim from a second stage.
+        prim: sdf::Path,
+    },
+
+    /// A skinning bake failing to compute or write the extents of the
+    /// point-based prims other than meshes, after its geometry committed.
+    #[error("a skinning bake committed its geometry but failed to update extents")]
+    BakeExtents(#[source] Box<SchemaError>),
+
+    /// A skinning bake failing to compute or write the extents hints of the
+    /// models above its prims, after its geometry and extents committed.
+    #[error("a skinning bake committed its geometry and extents but failed to update extents hints")]
+    BakeExtentHints(#[source] Box<SchemaError>),
+
+    /// A geom subset query names an element type the geometry has no
+    /// elements of, such as the segments of a mesh.
+    #[error("{prim} has no `{element_type}` elements for a GeomSubset to index")]
+    UnsupportedSubsetElementType {
+        /// The geometry asked about.
+        prim: sdf::Path,
+        /// The element type token asked for.
+        element_type: &'static str,
+    },
+
+    /// A connection source is to be authored, with the type of the attribute
+    /// connecting to it, and that attribute declares none.
+    #[error("connection source {attribute} cannot be created: {consumer} declares no value type")]
+    UntypedConnectionSource {
+        /// The source attribute.
+        attribute: sdf::Path,
+        /// The attribute connecting to it.
+        consumer: sdf::Path,
+    },
+
+    /// A master material variant is asked for over no materials.
+    #[error("no materials to give {master} a master material variant over")]
+    NoMaterials {
+        /// The master prim.
+        master: sdf::Path,
+    },
+
+    /// A material is on another stage than the master prim switching it.
+    #[error("material {material} is not on the stage of master prim {master}")]
+    ForeignStage {
+        /// The material.
+        material: sdf::Path,
+        /// The master prim.
+        master: sdf::Path,
+    },
+
+    /// A material a master variant is to switch has no `materialVariant`
+    /// variants.
+    #[error("material {material} has no materialVariant variants")]
+    NoMaterialVariants {
+        /// The material.
+        material: sdf::Path,
+    },
+
+    /// The materials a master variant is to switch differ in their
+    /// `materialVariant` variants.
+    #[error("material {material} has other materialVariant variants than {first}")]
+    MismatchedMaterialVariants {
+        /// The material whose variants differ.
+        material: sdf::Path,
+        /// The first material, whose variants the others are held to.
+        first: sdf::Path,
+    },
+
+    /// A skinning query is bound to a skeleton whose joint order, or whose
+    /// animation's blend-shape order, differs from the orders the query was
+    /// built against.
+    #[error("the skinning query of {target} was not built for skeleton {skeleton}")]
+    ForeignSkinningTarget {
+        /// The skinned prim.
+        target: sdf::Path,
+        /// The skeleton it was to be bound to.
+        skeleton: sdf::Path,
+    },
+}
+
+/// The indices of an indexed primvar that reach outside its values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimvarIndexError {
+    /// How many of the indices are out of range.
+    pub invalid: usize,
+    /// How many values the primvar holds.
+    pub len: usize,
+    /// The primvar's element size: how many values each index selects.
+    pub element_size: usize,
+    /// The first out-of-range indices, at most five, each as its position in
+    /// the indices array and the index found there.
+    pub first: Vec<(usize, i32)>,
+}
+
+impl fmt::Display for PrimvarIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} indices outside {} values at element size {}:",
+            self.invalid, self.len, self.element_size
+        )?;
+        for (position, index) in &self.first {
+            write!(f, " index {index} at position {position};")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for PrimvarIndexError {}
+
+/// Stage-tier authoring failures route through [`SchemaError::Core`], so a
+/// schema authoring helper propagates them with one `?`.
+impl From<openusd::usd::StageAuthoringError> for SchemaError {
+    fn from(error: openusd::usd::StageAuthoringError) -> Self {
+        Self::Core(error.into())
+    }
+}
+
+/// Composed-query failures route through [`SchemaError::Core`] likewise.
+impl From<openusd::pcp::QueryError> for SchemaError {
+    fn from(error: openusd::pcp::QueryError) -> Self {
+        Self::Core(error.into())
+    }
+}
+
+/// Layer read failures route through [`SchemaError::Core`] likewise.
+impl From<sdf::LayerError> for SchemaError {
+    fn from(error: sdf::LayerError) -> Self {
+        Self::Core(error.into())
+    }
+}
+
+/// Path-parse failures route through [`SchemaError::Core`] likewise.
+impl From<sdf::PathParseError> for SchemaError {
+    fn from(error: sdf::PathParseError) -> Self {
+        Self::Core(error.into())
+    }
+}
+
+/// Cast failures route through [`SchemaError::Core`] likewise.
+impl From<vt::CastError> for SchemaError {
+    fn from(error: vt::CastError) -> Self {
+        Self::Core(error.into())
+    }
+}
+
+/// A value that does not fit an attribute's declared type surfaces as the
+/// authoring error it is.
+impl From<sdf::ValueTypeError> for SchemaError {
+    fn from(error: sdf::ValueTypeError) -> Self {
+        Self::Core(openusd::usd::StageAuthoringError::from(error).into())
+    }
+}
+
+#[cfg(feature = "geom")]
+pub mod geom;
+#[cfg(feature = "lux")]
+pub mod lux;
+#[cfg(feature = "media")]
+pub mod media;
+#[cfg(feature = "physics")]
+pub mod physics;
+#[cfg(feature = "proc")]
+pub mod proc;
+#[cfg(feature = "render")]
+pub mod render;
+#[cfg(feature = "semantics")]
+pub mod semantics;
+#[cfg(feature = "shade")]
+pub mod shade;
+#[cfg(feature = "skel")]
+pub mod skel;
+#[cfg(feature = "ui")]
+pub mod ui;
+#[cfg(feature = "vol")]
+pub mod vol;
+
+/// Every family this build enables, ready to register.
+///
+/// Register each on a builder to make a registry of your own;
+/// [`schema_registry`] is the shared one built from exactly this. Each family declares the schema data generated from its
+/// own vendored definitions: the fallbacks a stage resolves, and the
+/// inheritance it answers [`is_a`](openusd::usd::Prim::is_a) along.
+///
+/// A single family registers the same way, through the `SCHEMAS` its module
+/// exposes:
+///
+/// ```
+/// # #[cfg(feature = "geom")]
+/// # fn main() -> Result<(), openusd::usd::SchemaRegistryError> {
+/// use openusd::usd::SchemaRegistry;
+///
+/// let registry = SchemaRegistry::builder().register(openusd_schemas::geom::SCHEMAS).build()?;
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "geom"))]
+/// # fn main() {}
+/// ```
+pub static ALL: &[&usd::SchemaFamily<'static>] = &[
+    #[cfg(feature = "geom")]
+    geom::SCHEMAS,
+    #[cfg(feature = "lux")]
+    lux::SCHEMAS,
+    #[cfg(feature = "media")]
+    media::SCHEMAS,
+    #[cfg(feature = "physics")]
+    physics::SCHEMAS,
+    #[cfg(feature = "proc")]
+    proc::SCHEMAS,
+    #[cfg(feature = "render")]
+    render::SCHEMAS,
+    #[cfg(feature = "semantics")]
+    semantics::SCHEMAS,
+    #[cfg(feature = "shade")]
+    shade::SCHEMAS,
+    #[cfg(feature = "skel")]
+    skel::SCHEMAS,
+    #[cfg(feature = "ui")]
+    ui::SCHEMAS,
+    #[cfg(feature = "vol")]
+    vol::SCHEMAS,
+];
+
+/// The registry of every enabled family, built once and shared.
+///
+/// Hand it to [`usd::StageBuilder::schema_registry`](openusd::usd::StageBuilder::schema_registry):
+/// a stage opened without it knows only the core `usd` family, so the typed
+/// `get` constructors answer `None` and no schema fallback resolves.
+///
+/// ```no_run
+/// use openusd::usd::Stage;
+///
+/// let stage = Stage::builder()
+///     .schema_registry(openusd_schemas::schema_registry())
+///     .open("scene.usda")?;
+/// # Ok::<(), openusd::Error>(())
+/// ```
+///
+/// # Panics
+///
+/// If the generated schema data does not register or compose, which is a bug
+/// in this crate rather than anything a caller can cause.
+pub fn schema_registry() -> Arc<SchemaRegistry> {
+    static REGISTRY: OnceLock<Arc<SchemaRegistry>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            ALL.iter()
+                .fold(SchemaRegistry::builder(), |builder, family| builder.register(family))
+                .build()
+                .expect("the generated schema data registers and composes")
+        })
+        .clone()
+}
+
+/// The extent function of every schema of this crate that has one, among
+/// the families enabled: what [`geom::BoundableExt`] computes extents with.
+///
+/// A clone of it is the starting point for a registry that also bounds types
+/// declared elsewhere.
+#[cfg(feature = "geom")]
+pub fn extent_registry() -> &'static geom::ExtentRegistry {
+    static REGISTRY: OnceLock<geom::ExtentRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = geom::ExtentRegistry::new();
+        geom::boundable::register_extents(&mut registry);
+        #[cfg(feature = "lux")]
+        lux::register_extents(&mut registry);
+        #[cfg(feature = "skel")]
+        skel::register_extents(&mut registry);
+        registry
+    })
+}
+
+/// The connectable behavior of every schema of this crate that has one, among
+/// the families enabled: what a [`shade::ConnectableContext`] answers with by
+/// default.
+///
+/// A clone of it is the starting point for a registry that also knows types
+/// declared elsewhere.
+#[cfg(feature = "shade")]
+pub fn connectable_registry() -> &'static shade::BehaviorRegistry {
+    static REGISTRY: OnceLock<shade::BehaviorRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = shade::BehaviorRegistry::new();
+        shade::behavior::register_behaviors(&mut registry);
+        #[cfg(feature = "lux")]
+        lux::register_behaviors(&mut registry);
+        registry
+    })
+}
+
+/// `attr`'s value at `time`, where `None` is the default time, when some layer
+/// authors one, and `None` where the value would be the schema's fallback.
+///
+/// A fallback is not an opinion anyone stated, so the computations that
+/// inherit a value from an ancestor, or from a settings prim, look past it:
+/// C++ checks `HasAuthoredValue` before `Get` for exactly this.
+// TODO(perf): the two calls resolve the attribute twice. C++ asks both of
+// one `UsdAttributeQuery`; `usd::AttributeQuery` would need to answer
+// whether a value is authored, and the default-time read, from the source
+// it keeps. A single read at `time` that drops a fallback is not the same
+// answer: an attribute with samples and no default reads its fallback at
+// the default time, and that read still counts as authored.
+#[cfg(feature = "geom")]
+pub(crate) fn authored_at<T>(attr: &usd::Attribute, time: Option<usd::TimeCode>) -> openusd::Result<Option<T>>
+where
+    T: vt::FromValue,
+    T::Error: Into<openusd::Error>,
+{
+    match attr.has_authored_value()? {
+        true => attr.get_at(time),
+        false => Ok(None),
+    }
+}
+
+/// `name` under `namespace`, a prefix ending in `:`, and `name` unchanged when
+/// it already starts with it (C++ `_MakeNamespaced` on `UsdVolVolume` and
+/// `UsdSkelBlendShape`).
+#[cfg(any(feature = "skel", feature = "vol"))]
+pub(crate) fn namespaced<'a>(namespace: &str, name: &'a str) -> Cow<'a, str> {
+    match name.starts_with(namespace) {
+        true => Cow::Borrowed(name),
+        false => Cow::Owned(format!("{namespace}{name}")),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    use std::cell::Cell;
+    use std::fs;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    use openusd::Result;
+    use openusd::usd::Stage;
+
+    /// An in-memory stage carrying every enabled family's schema data, which
+    /// is what makes a prim its type and resolves the fallbacks a schema
+    /// declares. Reached from a family's own tests as
+    /// `crate::tests::stage("anon.usda")`.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn stage(name: &str) -> Result<Stage> {
+        Stage::builder().schema_registry(schema_registry()).in_memory(name)
+    }
+
+    /// How many edits `stage` commits from here on.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn commits(stage: &Stage) -> Rc<Cell<usize>> {
+        let commits = Rc::new(Cell::new(0));
+        let counted = commits.clone();
+        stage
+            .add_sink(move |_stage: &Stage, _change: &usd::CommittedChange<'_>| counted.set(counted.get() + 1))
+            .unwrap();
+        commits
+    }
+
+    /// A stage opened from `usda` text written to a fresh directory, carrying
+    /// every enabled family's schema data. For a scene the stage-tier setters
+    /// refuse to author, such as a value of another type than its schema
+    /// declares.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn from_usda(usda: &str) -> Result<(tempfile::TempDir, Stage)> {
+        from_usda_with(usda, |builder| builder)
+    }
+
+    /// [`from_usda`], with the stage builder configured by `configure` before
+    /// it opens: a population mask, a load rule.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn from_usda_with(
+        usda: &str,
+        configure: impl FnOnce(usd::StageBuilder) -> usd::StageBuilder,
+    ) -> Result<(tempfile::TempDir, Stage)> {
+        from_files_with(&[("scene.usda", usda)], "scene.usda", configure)
+    }
+
+    /// A stage opened on `root` among `files`, each a file name and its usda
+    /// text written to a fresh directory, carrying every enabled family's
+    /// schema data. For a scene whose layers reach each other by relative
+    /// path.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn from_files(files: &[(&str, &str)], root: &str) -> Result<(tempfile::TempDir, Stage)> {
+        from_files_with(files, root, |builder| builder)
+    }
+
+    /// [`from_files`], with the stage builder configured by `configure` before
+    /// it opens.
+    pub(crate) fn from_files_with(
+        files: &[(&str, &str)],
+        root: &str,
+        configure: impl FnOnce(usd::StageBuilder) -> usd::StageBuilder,
+    ) -> Result<(tempfile::TempDir, Stage)> {
+        let dir = tempfile::tempdir()?;
+        for (name, usda) in files {
+            fs::write(dir.path().join(name), usda)?;
+        }
+        let path = dir.path().join(root);
+        let stage = configure(Stage::builder().schema_registry(schema_registry()))
+            .open(path.to_str().expect("utf-8 temp path"))?;
+        Ok((dir, stage))
+    }
+
+    /// A stage whose root layer only sublayers `layers`, strongest first, each
+    /// a file name and its `usda` body after the header. Carries every enabled
+    /// family's schema data.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn layered(layers: &[(&str, &str)]) -> Result<(tempfile::TempDir, Stage)> {
+        let dir = tempfile::tempdir()?;
+        let subs: Vec<String> = layers.iter().map(|(name, _)| format!("@./{name}@")).collect();
+        let root = dir.path().join("root.usda");
+        fs::write(
+            &root,
+            format!("#usda 1.0\n(\n    subLayers = [{}]\n)\n", subs.join(", ")),
+        )?;
+        for (name, body) in layers {
+            fs::write(dir.path().join(name), format!("#usda 1.0\n{body}\n"))?;
+        }
+        let stage = Stage::builder()
+            .schema_registry(schema_registry())
+            .open(root.to_str().expect("utf-8 temp path"))?;
+        Ok((dir, stage))
+    }
+
+    /// Aim `stage`'s edit target at the layer whose file is `name`, and
+    /// return that layer's identifier.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn target_layer(stage: &Stage, name: &str) -> Result<String> {
+        let identifier = stage
+            .layer_identifiers()
+            .into_iter()
+            .find(|id| Path::new(id).file_name().is_some_and(|file| file == name))
+            .expect("the layer is on the stage");
+        stage.set_edit_target(usd::EditTarget::for_layer(identifier.clone()))?;
+        Ok(identifier)
+    }
+
+    /// The layer named `identifier`, as the text it would be saved as.
+    #[allow(
+        dead_code,
+        reason = "which families' tests reach for it depends on the features enabled"
+    )]
+    pub(crate) fn layer_text(stage: &Stage, identifier: &str) -> String {
+        let layer = stage.layer(identifier).unwrap().expect("the layer is on the stage");
+        layer.export_to_string().expect("the layer exports")
+    }
+}

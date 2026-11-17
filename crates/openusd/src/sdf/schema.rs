@@ -1,0 +1,552 @@
+use strum::VariantArray;
+
+use super::ValueTypeName;
+use crate::vt::ValueKind;
+
+/// The following fields are pre-registered by Sdf.
+///
+/// See <https://github.com/PixarAnimationStudios/OpenUSD/blob/release/pxr/usd/sdf/schema.h#L597>
+#[derive(Debug, Clone, Copy, VariantArray)]
+pub enum FieldKey {
+    Active,
+    AllowedTokens,
+    ApiSchemas,
+    AssetInfo,
+    Clips,
+    ClipSets,
+    ColorConfiguration,
+    ColorManagementSystem,
+    ColorSpace,
+    Comment,
+    ConnectionPaths,
+    Custom,
+    CustomData,
+    CustomLayerData,
+    Default,
+    DefaultPrim,
+    DisplayGroup,
+    DisplayGroupOrder,
+    DisplayName,
+    DisplayUnit,
+    Documentation,
+    EndTimeCode,
+    ExpressionVariables,
+    FallbackPrimTypes,
+    FramePrecision,
+    FramesPerSecond,
+    Hidden,
+    HasOwnedSubLayers,
+    InheritPaths,
+    Instanceable,
+    Kind,
+    LayerRelocates,
+    PrimOrder,
+    NoLoadHint,
+    Owner,
+    Payload,
+    Permission,
+    Prefix,
+    PrefixSubstitutions,
+    PropertyOrder,
+    References,
+    Relocates,
+    SessionOwner,
+    Specializes,
+    Specifier,
+    Spline,
+    StartTimeCode,
+    SubLayers,
+    SubLayerOffsets,
+    Suffix,
+    SuffixSubstitutions,
+    SymmetricPeer,
+    SymmetryArgs,
+    SymmetryArguments,
+    SymmetryFunction,
+    TargetPaths,
+    TimeSamples,
+    TimeCodesPerSecond,
+    TypeName,
+    VariantSelection,
+    Variability,
+    VariantSetNames,
+    EndFrame,
+    StartFrame,
+}
+
+impl From<FieldKey> for &'static str {
+    fn from(key: FieldKey) -> Self {
+        key.as_str()
+    }
+}
+
+impl AsRef<str> for FieldKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FieldKey {
+    /// The type of the plain value the field holds, as C++ `SdfSchema`
+    /// registers its fallback: `hidden` a `bool`, `colorSpace` a `token`,
+    /// `allowedTokens` a `token[]`. A reader takes the field's literal as that
+    /// type, and a writer converts a value to it.
+    ///
+    /// `None` for a field that holds a dictionary, a list op or one of the
+    /// scene-description types (`specifier`, `references`, `relocates`, ...),
+    /// which have their own grammar, and for `displayUnit`, which is written
+    /// as a bare unit name.
+    pub const fn value_type(self) -> Option<ValueTypeName> {
+        use FieldKey as F;
+        use ValueTypeName as T;
+        Some(match self {
+            F::Active | F::Custom | F::Hidden | F::HasOwnedSubLayers | F::Instanceable | F::NoLoadHint => T::BOOL,
+            F::ColorManagementSystem | F::ColorSpace | F::DefaultPrim | F::Kind | F::SymmetryFunction | F::TypeName => {
+                T::TOKEN
+            }
+            F::Comment
+            | F::DisplayGroup
+            | F::DisplayName
+            | F::Documentation
+            | F::Owner
+            | F::Prefix
+            | F::SessionOwner
+            | F::Suffix
+            | F::SymmetricPeer => T::STRING,
+            F::AllowedTokens | F::PrimOrder | F::PropertyOrder => T::TOKEN_ARRAY,
+            F::DisplayGroupOrder => T::STRING_ARRAY,
+            F::EndFrame
+            | F::EndTimeCode
+            | F::FramesPerSecond
+            | F::StartFrame
+            | F::StartTimeCode
+            | F::TimeCodesPerSecond => T::DOUBLE,
+            F::FramePrecision => T::INT,
+            F::ColorConfiguration => T::ASSET,
+            F::ApiSchemas
+            | F::AssetInfo
+            | F::Clips
+            | F::ClipSets
+            | F::ConnectionPaths
+            | F::CustomData
+            | F::CustomLayerData
+            | F::Default
+            | F::DisplayUnit
+            | F::ExpressionVariables
+            | F::FallbackPrimTypes
+            | F::InheritPaths
+            | F::LayerRelocates
+            | F::Payload
+            | F::Permission
+            | F::PrefixSubstitutions
+            | F::References
+            | F::Relocates
+            | F::Specializes
+            | F::Specifier
+            | F::Spline
+            | F::SubLayers
+            | F::SubLayerOffsets
+            | F::SuffixSubstitutions
+            | F::SymmetryArgs
+            | F::SymmetryArguments
+            | F::TargetPaths
+            | F::TimeSamples
+            | F::VariantSelection
+            | F::Variability
+            | F::VariantSetNames => return None,
+        })
+    }
+
+    /// The field `name` denotes, or `None` where this enum does not name it.
+    ///
+    /// A schema may declare fields of its own, so a `None` here does not mean
+    /// the field is unregistered; [`registered_field_type`] answers that.
+    pub fn from_name(name: &str) -> Option<Self> {
+        FieldKey::VARIANTS.iter().copied().find(|key| key.as_str() == name)
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            FieldKey::Active => "active",
+            FieldKey::AllowedTokens => "allowedTokens",
+            FieldKey::ApiSchemas => "apiSchemas",
+            FieldKey::AssetInfo => "assetInfo",
+            FieldKey::Clips => "clips",
+            FieldKey::ClipSets => "clipSets",
+            FieldKey::ColorConfiguration => "colorConfiguration",
+            FieldKey::ColorManagementSystem => "colorManagementSystem",
+            FieldKey::ColorSpace => "colorSpace",
+            FieldKey::Comment => "comment",
+            FieldKey::ConnectionPaths => "connectionPaths",
+            FieldKey::Custom => "custom",
+            FieldKey::CustomData => "customData",
+            FieldKey::CustomLayerData => "customLayerData",
+            FieldKey::Default => "default",
+            FieldKey::DefaultPrim => "defaultPrim",
+            FieldKey::DisplayGroup => "displayGroup",
+            FieldKey::DisplayGroupOrder => "displayGroupOrder",
+            FieldKey::DisplayName => "displayName",
+            FieldKey::DisplayUnit => "displayUnit",
+            FieldKey::Documentation => "documentation",
+            FieldKey::EndTimeCode => "endTimeCode",
+            FieldKey::ExpressionVariables => "expressionVariables",
+            FieldKey::FallbackPrimTypes => "fallbackPrimTypes",
+            FieldKey::FramePrecision => "framePrecision",
+            FieldKey::FramesPerSecond => "framesPerSecond",
+            FieldKey::Hidden => "hidden",
+            FieldKey::HasOwnedSubLayers => "hasOwnedSubLayers",
+            FieldKey::InheritPaths => "inheritPaths",
+            FieldKey::Instanceable => "instanceable",
+            FieldKey::Kind => "kind",
+            FieldKey::LayerRelocates => "layerRelocates",
+            FieldKey::PrimOrder => "primOrder",
+            FieldKey::NoLoadHint => "noLoadHint",
+            FieldKey::Owner => "owner",
+            FieldKey::Payload => "payload",
+            FieldKey::Permission => "permission",
+            FieldKey::Prefix => "prefix",
+            FieldKey::PrefixSubstitutions => "prefixSubstitutions",
+            FieldKey::PropertyOrder => "propertyOrder",
+            FieldKey::References => "references",
+            FieldKey::Relocates => "relocates",
+            FieldKey::SessionOwner => "sessionOwner",
+            FieldKey::Specializes => "specializes",
+            FieldKey::Specifier => "specifier",
+            FieldKey::Spline => "spline",
+            FieldKey::StartTimeCode => "startTimeCode",
+            FieldKey::SubLayers => "subLayers",
+            FieldKey::SubLayerOffsets => "subLayerOffsets",
+            FieldKey::Suffix => "suffix",
+            FieldKey::SuffixSubstitutions => "suffixSubstitutions",
+            FieldKey::SymmetricPeer => "symmetricPeer",
+            FieldKey::SymmetryArgs => "symmetryArgs",
+            FieldKey::SymmetryArguments => "symmetryArguments",
+            FieldKey::SymmetryFunction => "symmetryFunction",
+            FieldKey::TargetPaths => "targetPaths",
+            FieldKey::TimeSamples => "timeSamples",
+            FieldKey::TimeCodesPerSecond => "timeCodesPerSecond",
+            FieldKey::TypeName => "typeName",
+            FieldKey::VariantSelection => "variantSelection",
+            FieldKey::Variability => "variability",
+            FieldKey::VariantSetNames => "variantSetNames",
+            FieldKey::EndFrame => "endFrame",
+            FieldKey::StartFrame => "startFrame",
+        }
+    }
+}
+
+/// See <https://github.com/PixarAnimationStudios/OpenUSD/blob/2864f3d04f396432f22ec5d6928fc37d34bb4c90/pxr/usd/sdf/schema.h#L652>
+#[derive(Clone, Copy)]
+pub enum ChildrenKey {
+    ConnectionChildren,
+    ExpressionChildren,
+    MapperArgChildren,
+    MapperChildren,
+    PrimChildren,
+    PropertyChildren,
+    RelationshipTargetChildren,
+    VariantChildren,
+    VariantSetChildren,
+}
+
+impl From<ChildrenKey> for &'static str {
+    fn from(key: ChildrenKey) -> Self {
+        key.as_str()
+    }
+}
+
+impl AsRef<str> for ChildrenKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl ChildrenKey {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ChildrenKey::ConnectionChildren => "connectionChildren",
+            ChildrenKey::ExpressionChildren => "expressionChildren",
+            ChildrenKey::MapperArgChildren => "mapperArgChildren",
+            ChildrenKey::MapperChildren => "mapperChildren",
+            ChildrenKey::PrimChildren => "primChildren",
+            // The internal/text token is "propertyChildren". The crate (binary)
+            // format stores this field under the name "properties"; the usdc
+            // reader and writer translate at that boundary (see `usdc`).
+            ChildrenKey::PropertyChildren => "propertyChildren",
+            ChildrenKey::RelationshipTargetChildren => "targetChildren",
+            ChildrenKey::VariantChildren => "variantChildren",
+            ChildrenKey::VariantSetChildren => "variantSetChildren",
+        }
+    }
+}
+
+/// The metadata fields the libraries shipped with USD declare, beyond the
+/// core fields [`FieldKey`] names, each with the type its declaration gives
+/// it.
+///
+/// C++ discovers these from the `SdfMetadata` block of every plugin's
+/// `plugInfo.json` and registers them before any layer is read, so a layer
+/// authoring one is authoring a registered field even where nothing has
+/// loaded the library that declares it (`SdfSchemaBase::_AddFieldsFromPlugins`).
+/// That is why this reaches past the families `openusd-schemas` implements,
+/// to `usdImaging` and `execIr`.
+///
+/// A schema family declares its fields with its schemas
+/// ([`MetadataDecl`](crate::usd::MetadataDecl)), and `openusd-schemas` checks
+/// what it registers against this table.
+///
+/// TODO: have the layer readers consult a registry's fields rather than this
+/// table, so a field a family defined outside this crate is registered too,
+/// and a field authored on a spec it does not apply to (C++ `appliesTo`) is
+/// rejected. A layer is read with no registry in hand today, which is why the
+/// set the families shipped with USD declare is spelled out here.
+const SCHEMA_METADATA: [(&str, &str); 22] = [
+    ("bindMaterialAs", "token"),
+    ("connectability", "token"),
+    ("constraintTargetIdentifier", "token"),
+    ("elementSize", "int"),
+    ("faceIndexPrimvar", "token"),
+    ("faceOffsetPrimvar", "token"),
+    ("inactiveIds", "int64listop"),
+    ("interpolation", "token"),
+    ("irIsInvertible", "bool"),
+    ("irRole", "token"),
+    ("kilogramsPerUnit", "double"),
+    ("metersPerUnit", "double"),
+    ("outputName", "token"),
+    ("payloadAssetDependencies", "asset[]"),
+    ("renderSettingsPrimPath", "string"),
+    ("renderType", "token"),
+    ("sdrMetadata", "dictionary"),
+    ("uiHints", "dictionary"),
+    ("unauthoredValuesIndex", "int"),
+    ("upAxis", "token"),
+    ("uvPrimvar", "token"),
+    ("weight", "float"),
+];
+
+/// What a registered metadata field holds, which decides how a reader takes
+/// its literal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldType {
+    /// A value of a type the value-type table knows, as `elementSize` is an
+    /// `int`.
+    Value(ValueTypeName),
+    /// A list op whose items are of this type, as `inactiveIds` is an
+    /// `int64listop` and so holds `int64` items.
+    ListOp(ValueTypeName),
+    /// A value its declaration gives no plain value type: a core field with a
+    /// grammar of its own (see [`FieldKey::value_type`]), or a schema field
+    /// declared a `dictionary`.
+    Untyped,
+}
+
+impl FieldType {
+    /// The field type a schema library's declaration spells: a value type
+    /// the value-type table knows, `dictionary`, or `<element>listop` for a
+    /// list op of `int`, `int64`, `uint`, `uint64`, `string` or `token`
+    /// items, the elements the text format writes a list of (C++
+    /// `_IsGenericMetadataListOpType`). `None` for any other spelling.
+    pub fn from_spelling(spelling: &str) -> Option<Self> {
+        if spelling == "dictionary" {
+            return Some(Self::Untyped);
+        }
+        let Some(element) = spelling.strip_suffix("listop") else {
+            let ty = ValueTypeName::from(spelling);
+            return ty.kind().is_some().then_some(Self::Value(ty));
+        };
+        let element = ValueTypeName::from(element);
+        matches!(
+            element.kind(),
+            Some(
+                ValueKind::Int
+                    | ValueKind::Int64
+                    | ValueKind::Uint
+                    | ValueKind::Uint64
+                    | ValueKind::String
+                    | ValueKind::Token
+            )
+        )
+        .then_some(Self::ListOp(element))
+    }
+}
+
+/// The prim type name that stands for any type, which the text format
+/// writes as no type at all (C++ `SdfTokens->AnyTypeToken`).
+pub const ANY_TYPE: &str = "__AnyType__";
+
+/// What the metadata field `name` holds, or `None` where neither [`FieldKey`]
+/// nor any schema declares it.
+///
+/// A layer may author any identifier in a metadata block. One this answers
+/// `None` for is unregistered: nothing gives its literal a type, so a reader
+/// carries the text it was written as
+/// (C++ `SdfSchemaBase::SpecDefinition::IsValidField`).
+///
+/// Narrower than C++ in one direction, which is the safe one: C++ also
+/// rejects a field that is registered but is not metadata for the spec type
+/// being read, and without a per-spec-type table this treats such a field as
+/// registered.
+// TODO(perf): both halves scan their table, once per metadata field read.
+// The lookup wants a map, or a `match` the compiler can turn into one; neither
+// is worth a third copy of the field names before a profile asks for it.
+pub fn registered_field_type(name: &str) -> Option<FieldType> {
+    let Some(spelling) = schema_field_spelling(name) else {
+        let key = FieldKey::from_name(name)?;
+        return Some(key.value_type().map_or(FieldType::Untyped, FieldType::Value));
+    };
+    FieldType::from_spelling(spelling)
+}
+
+/// The type the schema declaring `name` gives that metadata field, or `None`
+/// where no schema declares it.
+///
+/// A spelling the value-type table does not know — `dictionary`, and the
+/// list-op types — comes back as an unregistered [`ValueTypeName`] answering
+/// no [`kind`](ValueTypeName::kind), so a caller that can only act on a type
+/// it recognises skips those without needing a second table.
+pub fn schema_field_type(name: &str) -> Option<ValueTypeName> {
+    schema_field_spelling(name).map(ValueTypeName::from)
+}
+
+/// How the declaring library spells that field's type, without resolving it.
+fn schema_field_spelling(name: &str) -> Option<&'static str> {
+    SCHEMA_METADATA
+        .iter()
+        .find(|(field, _)| *field == name)
+        .map(|(_, ty)| *ty)
+}
+
+/// Whether `field` holds a vector rather than an array of the same element.
+///
+/// C++ separates `std::vector<T>` from `VtArray<T>`: `subLayers` is a vector
+/// of strings, while a `string[]` attribute's value is an array of them.
+/// [`Value::TokenVec`](crate::vt::Value::TokenVec) and
+/// [`Value::StringVec`](crate::vt::Value::StringVec) carry both, so a format that
+/// encodes them differently has to ask the field which it is looking at.
+///
+/// These are the fields `SdfSchema` registers with a `std::vector` fallback
+/// and whose element has an array spelling too; the path and layer-offset
+/// vectors need no entry, having no array form to be confused with.
+pub fn is_vector_field(field: &str) -> bool {
+    const VECTORS: [&str; 9] = [
+        ChildrenKey::ExpressionChildren.as_str(),
+        ChildrenKey::MapperArgChildren.as_str(),
+        ChildrenKey::PrimChildren.as_str(),
+        ChildrenKey::PropertyChildren.as_str(),
+        ChildrenKey::VariantChildren.as_str(),
+        ChildrenKey::VariantSetChildren.as_str(),
+        FieldKey::PrimOrder.as_str(),
+        FieldKey::PropertyOrder.as_str(),
+        FieldKey::SubLayers.as_str(),
+    ];
+    VECTORS.contains(&field)
+}
+
+/// Whether generic field resolution folds list-op opinions authored for
+/// `field` (spec 12.2.6).
+///
+/// Composition arcs, relationship targets and attribute connections, clip-set
+/// ordering, and the value-resolution fields compose through dedicated
+/// machinery — arcs during prim indexing, targets with per-node namespace
+/// translation, `clipSets` with encoding coercion, values by
+/// strongest-opinion resolution — so generic resolution leaves their opinions
+/// untouched (C++ `UsdStage::_IsPrivateFieldKey` shields the same fields from
+/// its generic metadata path).
+pub fn folds_list_ops(field: &str) -> bool {
+    const DEDICATED: [FieldKey; 10] = [
+        FieldKey::References,
+        FieldKey::Payload,
+        FieldKey::InheritPaths,
+        FieldKey::Specializes,
+        FieldKey::VariantSetNames,
+        FieldKey::ConnectionPaths,
+        FieldKey::TargetPaths,
+        FieldKey::ClipSets,
+        FieldKey::Default,
+        FieldKey::TimeSamples,
+    ];
+    !DEDICATED.iter().any(|key| key.as_str() == field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_key_from_name() {
+        for key in FieldKey::VARIANTS {
+            assert_eq!(
+                FieldKey::from_name(key.as_str()).map(|k| k.as_str()),
+                Some(key.as_str())
+            );
+        }
+        assert!(FieldKey::from_name("madeUpField").is_none());
+    }
+
+    #[test]
+    fn vector_fields() {
+        assert!(is_vector_field(ChildrenKey::PrimChildren.as_str()));
+        assert!(is_vector_field(FieldKey::SubLayers.as_str()));
+        // A path-valued children field, and an array-valued metadata field.
+        assert!(!is_vector_field(ChildrenKey::ConnectionChildren.as_str()));
+        assert!(!is_vector_field(FieldKey::AllowedTokens.as_str()));
+    }
+
+    /// Every spelling the table declares names a field type, and a spelling
+    /// outside the value types, `dictionary` and the six list ops names
+    /// none.
+    #[test]
+    fn field_type_spellings() {
+        for (name, spelling) in SCHEMA_METADATA {
+            assert!(FieldType::from_spelling(spelling).is_some(), "{name}: {spelling}");
+        }
+        assert_eq!(
+            FieldType::from_spelling("tokenlistop"),
+            Some(FieldType::ListOp(ValueTypeName::TOKEN))
+        );
+        for spelling in ["pathlistop", "doublelistop", "listop", "bogus"] {
+            assert_eq!(FieldType::from_spelling(spelling), None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn registered_field_types() {
+        use FieldType::{ListOp, Untyped, Value};
+        for (name, expected) in [
+            (FieldKey::DisplayUnit.as_str(), Some(Untyped)),
+            (FieldKey::ColorSpace.as_str(), Some(Value(ValueTypeName::TOKEN))),
+            (FieldKey::Hidden.as_str(), Some(Value(ValueTypeName::BOOL))),
+            (
+                FieldKey::AllowedTokens.as_str(),
+                Some(Value(ValueTypeName::TOKEN_ARRAY)),
+            ),
+            (FieldKey::CustomData.as_str(), Some(Untyped)),
+            ("interpolation", Some(Value(ValueTypeName::TOKEN))),
+            ("elementSize", Some(Value(ValueTypeName::INT))),
+            ("inactiveIds", Some(ListOp(ValueTypeName::INT64))),
+            ("sdrMetadata", Some(Untyped)),
+            ("hide_in_stage_window", None),
+        ] {
+            assert_eq!(registered_field_type(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn schema_field_types() {
+        assert_eq!(schema_field_type("interpolation"), Some(ValueTypeName::TOKEN));
+        assert_eq!(schema_field_type("elementSize"), Some(ValueTypeName::INT));
+        // A spelling the type table does not know still names the field.
+        assert!(schema_field_type("sdrMetadata").is_some_and(|ty| ty.kind().is_none()));
+        assert_eq!(schema_field_type("hide_in_stage_window"), None);
+        // Declared by a library outside the families this workspace builds.
+        assert_eq!(schema_field_type("uvPrimvar"), Some(ValueTypeName::TOKEN));
+    }
+
+    #[test]
+    fn child_key_str() {
+        assert_eq!(ChildrenKey::ConnectionChildren.as_str(), "connectionChildren");
+        assert_eq!(ChildrenKey::PrimChildren.as_str(), "primChildren");
+        assert_eq!(ChildrenKey::VariantSetChildren.as_str(), "variantSetChildren");
+    }
+}

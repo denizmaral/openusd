@@ -17,15 +17,48 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
-      - run: cargo check --examples --tests
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `shell: bash` so an earlier failing command fails the step on every
+      # runner; the Windows default shell only reports the last command's exit
+      # code.
+      - name: Check
+        shell: bash
+        run: |
+          cargo check --workspace --all-targets
+          cargo check --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo fmt --all -- --check --files-with-diff
-      - run: cargo doc --no-deps
-      - run: cargo test --all-targets --all-features
+      - run: cargo doc --workspace --no-deps --all-features
+      - run: cargo test --workspace --all-targets --all-features
+
+      # The members require each other by version, and a stale value there
+      # publishes a crate pinned to the previous release. Nothing else catches
+      # it: the path dependency wins locally, so builds and tests stay green.
+      - name: Workspace version matches the in-workspace dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pkg=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "workspace.package.version = ${pkg:-<unset>}"
+          if [ -z "$pkg" ]; then
+            echo "::error::could not read the version from the root Cargo.toml"
+            exit 1
+          fi
+          for crate in openusd openusd-build; do
+            dep=$(grep -m1 "^$crate = { version = " Cargo.toml | cut -d'"' -f2)
+            echo "workspace.dependencies.$crate.version = ${dep:-<unset>}"
+            if [ -z "$dep" ]; then
+              echo "::error::could not read the $crate version from the root Cargo.toml"
+              exit 1
+            fi
+            if [ "$pkg" != "$dep" ]; then
+              echo "::error::$crate version mismatch - bump both in the root Cargo.toml"
+              exit 1
+            fi
+          done
 
   deny:
     name: Deny
@@ -33,7 +66,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -45,14 +78,14 @@ jobs:
     if: ${{ github.event_name != 'schedule' && github.ref_name == 'main' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
       - run: cargo install grcov
       - run: grcov --version
 
-      - run: cargo test --all-features
+      - run: cargo test --workspace --all-features
         env:
           RUSTFLAGS: "-Cinstrument-coverage"
           LLVM_PROFILE_FILE: "target/coverage/%p-%m.profraw"
@@ -65,11 +98,11 @@ jobs:
             --branch \
             --ignore-not-existing \
             --output-types markdown,lcov \
-            --keep-only 'src/*' \
+            --keep-only 'crates/*/src/*' \
             --output-path ./target/coverage/
 
       - name: Upload coverage data
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: unittests

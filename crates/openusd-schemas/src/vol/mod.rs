@@ -1,0 +1,65 @@
+//! UsdVol schema views.
+//!
+//! Typed value-views over a composed [`openusd::usd::Stage`], mirroring Pixar's
+//! `UsdVol` family — renderable volumes built from file-backed fields. The
+//! views build on the [`geom`](crate::geom) chain: a
+//! [`Volume`] is a [`geom::Gprim`](crate::geom::Gprim) and the field
+//! prims are [`geom::Xformable`](crate::geom::Xformable).
+//!
+//! ```text
+//! geom::Gprim
+//!  └ Volume                          (field:<name> relationships)
+//! geom::Xformable
+//!  └ FieldBase           (abstract; a transformable single field)
+//!     └ FieldAsset       (abstract; file-backed grid attributes)
+//!        └ OpenVDBAsset / Field3DAsset
+//! ```
+//!
+//! A [`Volume`] aggregates any number of named fields via `field:<name>`
+//! relationships, each targeting a field prim. [`FieldAsset`] is the interface
+//! carrying the shared file/grid attributes (`filePath` / `fieldName` /
+//! `fieldIndex` / `fieldDataType` / `vectorDataRoleHint`); the concrete
+//! [`OpenVDBAsset`] (an OpenVDB grid) and [`Field3DAsset`] (a Field3D file) add
+//! their own `fieldClass` / `fieldPurpose`.
+//!
+//! The `ParticleField*` schemas (Gaussian-splat volumes) are generated beside
+//! them, each reflecting the attribute APIs its data comes from, with
+//! [`ParticleField3DGaussianSplat::attribute_in_use`] over the pairs they
+//! store at two precisions. The subsystem that renders them is not modelled
+//! here.
+//!
+//! # Example
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//!
+//! use openusd_schemas::vol::{self, VolumeFieldAssetSchema, VolumeSchema};
+//! use openusd::{sdf, usd, vt};
+//!
+//! let stage = usd::Stage::builder()
+//!     .schema_registry(openusd_schemas::schema_registry())
+//!     .in_memory("scene.usda").unwrap();
+//!
+//! // A field is a file-backed grid prim; `create_file_path_attr` is inherited
+//! // from `VolumeFieldAssetSchema`, the trait carrying the shared attributes.
+//! let field = vol::OpenVDBAsset::define(&stage, "/Smoke/density").unwrap();
+//! field.create_file_path_attr().unwrap().set(vt::Value::AssetPath("./smoke.vdb".into())).unwrap();
+//! field.create_field_name_attr().unwrap().set(vt::Value::token("density")).unwrap();
+//!
+//! // A Volume binds named fields through `field:<name>` relationships.
+//! let volume = vol::Volume::define(&stage, "/Smoke").unwrap()
+//!     .create_field_rel("density", "/Smoke/density").unwrap();
+//!
+//! assert_eq!(
+//!     volume.field_paths().unwrap(),
+//!     BTreeMap::from([("density".to_string(), sdf::path("/Smoke/density").unwrap())]),
+//! );
+//! ```
+
+openusd::include_schema!("usdVol");
+
+mod splat;
+mod volume;
+
+pub use splat::SplatData;
+pub use volume::FIELD_NAMESPACE;

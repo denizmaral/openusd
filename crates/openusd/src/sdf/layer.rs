@@ -1,0 +1,3690 @@
+//! A single scene-description layer (the Rust equivalent of C++ `SdfLayer`):
+//! identity plus a backing [`AbstractData`] under a copy-on-write [`CowData`]
+//! staging overlay.
+//!
+//! # Editing
+//!
+//! A layer is mutated only through [`Layer::edit`] (one layer) or [`edit_layers`]
+//! (several at once, atomically): the closure authors through a [`LayerEdit`]
+//! view — [`PrimSpec::new`](super::PrimSpec::new) and friends write through
+//! [`LayerEdit::data_mut`] — and the whole batch commits when the closure returns
+//! `Ok`, or rolls back on its error or a panic. Committing drains the overlay into
+//! the backend and yields the derived [`ChangeList`] for composition
+//! invalidation. [`dry_run_layers`] runs the same staging but always discards it,
+//! to check an edit applies without keeping it. Reads merge staged-over-base, so
+//! an in-progress edit is visible to reads inside its closure.
+//!
+//! # Why copy-on-write
+//!
+//! Staging is the primitive that makes three things the editing pipeline relies on
+//! cheap and correct (the alternative is to edit the backend immediately and track
+//! changes as they happen):
+//!
+//! - Net-effect change records. A composition invalidation should reflect the
+//!   final state of an edit, not the churn along the way. Because the overlay holds
+//!   the net staged state, the [`ChangeList`] derived from it at commit reflects
+//!   only that final result: a field set twice records once, and a spec created
+//!   then deleted within one edit records nothing — never the in-between steps an
+//!   immediate-edit log would carry.
+//! - Old and new values side by side. At commit the pristine base and the staged
+//!   overlay both exist, so a forward log (the new values) and an inverse log (the
+//!   old values, for undo) fall out directly from the diff — no need to snapshot
+//!   the old value at each mutation before it is overwritten.
+//! - All-or-nothing edits. A multi-step edit — or a multi-layer one, where a
+//!   namespace edit must apply across several layers together — either commits
+//!   whole or rolls back whole. Rolling back is just dropping the overlay, so
+//!   abandoning a half-built or vetoed edit costs nothing and leaves no partial
+//!   state behind.
+//!
+//! Loading a layer and its sublayer stack lives in
+//! [`LayerRegistry`](super::LayerRegistry); cross-layer composition (references,
+//! payloads) lives in [`crate::pcp`].
+
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, Cursor, Write};
+use std::mem;
+use std::path::Path as FsPath;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use crate::vt::Value;
+use crate::{ar, sdf, tf};
+
+use super::commit::{
+    CommitRecord, Committed, Footprint, Notification, PendingCommit, Prepared, Subscriber, TxnContext,
+};
+use super::schema::FieldKey;
+use super::{
+    AbstractData, AttributeSpecMut, AttributeSpecRef, ChangeList, CowData, Data, DataError, FormatError, IntoPath,
+    LayerData, Patch, Path, PathParseError, PrimSpecMut, PrimSpecRef, PseudoRootSpecMut, PseudoRootSpecRef,
+    RelationshipSpecMut, RelationshipSpecRef, RelocateList, SpecError, SpecType, ValueTypeError, sink, try_into_path,
+};
+
+/// A [`sink::Id`] for a [`LayerSink`] installed on a [`Layer`].
+pub type LayerSinkId = sink::Id<dyn LayerSink>;
+
+/// Prefix marking an anonymous layer identifier (`anon:<n>:<tag>`), the single
+/// source of truth shared by minting and [`Layer::is_anonymous`].
+const ANONYMOUS_PREFIX: &str = "anon:";
+
+/// A single loaded layer in the composition.
+pub struct Layer {
+    /// Resolved, canonical identifier for this layer, read through
+    /// [`identifier`](Self::identifier). It never changes once the layer
+    /// exists: a registry indexes the layers it holds by it.
+    identifier: String,
+    /// The layer's resolved physical location when it differs from
+    /// [`identifier`](Self::identifier) — the anchor for the relative asset
+    /// paths it authors (C++ `SdfLayer::GetRealPath`). `None` (the common case)
+    /// means it equals the identifier; a package (`.usdz`) opens under the bare
+    /// package identifier while its real path is the package-relative default
+    /// layer (`pkg.usdz[root.usd]`), so paths authored inside it anchor
+    /// in-package against the real path rather than the identifier, and a layer
+    /// found through a resolver search directory keeps the search path as its
+    /// identifier while its real path is the file that directory holds. Read
+    /// through [`real_path`](Self::real_path), which falls back to the
+    /// identifier.
+    real_path: Option<String>,
+    /// The parsed scene description data, under a copy-on-write [`CowData`]
+    /// staging overlay. Every authoring write stages in the overlay; committing an
+    /// edit derives the composition record and drains the overlay into the backend.
+    /// Private so external callers reach it only through [`data`](Self::data) for
+    /// reads or a [`LayerEdit`] for authoring, keeping the authoring API's
+    /// bookkeeping invariants (`primChildren`, `propertyChildren`, ancestor
+    /// specifiers, …) in force.
+    data: CowData<LayerData>,
+    /// The change record for the edit in progress, derived from the overlay at
+    /// commit. Refilled in place each commit; a commit with sinks or
+    /// subscribers moves it into the transaction's record.
+    changes: ChangeList,
+    /// Per-layer change sinks notified of each commit. Empty by default.
+    sinks: sink::Set<dyn LayerSink>,
+    /// The resolver the layer was opened through, which a save reopens the
+    /// saved file with. `None` for a layer that was not read from an asset.
+    resolver: Option<Rc<dyn ar::Resolver>>,
+    /// The format the layer was read in (C++ `SdfLayer::GetFileFormat`), which
+    /// a [`save`](Self::save) writes it back in. `None` for a layer built in
+    /// memory, which saves in the format its identifier's extension names.
+    format: Option<&'static dyn super::FileFormat>,
+    /// Whether a commit changed the layer since it was read or last saved.
+    unsaved: bool,
+    /// The modification time its asset had when the layer was read or last
+    /// saved (C++ `SdfLayer::_assetModificationTime`), which a reload compares
+    /// to leave an unchanged file unread.
+    modified: AssetTime,
+    /// What the reload being staged read of the asset, applied when its edit
+    /// commits ([`LayerEdit::reload`]).
+    reloading: Option<Reloaded>,
+    /// Whether the edit being staged reports a change of a package the layer
+    /// lies in ([`LayerEdit::package_changed`]).
+    package_changed: bool,
+}
+
+/// A reload of a layer from its asset ([`Layer::read_due`]): the edits
+/// that bring the layer's content to the asset's, and the asset's state.
+pub(crate) struct Reload {
+    /// The edits, in the order they apply.
+    edits: Vec<ContentEdit>,
+    /// The asset's state, which the layer takes on when the reload commits.
+    reloaded: Reloaded,
+}
+
+/// A reload a layer is due, found without reading its asset's content.
+pub(crate) enum Due {
+    /// The reload, already known: an anonymous layer's, which reads no asset.
+    Ready(Reload),
+    /// The asset to read for the reload, where its identifier resolves now,
+    /// with its modification time.
+    Read {
+        /// The resolver the layer was opened through, which reads the asset.
+        resolver: Rc<dyn ar::Resolver>,
+        /// Where the layer's identifier resolves.
+        resolved: ar::ResolvedPath,
+        /// The asset's modification time.
+        modified: AssetTime,
+    },
+}
+
+/// What a reload read of a layer's asset besides its content.
+#[derive(Clone, Copy)]
+struct Reloaded {
+    /// The format the content was read in.
+    format: Option<&'static dyn super::FileFormat>,
+    /// The asset's modification time.
+    modified: AssetTime,
+}
+
+/// When a layer's asset was modified, as the layer last read or saved it.
+#[derive(Clone, Copy)]
+pub(crate) enum AssetTime {
+    /// The layer was not read from an asset.
+    Unread,
+    /// The layer was read from an asset its resolver reports no time for.
+    Unknown,
+    /// The layer was read from an asset modified at this time.
+    At(SystemTime),
+}
+
+/// One edit a [`Reload`] makes to a layer's content.
+enum ContentEdit {
+    /// Erase the spec at the path.
+    EraseSpec(Path),
+    /// Create a spec of the type at the path.
+    CreateSpec(Path, SpecType),
+    /// Erase the field of the spec at the path.
+    EraseField(Path, String),
+    /// Set the field of the spec at the path.
+    SetField(Path, String, Value),
+}
+
+impl Layer {
+    /// Construct a layer from a resolved identifier and a backing data store.
+    /// `identifier` is used verbatim, so it must already be the canonical
+    /// spelling under the resolver of the graph the layer joins: the one
+    /// [`in_memory_identifier`](ar::Resolver::in_memory_identifier) returns
+    /// for it. Crate-private — external callers should use
+    /// [`Layer::new_anonymous`] for blank in-memory layers,
+    /// [`open`](Self::open) for one on disk, or
+    /// [`from_bytes`](Self::from_bytes) for one already in hand.
+    pub(crate) fn new(identifier: impl Into<String>, data: LayerData) -> Self {
+        Self::build(identifier.into(), None, data)
+    }
+
+    /// Open the layer at `identifier` off the filesystem, read in whichever
+    /// format claims it.
+    ///
+    /// The layer is read alone: the sublayers, references and payloads it
+    /// declares stay the asset paths it authored. Composing them is
+    /// [`Stage::open`](crate::usd::Stage::open)'s job.
+    pub fn open(identifier: impl AsRef<str>) -> crate::Result<Self> {
+        Self::open_with(ar::DefaultResolver::new(), identifier)
+    }
+
+    /// Open the layer at `identifier`, resolving and reading it through
+    /// `resolver` — the door for layers a host serves from somewhere other than
+    /// the filesystem. See [`open`](Self::open).
+    pub fn open_with(resolver: impl ar::Resolver + 'static, identifier: impl AsRef<str>) -> crate::Result<Self> {
+        let registry = sdf::LayerRegistry::new(Box::new(resolver));
+        // Canonicalized first, as every other load path does: the layer is
+        // addressed by the identifier it keeps, so a caller's spelling of one
+        // file must not become a second identity for it.
+        let identifier = sdf::absolute_path_at(&registry, None, identifier.as_ref());
+        let layer = registry.open_layer(&identifier)?;
+        layer.ok_or(crate::Error::UnresolvedAsset(identifier))
+    }
+
+    /// Decode `bytes` as an anonymous layer tagged `tag`, in whichever format
+    /// their content names (see
+    /// [`LayerRegistry::read_bytes`](sdf::LayerRegistry::read_bytes)).
+    ///
+    /// For layer bytes that were never an asset — compiled into a program, or
+    /// handed over by a host. The layer is anonymous because it resolved from
+    /// nowhere, so the relative asset paths it authors anchor against nothing;
+    /// C++ opens the schema data it compiles against the same way
+    /// (`SdfLayer::OpenAsAnonymous`). `tag` names their origin for diagnostics,
+    /// as in [`new_anonymous`](Self::new_anonymous).
+    pub fn from_bytes(tag: impl fmt::Display, bytes: impl Into<ar::AssetBuffer>) -> Result<Self, FormatError> {
+        let identifier = Self::anonymous_identifier(tag);
+        let (data, format) = sdf::LayerRegistry::read_bytes(bytes.into(), &identifier)?;
+        let mut layer = Self::new(identifier, data);
+        layer.format = Some(format);
+        Ok(layer)
+    }
+
+    /// An anonymous layer tagged `tag` reading through `data`, which it
+    /// shares with everyone else holding it.
+    ///
+    /// Edits stage as usual, and the first one committed copies the whole
+    /// data while anyone else still holds it (see [`AbstractData`] for
+    /// [`Arc`]), so the shared data is never written. `data` holds its
+    /// pseudo-root spec ([`Data::rooted`]). Shared data can cross threads
+    /// where a layer cannot: a thread builds a layer of its own over it. The
+    /// layer is anonymous, so a reload empties it. `tag` names the data's
+    /// origin for diagnostics, as in [`new_anonymous`](Self::new_anonymous).
+    pub fn from_shared(tag: impl fmt::Display, data: Arc<Data>) -> Self {
+        // TODO: two kinds of shared layer are left to their own design. A
+        // lazily decoded backend (`usdc::CrateData`) cannot copy out inside
+        // the infallible mutators, since decoding every field can fail: it
+        // needs a fallible materialization before the transaction, or the
+        // immutable crate backing shared beneath writable spec metadata and an
+        // overlay, which keeps decoding lazy. A shared layer with an identity
+        // needs the origin an opened layer has, its identifier and its
+        // resolved location (`real_path`) under a resolver, and a decision on
+        // whether it can save or reload.
+        debug_assert!(data.has_spec(&Path::abs_root()), "shared data holds its pseudo-root");
+        Self::new(Self::anonymous_identifier(tag), Box::new(data))
+    }
+
+    /// Construct a loaded layer recording its resolved physical location.
+    ///
+    /// The loader passes the [`real_path`](Self::real_path) it resolved the
+    /// layer to: it equals `identifier` for an ordinary layer, but a package
+    /// opens under its bare identifier while its real path is the
+    /// package-relative root layer, so the paths it authors anchor
+    /// in-package. Only a real path that differs from the identifier is
+    /// stored. The layer keeps `resolver`, the one it was read through, for
+    /// [`save`](Self::save) to reopen its file with.
+    pub(crate) fn new_resolved(prepared: sdf::PreparedLayer, resolver: Rc<dyn ar::Resolver>) -> Self {
+        let sdf::PreparedLayer {
+            identifier,
+            resolved,
+            data,
+            format,
+            modified,
+        } = prepared;
+        let real_path = resolved.to_string();
+        let real_path = (real_path != identifier).then_some(real_path);
+        let mut layer = Self::build(identifier, real_path, data);
+        layer.resolver = Some(resolver);
+        layer.format = format;
+        layer.modified = modified;
+        layer
+    }
+
+    /// Anchor, read and save the layer through `resolver` from then on.
+    pub(crate) fn set_resolver(&mut self, resolver: Rc<dyn ar::Resolver>) {
+        self.resolver = Some(resolver);
+    }
+
+    /// Shared constructor backing [`new`](Self::new) and
+    /// [`new_resolved`](Self::new_resolved).
+    fn build(identifier: String, real_path: Option<String>, data: LayerData) -> Self {
+        Self {
+            identifier,
+            real_path,
+            data: CowData::new(data),
+            changes: ChangeList::new(),
+            sinks: sink::Set::default(),
+            resolver: None,
+            format: None,
+            unsaved: false,
+            modified: AssetTime::Unread,
+            reloading: None,
+            package_changed: false,
+        }
+    }
+
+    /// Install a [`LayerSink`] fired at this layer's commit seam, returning its
+    /// [`LayerSinkId`] for a later [`remove_sink`](Self::remove_sink). Any
+    /// editor of this layer — a stage, the namespace editor, raw authoring —
+    /// fires the sink, so an external observer sees every committed edit. A bare
+    /// `Fn(&str, &ChangeList)` closure is a `LayerSink`, so this takes either a
+    /// full sink type or a closure observer.
+    pub fn add_sink<S: LayerSink + 'static>(&mut self, sink: S) -> LayerSinkId {
+        self.sinks.add(Rc::new(sink))
+    }
+
+    /// Remove the layer sink with `id`; a no-op if it was already removed.
+    pub fn remove_sink(&mut self, id: LayerSinkId) {
+        self.sinks.remove(id);
+    }
+
+    /// Borrow the layer's data as a read-only [`AbstractData`]. Reads see the
+    /// staged-over-base view, so edits staged but not yet flushed are visible.
+    pub fn data(&self) -> &dyn AbstractData {
+        &self.data
+    }
+
+    /// Discard the layer's staged (uncommitted) edits, restoring the backend to
+    /// its last-committed state. Already-committed content is unaffected. Private:
+    /// staging and committing are driven only through [`edit`](Self::edit) /
+    /// [`edit_layers`], which roll back automatically on failure, so a caller
+    /// never sequences a rollback by hand.
+    fn rollback(&mut self) {
+        self.data.rollback();
+        self.reloading = None;
+        self.package_changed = false;
+    }
+
+    /// Author a batch of edits as one atomic unit: run `f` against the layer's
+    /// [`LayerEdit`] view, then commit on success, or roll back on `f`'s error, a
+    /// sink veto, or a panic. Returns whether the edit produced a composition
+    /// change. This is the only way to mutate a layer — the commit is the closing
+    /// brace, not a separate call a caller can omit — so an edit is never left
+    /// staged-but-uncommitted. Mirrors C++ scene description committing through
+    /// `Sdf_ChangeManager`. To edit several of a stage's layers atomically, use
+    /// [`Stage::batch_edit`](crate::usd::Stage::batch_edit).
+    ///
+    /// Panics if called re-entrantly on the same layer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use openusd::sdf::{self, PrimSpec, Specifier};
+    ///
+    /// let mut layer = sdf::Layer::new_anonymous("example.usda");
+    /// // On success the batch commits and the change record is returned.
+    /// layer
+    ///     .edit(|l| {
+    ///         PrimSpec::new(l.data_mut(), "/World", Specifier::Def, "Xform")?;
+    ///         Ok(())
+    ///     })
+    ///     .expect("authored and committed");
+    /// assert!(layer.prim("/World").unwrap().is_some());
+    ///
+    /// // If the closure returns an error, the whole batch rolls back — neither
+    /// // spec below survives, because the second authoring call fails.
+    /// let result = layer.edit(|l| {
+    ///     PrimSpec::new(l.data_mut(), "/Good", Specifier::Def, "Xform")?;
+    ///     PrimSpec::new(l.data_mut(), "/Good.prop", Specifier::Def, "Xform")?; // property path: invalid for a prim
+    ///     Ok(())
+    /// });
+    /// assert!(result.is_err());
+    /// assert!(layer.prim("/Good").unwrap().is_none());
+    /// ```
+    pub fn edit(
+        &mut self,
+        f: impl FnOnce(&mut LayerEdit<'_>) -> Result<(), AuthoringError>,
+    ) -> Result<bool, EditError> {
+        // A layer no registry holds has no subscribers.
+        let none = sink::Set::default();
+        let target = TargetLayer {
+            layer: self,
+            subscribers: &none,
+        };
+        let committed = edit_layers(&mut [target], TxnContext::new(None), |edits| {
+            f(&mut edits[0]).map_err(EditError::from)
+        })?;
+        Ok(committed.dispatch())
+    }
+
+    /// Refill this layer's change record from the staged overlay against the
+    /// still-pristine base, and offer it to each sink's
+    /// [`before_commit`](LayerSink::before_commit) while the overlay is intact,
+    /// tagged with the enclosing transaction's id. A sink's rejection leaves
+    /// the overlay staged for the caller to roll back. Does not touch the
+    /// backend.
+    fn veto(&mut self, txn: &TxnContext) -> Result<(), sink::Error> {
+        self.changes.update(&self.data);
+        self.changes.set_reloaded(self.reloading.is_some());
+        self.changes.set_package_changed(self.package_changed);
+        if !self.changes.is_empty() && !self.sinks.is_empty() {
+            let change = self.pending_change(txn);
+            self.sinks.iter().try_for_each(|sink| sink.before_commit(&change))?;
+        }
+        Ok(())
+    }
+
+    /// Offer the accepted edit to each of the layer's `subscribers`, collecting
+    /// what they capture, and read its [`Footprint`] for them while the
+    /// overlay is intact. Empty for a layer with no subscriber.
+    fn prepare(
+        &self,
+        subscribers: &sink::Set<dyn Subscriber>,
+        txn: &TxnContext,
+    ) -> (Footprint, Vec<Box<dyn Prepared>>) {
+        if subscribers.is_empty() {
+            return Default::default();
+        }
+        let change = self.pending_change(txn);
+        let commit = PendingCommit { change: &change, txn };
+        let prepared = subscribers.iter().filter_map(|s| s.prepare(&commit)).collect();
+        (Footprint::of(self.data.overlay()), prepared)
+    }
+
+    /// Whether a commit to this layer has anyone to hand a record to: one of
+    /// its sinks or one of its `subscribers`.
+    fn observed(&self, subscribers: &sink::Set<dyn Subscriber>) -> bool {
+        !self.changes.is_empty() && (!self.sinks.is_empty() || !subscribers.is_empty())
+    }
+
+    /// The staged edit as its observers see it.
+    fn pending_change(&self, txn: &TxnContext) -> PendingLayerChange<'_> {
+        PendingLayerChange {
+            layer_identifier: &self.identifier,
+            base: &**self.data.base(),
+            overlay: self.data.overlay(),
+            change_list: &self.changes,
+            generation: txn.id.get(),
+        }
+    }
+
+    /// Whether the layer holds edits not yet saved: committed since it was
+    /// read or last [saved](Self::save), or staged in its overlay and not yet
+    /// committed (C++ `SdfLayer::IsDirty`). An edit that a commit found to
+    /// change nothing does not count; a staged one does, even one that re-sets
+    /// a field to the value the base already holds.
+    pub fn is_dirty(&self) -> bool {
+        self.unsaved || !self.data.is_empty()
+    }
+
+    /// Whether reading the layer's file again would give back what the layer
+    /// holds: it was read from a file and holds no unsaved edits. An anonymous
+    /// layer or one built in memory has no file to read.
+    pub(crate) fn is_rereadable(&self) -> bool {
+        !self.is_anonymous() && self.format.is_some() && !self.is_dirty()
+    }
+
+    /// Commit any staged edits into the backend to keep their content, without
+    /// deriving a change record or notifying sinks. Called when a layer joins a
+    /// stage: its content is composed fresh by the layer-stack recompose, so a
+    /// record from prior direct edits would be redundant. The edits stay
+    /// unsaved.
+    pub(crate) fn discard_changes(&mut self) {
+        self.unsaved |= !self.data.is_empty();
+        self.data.commit();
+    }
+
+    /// The layer's resolved, canonical identifier.
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    /// Where the layer was found, or `None` for an anonymous layer, which was
+    /// never read from anywhere (C++ `SdfLayer::GetRealPath`, empty for one).
+    ///
+    /// This is the identifier except for a package, whose location is its
+    /// package-relative root layer, and a layer found through a resolver
+    /// search directory, whose identifier is the bare search path it was asked
+    /// for.
+    pub fn resolved_path(&self) -> Option<&str> {
+        (!self.is_anonymous()).then(|| self.real_path())
+    }
+
+    /// The resolver the layer reads and saves through, once a registry or an
+    /// open gave it one.
+    pub(crate) fn resolver(&self) -> Option<&Rc<dyn ar::Resolver>> {
+        self.resolver.as_ref()
+    }
+
+    /// The layer's resolved physical location, the anchor for the relative
+    /// asset paths it authors. Falls back to the identifier, which is what an
+    /// anonymous layer anchors against; [`resolved_path`](Self::resolved_path)
+    /// is the one that says so.
+    pub(crate) fn real_path(&self) -> &str {
+        self.real_path.as_deref().unwrap_or(&self.identifier)
+    }
+
+    /// The location that anchors the relative asset paths this layer authors,
+    /// or `None` when it is anonymous and so has no resolvable location (C++
+    /// `SdfLayer::GetRealPath` is empty for one).
+    pub(crate) fn anchor_location(&self) -> Option<ar::ResolvedPath> {
+        (!self.is_anonymous()).then(|| ar::ResolvedPath::new(self.real_path()))
+    }
+
+    /// `asset_path`, authored in this layer, as an identifier that names the
+    /// same asset from any other layer (C++ `SdfLayer::ComputeAbsolutePath`).
+    ///
+    /// A relative path is anchored to the location the layer was read from,
+    /// through the resolver it was read through, or the default resolver for
+    /// a layer that was not read from an asset. The paths an anonymous layer
+    /// authors are given no anchor. An empty path and an anonymous layer
+    /// identifier are returned as they are.
+    ///
+    /// A search path (relative, and not opening with `.`) authored inside a
+    /// package is anchored beside the authoring layer when the package holds
+    /// that entry, else beside the package's root layer when it holds that
+    /// one, else as the resolver anchors it at the package.
+    pub fn absolute_path(&self, asset_path: &str) -> String {
+        let anchor = self.anchor_location();
+        match &self.resolver {
+            Some(resolver) => sdf::absolute_path_at(resolver.as_ref(), anchor.as_ref(), asset_path),
+            None => sdf::absolute_path_at(&ar::DefaultResolver::new(), anchor.as_ref(), asset_path),
+        }
+    }
+}
+
+impl Layer {
+    /// Write this layer to `filename`, choosing the format from the filename's
+    /// extension (C++ `SdfLayer::Export`). This writes a copy; the layer's own
+    /// identifier is unchanged.
+    ///
+    /// `.usda` writes text, `.usdc` writes the binary crate, `.usd` writes
+    /// binary (the C++ `USD_WRITE_NEW_USD_FILES_AS_BINARY` default), and
+    /// `.usdz` writes an archive wrapping one crate-encoded layer. The reader
+    /// auto-detects the format regardless of extension, so text written to a
+    /// `.usd` path still reads back correctly.
+    ///
+    /// The file is written beside the destination and renamed over it once
+    /// complete, keeping the destination's permissions. The destination is
+    /// therefore never a half-written file, and a file a layer reads from is
+    /// never written into. A destination this layer
+    /// itself reads from is written through [`save`](Self::save), which also
+    /// rebinds the layer to what it wrote.
+    pub fn export(&self, filename: impl AsRef<str>) -> Result<(), ExportError> {
+        let filename = filename.as_ref();
+        let format = super::LayerRegistry::export_format(filename)?;
+        let mut temp = tf::SafeOutputFile::create(FsPath::new(filename)).map_err(|source| ExportError::Create {
+            filename: filename.to_owned(),
+            source,
+        })?;
+        format.write(self.data(), temp.file())?;
+        temp.persist().map_err(|source| ExportError::Replace {
+            filename: filename.to_owned(),
+            source,
+        })
+    }
+
+    /// Serialize this layer to a `usda` text string (C++ `ExportToString`).
+    ///
+    /// Always emits text, the canonical human-readable form, regardless of the
+    /// layer's on-disk format. Named to avoid confusion with the infallible
+    /// [`ToString::to_string`].
+    pub fn export_to_string(&self) -> Result<String, ExportError> {
+        let format = super::LayerRegistry::find_by_id("usda").expect("usda is a built-in format");
+        let mut buf = Cursor::new(Vec::new());
+        format.write(self.data(), &mut buf)?;
+        Ok(String::from_utf8(buf.into_inner()).expect("the usda writer emits UTF-8 text"))
+    }
+
+    /// Write this layer to its own [`identifier`](Self::identifier), choosing
+    /// the format from the identifier's extension (C++ `SdfLayer::Save`).
+    ///
+    /// The identifier must be an absolute filesystem path — the canonical form
+    /// the resolver produces for layers loaded from disk.
+    /// Anonymous layers ([`is_anonymous`](Self::is_anonymous)) and layers whose
+    /// identifier is a relative path or a non-filesystem asset identifier (e.g.
+    /// `scheme://…`) have no persistent location here; save them with
+    /// [`export`](Self::export) and an explicit destination instead.
+    ///
+    /// A save is three steps, each leaving the layer whole if it fails. The
+    /// layer is serialized in memory and written to a temporary file beside
+    /// its own; a failure there changes nothing. The temporary file is then
+    /// renamed over the layer's own, which replaces it atomically. Last, a
+    /// layer whose data decodes from its bytes on demand (the crate format)
+    /// rebinds to the data its format built over the bytes it serialized
+    /// ([`FileFormat::write_bytes`](super::FileFormat::write_bytes)),
+    /// dropping the bytes it read before, which releases any view of its own
+    /// file it held. Data that copied everything out of its bytes stays as
+    /// it is.
+    ///
+    /// A rename that fails (a destination that is no longer a file, a
+    /// filesystem that refuses it) is [`ExportError::Replace`]: the temporary
+    /// file is removed and the layer still rebinds, which holds its edits in
+    /// memory for a later save to retry. Rebinding is not an edit: no change
+    /// list is derived and no sink fires.
+    ///
+    /// A layer opened through a resolver that maps files goes back onto a
+    /// mapping of the file it saved, and holds no heap copy of it (C++
+    /// `CrateFile::Packer::Close` reopens the saved asset through the resolver
+    /// and maps it again). The layer moves to the asset its resolver opens
+    /// only when that asset shares its bytes, the bytes are a file mapping,
+    /// and they equal the bytes just written. A resolver is free to answer
+    /// with something older than the file the save replaced, and data decoded
+    /// from that would put superseded values back in the layer; equal bytes
+    /// are what show the mapping to be the saved file. In every other case, a
+    /// failed open among them, the asset is dropped unread and the layer
+    /// stays on the bytes it serialized. The save has succeeded either way.
+    ///
+    /// A view another layer holds of the file does not block the
+    /// replacement: that layer goes on reading the file it mapped, which the
+    /// rename unlinks and leaves as it was.
+    pub fn save(&mut self) -> Result<(), ExportError> {
+        if self.is_anonymous() {
+            return Err(ExportError::Anonymous {
+                identifier: self.identifier.clone(),
+            });
+        }
+        let path = FsPath::new(&self.identifier);
+        if !path.is_absolute() {
+            return Err(ExportError::NotAFilePath {
+                identifier: self.identifier.clone(),
+            });
+        }
+        // The layer is written back in the format it was read in (C++
+        // `SdfLayer::Save` writes through the layer's own `_fileFormat`), so a
+        // text `.usd` stays text. A layer built in memory has none and takes
+        // the one its identifier's extension names.
+        //
+        // The destination is the file the identifier names, whatever the layer
+        // was read in: its extension must name a format, and that format must
+        // support in-place editing — unlike `export`, which only writes a copy.
+        // A package (usdz) is writable as a fresh archive but not editable in
+        // place: its other assets (textures, sibling layers) are not held by
+        // the layer, so saving over it would discard them. That holds for a
+        // layer opened from the package too, which reads in its root layer's
+        // format while its identifier names the archive.
+        let destination = super::LayerRegistry::export_format(&self.identifier)?;
+        if !destination.caps().can_edit() {
+            return Err(ExportError::NotEditable {
+                identifier: self.identifier.clone(),
+                format: destination.format_id(),
+            });
+        }
+        let format = self.format.unwrap_or(destination);
+        // TODO(layer-registry): save writes to `identifier` as a literal
+        // filesystem path. A layer loaded through a custom resolver may carry a
+        // logical identifier (e.g. `scheme://…`); save should resolve it through
+        // the owning resolver and write via a resolver write API. The
+        // absolute-path guard above refuses such identifiers for now. With
+        // the write and the reopen going through the one resolver, as C++
+        // `OpenAssetForWrite` then `OpenAsset` do, the reopen below would
+        // know the asset it opens is the one it wrote, and its byte
+        // comparison would have nothing left to prove.
+        let written = format.write_bytes(self.data())?;
+        let create = |source| ExportError::Create {
+            filename: self.identifier.clone(),
+            source,
+        };
+        let mut temp = tf::SafeOutputFile::create(path).map_err(create)?;
+        temp.file().write_all(&written.bytes).map_err(create)?;
+        let replaced = temp.persist().map_err(|source| ExportError::Replace {
+            filename: self.identifier.clone(),
+            source,
+        });
+        if let Some(serialized) = written.data {
+            let reopened = match &replaced {
+                Ok(()) => self.reopen_saved(&written.bytes, format),
+                Err(_) => None,
+            };
+            self.data = CowData::new(reopened.unwrap_or(serialized));
+        }
+        self.unsaved &= replaced.is_err();
+        if replaced.is_ok()
+            && let Some(resolver) = &self.resolver
+        {
+            let resolved = ar::ResolvedPath::new(self.real_path());
+            self.modified = asset_time(resolver.as_ref(), &self.identifier, &resolved);
+        }
+        replaced
+    }
+
+    /// Reloads the layer from its asset (C++ `SdfLayer::Reload`), returning
+    /// whether it did. Its content becomes what the asset holds, with its
+    /// unsaved edits discarded, through one edit whose change list names the
+    /// specs that changed and [reports the reload](ChangeList::did_reload_content).
+    ///
+    /// Nothing is read, and the layer is left as it is, when `force` is not
+    /// set and the layer has no unsaved edits, its identifier resolves where
+    /// it did, and the asset's modification time is the one it had at the
+    /// last read or save. A layer that was not read from an asset is left as
+    /// it is, and an anonymous layer is emptied unless the format its tag
+    /// names [skips that](super::FileFormat::skip_anonymous_reload). An
+    /// identifier that no longer resolves, one that resolves elsewhere than
+    /// the layer was read from
+    /// ([`LayerError::Moved`](super::LayerError::Moved)), or an asset that
+    /// cannot be read is an error, and the layer is left as it is.
+    pub fn reload(&mut self, force: bool) -> crate::Result<bool> {
+        let _scope = ar::CacheScope::begin();
+        if let Some(resolver) = &self.resolver {
+            super::LayerRegistry::forget_packages(resolver.as_ref(), self.real_path());
+        }
+        let Some(due) = self.reload_due(force)? else {
+            return Ok(false);
+        };
+        let reload = self.read_due(due)?;
+        self.edit(|e| {
+            e.reload(reload);
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// The reload a [`reload`](Self::reload) of the layer is due, or `None`
+    /// when the reload leaves the layer as it is. Reads no asset's content:
+    /// it resolves the identifier and asks for the asset's modification time.
+    pub(crate) fn reload_due(&self, force: bool) -> crate::Result<Option<Due>> {
+        if self.is_anonymous() {
+            // The format that decides is the one the tag's extension names,
+            // as C++ `SdfLayer::CreateAnonymous` takes it, whatever format
+            // the content was read in; a tag naming none is the text
+            // format's.
+            let format = super::LayerRegistry::find_by_extension(ar::extension(&self.identifier));
+            if format.is_some_and(|format| format.skip_anonymous_reload()) {
+                return Ok(None);
+            }
+            let edits = content_edits(&self.data, &Data::rooted())?;
+            let reloaded = Reloaded {
+                format: self.format,
+                modified: AssetTime::Unread,
+            };
+            return Ok((!edits.is_empty()).then_some(Due::Ready(Reload { edits, reloaded })));
+        }
+        // A layer read from no asset has nothing to read again: C++ tells one
+        // by its empty modification time, which a layer built in memory keeps
+        // though a registry gives it a resolver.
+        let Some(resolver) = self
+            .resolver
+            .as_ref()
+            .filter(|_| !matches!(self.modified, AssetTime::Unread))
+        else {
+            return Ok(None);
+        };
+        // The asset may have moved since it was read, so the identifier
+        // resolves again.
+        let resolved = super::LayerRegistry::resolve_layer_with(resolver.as_ref(), &self.identifier)
+            .ok_or_else(|| crate::Error::UnresolvedAsset(self.identifier.clone()))?;
+        // TODO: C++ reloads a layer from where its identifier resolves now
+        // (`DidChangeLayerResolvedPath`). A registry, a stage's graph and a
+        // handle index or anchor the layer by the real path it was read at, so
+        // a move needs them re-keyed, reported with the reload; until then a
+        // moved asset is refused, a package whose first layer was renamed
+        // among them.
+        if *resolved != *self.real_path() {
+            return Err(super::LayerError::Moved {
+                identifier: self.identifier.clone(),
+                resolved: resolved.to_string(),
+            }
+            .into());
+        }
+        let modified = asset_time(resolver.as_ref(), &self.identifier, &resolved);
+        if !force && !self.is_dirty() && modified.same(self.modified) {
+            return Ok(None);
+        }
+        Ok(Some(Due::Read {
+            resolver: Rc::clone(resolver),
+            resolved,
+            modified,
+        }))
+    }
+
+    /// The reload `due` brings the layer to, reading the asset it names.
+    pub(crate) fn read_due(&self, due: Due) -> crate::Result<Reload> {
+        let (resolver, resolved, modified) = match due {
+            Due::Ready(reload) => return Ok(reload),
+            Due::Read {
+                resolver,
+                resolved,
+                modified,
+            } => (resolver, resolved, modified),
+        };
+        let prepared = super::LayerRegistry::read(resolver.as_ref(), self.identifier.clone(), resolved, modified)?;
+        let reloaded = Reloaded {
+            format: prepared.format,
+            modified: prepared.modified,
+        };
+        let edits = content_edits(&self.data, prepared.data.as_ref())?;
+        Ok(Reload { edits, reloaded })
+    }
+
+    /// The layer's data read from a mapping of its saved file, when the
+    /// resolver it was opened through serves one whose bytes are `written`,
+    /// the bytes just saved.
+    fn reopen_saved(&self, written: &ar::SharedBuffer, format: &dyn super::FileFormat) -> Option<LayerData> {
+        let resolved = ar::ResolvedPath::new(self.real_path());
+        let saved = self.resolver.as_ref()?.open_asset(&resolved).ok()?.shared_buffer()?;
+        if !saved.is_mapping() || saved[..] != written[..] {
+            return None;
+        }
+        format
+            .read_bytes(ar::AssetBuffer::Shared(saved), &resolved.to_string())
+            .ok()
+    }
+}
+
+/// Error returned by [`Layer::export`], [`Layer::export_to_string`], and
+/// [`Layer::save`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExportError {
+    /// The destination path has no extension to choose a format from.
+    #[error("layer path {filename} has no extension; cannot choose format")]
+    NoExtension {
+        /// The destination path.
+        filename: String,
+    },
+
+    /// The destination path's extension names no registered format.
+    #[error("unsupported layer extension {extension:?} (expected usda/usdc/usd/usdz)")]
+    UnsupportedExtension {
+        /// The unrecognized extension.
+        extension: String,
+    },
+
+    /// The chosen format cannot serialize layer data at all.
+    #[error("file format {format} does not support writing")]
+    NotWritable {
+        /// The format's identifier token.
+        format: tf::Token,
+    },
+
+    /// [`Layer::save`] on an anonymous layer, which has no persistent
+    /// location.
+    #[error("cannot save anonymous layer {identifier}")]
+    Anonymous {
+        /// The layer's identifier.
+        identifier: String,
+    },
+
+    /// [`Layer::save`] on a layer whose identifier is not an absolute
+    /// filesystem path, so it names no writable location.
+    #[error(
+        "cannot save layer {identifier}: identifier is not an absolute file path; \
+         use Layer::export(path) to choose a destination"
+    )]
+    NotAFilePath {
+        /// The layer's identifier.
+        identifier: String,
+    },
+
+    /// [`Layer::save`] would overwrite the layer in place, but its format does
+    /// not support in-place editing.
+    #[error(
+        "cannot save layer {identifier} in place: the {format} format is not editable; \
+         use Layer::export(path) to write a new copy"
+    )]
+    NotEditable {
+        /// The layer's identifier.
+        identifier: String,
+        /// The format's identifier token.
+        format: tf::Token,
+    },
+
+    /// The destination file could not be created.
+    #[error("failed to create {filename}")]
+    Create {
+        /// The destination path.
+        filename: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The written file could not replace the destination, which is as it
+    /// was.
+    #[error("failed to replace {filename}")]
+    Replace {
+        /// The destination path.
+        filename: String,
+        /// The filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The format failed to serialize the layer's data.
+    #[error(transparent)]
+    Format(#[from] FormatError),
+}
+
+/// Errors raised by [`Layer`]'s authoring methods.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuthoringError {
+    /// A path argument failed to parse.
+    #[error(transparent)]
+    Parse(#[from] PathParseError),
+
+    /// The target spec rejected an edit.
+    #[error(transparent)]
+    Spec(#[from] SpecError),
+
+    /// Reading a field from the source data failed (e.g. a lazy backend could
+    /// not decode an authored value while copying it).
+    #[error(transparent)]
+    Data(#[from] DataError),
+
+    /// A value does not fit the attribute's declared type, or the declaration
+    /// itself is unusable.
+    #[error(transparent)]
+    ValueType(#[from] ValueTypeError),
+
+    /// The given path is not valid for the requested authoring operation.
+    /// Prim authoring requires an absolute, non-root, non-property path;
+    /// property authoring requires a property path.
+    #[error("path {path} is not valid here: {reason}")]
+    InvalidPath {
+        /// The offending path.
+        path: Path,
+        /// A short, human-readable reason describing what was expected.
+        reason: &'static str,
+    },
+
+    /// A variant selection is set to the empty name, which spells a blocked
+    /// selection; [`PrimSpec::block_variant_selection`] authors one.
+    ///
+    /// [`PrimSpec::block_variant_selection`]: super::PrimSpec::block_variant_selection
+    #[error("the selection of variant set {set:?} on {prim} is empty")]
+    EmptyVariantSelection {
+        /// The prim spec.
+        prim: Path,
+        /// The variant set.
+        set: String,
+    },
+}
+
+/// An error from [`Layer::edit`]: the closure's authoring error, or a sink's
+/// rejection of the staged edit.
+#[derive(Debug, thiserror::Error)]
+pub enum EditError {
+    /// The edit closure failed to author; nothing was committed.
+    #[error(transparent)]
+    Author(#[from] AuthoringError),
+
+    /// A [`LayerSink`] rejected the staged edit from its
+    /// [`before_commit`](LayerSink::before_commit).
+    #[error(transparent)]
+    Rejected(#[from] sink::Error),
+}
+
+/// An observer of a single [`Layer`]'s committed edits — the low tier of the
+/// change pipeline. A sink sees every edit, by any editor. Composition-level
+/// observation lives one tier up, on the [`Stage`](crate::usd::Stage).
+///
+/// Both methods default to doing nothing, so a sink implements only the phase it
+/// cares about. Sinks fire in installation order. `before_commit` runs inside
+/// the edit. `after_commit` runs once the edit's borrows are released: for a
+/// layer outside any registry, before the edit returns; for one a
+/// [`LayerRegistry`](super::LayerRegistry) holds, in commit order after every
+/// notification queued ahead of it, which may be after the edit returns when
+/// the edit was made from inside another sink's callback.
+pub trait LayerSink {
+    /// Inspect a staged edit before it commits. Returning `Err` rolls the edit
+    /// back: the overlay is discarded and the error surfaces to the author. The
+    /// pristine base and the staged overlay are both visible, which is what lets
+    /// a sink derive an inverse (undo) record here.
+    fn before_commit(&self, change: &PendingLayerChange<'_>) -> Result<(), sink::Error> {
+        let _ = change;
+        Ok(())
+    }
+
+    /// Observe a committed edit, after the overlay has drained into the backend.
+    /// Its [`generation`](CommittedLayerChange::generation) pairs it with the
+    /// [`before_commit`](Self::before_commit) of the same transaction, which
+    /// another transaction's `before_commit` may have followed.
+    fn after_commit(&self, change: &CommittedLayerChange<'_>) {
+        let _ = change;
+    }
+}
+
+/// A bare closure is a [`LayerSink`] that only observes committed edits — the
+/// ergonomic "just record commits" case, installed straight through
+/// [`Layer::add_sink`] with no wrapper type. `Fn` (not `FnMut`) because a sink is
+/// invoked through a shared `&self`; capture interior-mutable state to accumulate.
+impl<F: Fn(&str, &ChangeList)> LayerSink for F {
+    fn after_commit(&self, change: &CommittedLayerChange<'_>) {
+        self(change.layer_identifier, change.change_list);
+    }
+}
+
+/// A committed edit on one layer, handed to [`LayerSink::after_commit`].
+#[derive(Debug)]
+pub struct CommittedLayerChange<'a> {
+    /// Canonical identifier of the edited layer.
+    pub layer_identifier: &'a str,
+    /// The composition record derived from the edit.
+    pub change_list: &'a ChangeList,
+    /// The id of the atomic transaction the commit belongs to, as the matching
+    /// [`PendingLayerChange::generation`] carried it.
+    pub generation: u64,
+}
+
+/// A staged, not-yet-committed edit on one layer, handed to
+/// [`LayerSink::before_commit`]: the pre-edit base, the staged overlay, and the
+/// derived change record — enough for a sink to derive a forward or inverse
+/// [`Edit`](crate::usd::Edit) log without committing.
+pub struct PendingLayerChange<'a> {
+    /// Canonical identifier of the edited layer.
+    pub layer_identifier: &'a str,
+    /// The layer's pre-edit values (the overlay's base).
+    pub base: &'a dyn AbstractData,
+    /// The staged changes keyed by path — the new values, as [`Patch`]es.
+    pub overlay: &'a sdf::PathMap<Patch>,
+    /// The composition record derived from this layer's overlay. A sink that
+    /// needs to retain it past the callback clones it ([`ChangeList`] is
+    /// [`Clone`]).
+    pub change_list: &'a ChangeList,
+    /// The id of the atomic transaction (`edit_layers` group) this commit
+    /// belongs to: one id shared by every layer the transaction commits, distinct
+    /// from the next transaction's, and monotonically increasing. An observer
+    /// keys per-transaction state on it (see [`crate::usd::UndoStage`]).
+    pub generation: u64,
+}
+
+/// Identity, persistence, and typed-view lookups. Spec authoring lives on the
+/// views themselves ([`PrimSpec::new`](crate::sdf::PrimSpec::new) and friends,
+/// mirroring C++ `Sdf*Spec::New`); they write through [`LayerEdit::data_mut`], so
+/// every edit stages in the layer's overlay for the next flush to record.
+///
+/// The typed-view lookups ([`Layer::prim`], [`Layer::attribute`],
+/// [`Layer::relationship`], [`Layer::pseudo_root`]) operate through the
+/// [`AbstractData`] field interface, so they work uniformly on any backend —
+/// in-memory [`Data`] or a file-loaded reader — matching C++
+/// `SdfLayer::GetPrimAtPath`.
+impl Layer {
+    /// Create a blank in-memory writable layer with a unique anonymous
+    /// identifier of the form `anon:<n>:<tag>`, mirroring C++
+    /// `SdfLayer::CreateAnonymous`. `tag` is a human-readable hint, not an
+    /// address: two calls with the same tag get distinct identifiers, so
+    /// independent anonymous layers never alias (see [`Layer::is_anonymous`]).
+    ///
+    /// The layer's pseudo-root spec is pre-populated so layer-level metadata
+    /// (`defaultPrim`, `subLayers`, time codes, …) can be authored via
+    /// [`LayerEdit::pseudo_root_mut`] immediately.
+    pub fn new_anonymous(tag: impl fmt::Display) -> Self {
+        Self::new_in_memory(Self::anonymous_identifier(tag))
+    }
+
+    /// A fresh anonymous identifier of the form `anon:<n>:<tag>`. Distinct on
+    /// every call, so independent anonymous layers never alias.
+    pub(crate) fn anonymous_identifier(tag: impl fmt::Display) -> String {
+        // The `<n>` in `anon:<n>:<tag>` is unique in the process, so anonymous
+        // layers created anywhere in it never collide.
+        let n = crate::next_id();
+        format!("{ANONYMOUS_PREFIX}{n}:{tag}")
+    }
+
+    /// Create a blank in-memory writable layer with the given verbatim
+    /// identifier and a pre-populated pseudo-root spec, under the identifier
+    /// contract of [`new`](Self::new). Backs
+    /// [`new_anonymous`](Self::new_anonymous) and, within the crate, composes
+    /// layers whose identifiers must match an authored `subLayers` entry.
+    pub(crate) fn new_in_memory(identifier: impl Into<String>) -> Self {
+        Self::new(identifier, Box::new(Data::rooted()))
+    }
+
+    /// Whether this layer's identifier is anonymous (the `anon:` prefix minted
+    /// by [`new_anonymous`](Self::new_anonymous)). Mirrors C++
+    /// `SdfLayer::IsAnonymous`; an anonymous layer has no asset-resolvable
+    /// location.
+    pub fn is_anonymous(&self) -> bool {
+        Self::is_anonymous_identifier(&self.identifier)
+    }
+
+    /// Whether `identifier` is an anonymous-layer identifier (the `anon:` prefix),
+    /// without needing the layer itself. Mirrors C++
+    /// `SdfLayer::IsAnonymousLayerIdentifier`; the prefix is the single source of
+    /// truth for anonymity.
+    pub fn is_anonymous_identifier(identifier: &str) -> bool {
+        identifier.starts_with(ANONYMOUS_PREFIX)
+    }
+
+    /// Look up the prim spec at `path`. A variant spec (`/Prim{set=sel}`) is
+    /// returned as a prim spec too, one that authors no `specifier`.
+    /// `Ok(None)` when no prim or variant spec exists there; `Err` when `path`
+    /// fails to parse.
+    pub fn prim(&self, path: impl IntoPath) -> Result<Option<PrimSpecRef<'_>>, PathParseError> {
+        Ok(PrimSpecRef::get(self.data(), try_into_path(path)?))
+    }
+
+    /// Look up an attribute spec at a property path.
+    pub fn attribute(&self, path: impl IntoPath) -> Result<Option<AttributeSpecRef<'_>>, PathParseError> {
+        Ok(AttributeSpecRef::get(self.data(), try_into_path(path)?))
+    }
+
+    /// Look up a relationship spec at a property path.
+    pub fn relationship(&self, path: impl IntoPath) -> Result<Option<RelationshipSpecRef<'_>>, PathParseError> {
+        Ok(RelationshipSpecRef::get(self.data(), try_into_path(path)?))
+    }
+
+    /// View this layer's root pseudo-spec, which carries layer-wide metadata
+    /// (`defaultPrim`, `subLayers`, time codes, …).
+    pub fn pseudo_root(&self) -> Option<PseudoRootSpecRef<'_>> {
+        PseudoRootSpecRef::get(self.data())
+    }
+
+    /// The layer's `defaultPrim` metadata, `None` when unauthored (C++
+    /// `SdfLayer::GetDefaultPrim`).
+    pub fn default_prim(&self) -> Option<tf::Token> {
+        self.pseudo_root()?.default_prim()
+    }
+
+    /// The prim path the layer's `defaultPrim` names, `None` when unauthored
+    /// or when it names no prim (C++ `SdfLayer::GetDefaultPrimAsPath`; see
+    /// [`default_prim_path`]).
+    pub fn default_prim_path(&self) -> Option<Path> {
+        default_prim_path(&self.default_prim()?)
+    }
+
+    /// The list of namespace relocations authored in this layer's metadata,
+    /// or an empty list when none are authored. Mirrors C++
+    /// `SdfLayer::GetRelocates`. Reads through the backing [`AbstractData`], so
+    /// it works on both in-memory and file-loaded layers.
+    pub fn relocates(&self) -> RelocateList {
+        self.pseudo_root().and_then(|root| root.relocates()).unwrap_or_default()
+    }
+
+    /// Whether this layer's metadata carries any `relocates` opinion, including
+    /// an explicit empty list (an opinion that *there should be no* relocates).
+    /// Mirrors C++ `SdfLayer::HasRelocates`.
+    pub fn has_relocates(&self) -> bool {
+        self.has_root_field(FieldKey::LayerRelocates)
+    }
+
+    /// The layer's `startTimeCode`, or `0.0` when unauthored. Mirrors C++
+    /// `SdfLayer::GetStartTimeCode`.
+    pub fn start_time_code(&self) -> f64 {
+        self.pseudo_root()
+            .and_then(|root| root.start_time_code())
+            .unwrap_or(0.0)
+    }
+
+    /// Whether this layer authors a `startTimeCode` opinion. Mirrors C++
+    /// `SdfLayer::HasStartTimeCode`.
+    pub fn has_start_time_code(&self) -> bool {
+        self.has_root_field(FieldKey::StartTimeCode)
+    }
+
+    /// The layer's `endTimeCode`, or `0.0` when unauthored. Mirrors C++
+    /// `SdfLayer::GetEndTimeCode`.
+    pub fn end_time_code(&self) -> f64 {
+        self.pseudo_root().and_then(|root| root.end_time_code()).unwrap_or(0.0)
+    }
+
+    /// Whether this layer authors an `endTimeCode` opinion. Mirrors C++
+    /// `SdfLayer::HasEndTimeCode`.
+    pub fn has_end_time_code(&self) -> bool {
+        self.has_root_field(FieldKey::EndTimeCode)
+    }
+
+    /// The layer's `timeCodesPerSecond`. Falls back to the authored
+    /// `framesPerSecond`, then to `24.0`, when unauthored. Mirrors C++
+    /// `SdfLayer::GetTimeCodesPerSecond`.
+    pub fn time_codes_per_second(&self) -> f64 {
+        let root = self.pseudo_root();
+        root.as_ref()
+            .and_then(|root| root.time_codes_per_second())
+            .or_else(|| root.as_ref().and_then(|root| root.frames_per_second()))
+            .unwrap_or(24.0)
+    }
+
+    /// Whether this layer authors a `timeCodesPerSecond` opinion. Mirrors C++
+    /// `SdfLayer::HasTimeCodesPerSecond`.
+    pub fn has_time_codes_per_second(&self) -> bool {
+        self.has_root_field(FieldKey::TimeCodesPerSecond)
+    }
+
+    /// The layer's `framesPerSecond`, or `24.0` when unauthored. Mirrors C++
+    /// `SdfLayer::GetFramesPerSecond`.
+    pub fn frames_per_second(&self) -> f64 {
+        self.pseudo_root()
+            .and_then(|root| root.frames_per_second())
+            .unwrap_or(24.0)
+    }
+
+    /// Whether this layer authors a `framesPerSecond` opinion. Mirrors C++
+    /// `SdfLayer::HasFramesPerSecond`.
+    pub fn has_frames_per_second(&self) -> bool {
+        self.has_root_field(FieldKey::FramesPerSecond)
+    }
+
+    /// The layer's `colorConfiguration`, the asset path of the color
+    /// configuration (an OCIO config, say) pipeline tools read the layer's
+    /// display colors with, or `None` when unauthored. Mirrors C++
+    /// `SdfLayer::GetColorConfiguration`.
+    pub fn color_configuration(&self) -> Option<sdf::AssetPath> {
+        self.pseudo_root().and_then(|root| root.color_configuration())
+    }
+
+    /// Whether this layer authors a `colorConfiguration` opinion. Mirrors C++
+    /// `SdfLayer::HasColorConfiguration`.
+    pub fn has_color_configuration(&self) -> bool {
+        self.has_root_field(FieldKey::ColorConfiguration)
+    }
+
+    /// The layer's `colorManagementSystem`, the name of the system that reads
+    /// [`color_configuration`](Self::color_configuration) (`OpenColorIO`, say),
+    /// or `None` when unauthored. Mirrors C++
+    /// `SdfLayer::GetColorManagementSystem`.
+    pub fn color_management_system(&self) -> Option<tf::Token> {
+        self.pseudo_root().and_then(|root| root.color_management_system())
+    }
+
+    /// Whether this layer authors a `colorManagementSystem` opinion. Mirrors
+    /// C++ `SdfLayer::HasColorManagementSystem`.
+    pub fn has_color_management_system(&self) -> bool {
+        self.has_root_field(FieldKey::ColorManagementSystem)
+    }
+
+    /// The layer's `framePrecision`, or `3` when unauthored. Mirrors C++
+    /// `SdfLayer::GetFramePrecision`.
+    pub fn frame_precision(&self) -> i32 {
+        self.pseudo_root().and_then(|root| root.frame_precision()).unwrap_or(3)
+    }
+
+    /// Whether this layer authors a `framePrecision` opinion. Mirrors C++
+    /// `SdfLayer::HasFramePrecision`.
+    pub fn has_frame_precision(&self) -> bool {
+        self.has_root_field(FieldKey::FramePrecision)
+    }
+
+    /// Whether the pseudo-root spec authors `key`, including an explicit
+    /// opinion that carries an "empty"/default value.
+    fn has_root_field(&self, key: FieldKey) -> bool {
+        self.data.has_field(&Path::abs_root(), key.as_str())
+    }
+}
+
+/// The authoring view of a [`Layer`] handed to an [`edit`](Layer::edit) closure
+/// — the only surface through which a layer is mutated.
+///
+/// Derefs to the [`Layer`] for reads, and exposes the layer's authoring
+/// operations directly. A layer's `commit` and `rollback` are deliberately absent:
+/// the edit commits when the closure returns and rolls back on its error or a
+/// panic, so an edit can never be left staged-but-uncommitted, and a multi-layer
+/// edit stays atomic across its layers.
+pub struct LayerEdit<'a> {
+    layer: &'a mut Layer,
+}
+
+impl std::ops::Deref for LayerEdit<'_> {
+    type Target = Layer;
+
+    fn deref(&self) -> &Layer {
+        &*self.layer
+    }
+}
+
+impl LayerEdit<'_> {
+    /// Borrow the layer's backing data mutably for authoring; the write stages in
+    /// the copy-on-write overlay and commits with the enclosing edit. The typed
+    /// spec constructors ([`PrimSpec::new`](crate::sdf::PrimSpec::new) and friends)
+    /// write through this.
+    ///
+    /// A caller writing specs through the raw [`AbstractData`] methods keeps
+    /// each parent's children field in step itself
+    /// ([`AbstractData::create_spec`]).
+    pub fn data_mut(&mut self) -> &mut dyn AbstractData {
+        &mut self.layer.data
+    }
+
+    /// Brings the layer to the content a reload read
+    /// ([`Layer::read_due`]), and has the commit take on the asset's state
+    /// and report the reload ([`ChangeList::did_reload_content`]).
+    pub(crate) fn reload(&mut self, reload: Reload) {
+        let data = &mut self.layer.data;
+        for edit in reload.edits {
+            match edit {
+                ContentEdit::EraseSpec(path) => data.erase_spec(&path),
+                ContentEdit::CreateSpec(path, ty) => data.create_spec(path, ty),
+                ContentEdit::EraseField(path, field) => data.erase_field(&path, &field),
+                ContentEdit::SetField(path, field, value) => data.set_field(&path, &field, value),
+            }
+        }
+        self.layer.reloading = Some(reload.reloaded);
+    }
+
+    /// Report, with this edit, that a package the layer lies in changed
+    /// what it holds ([`ChangeList::did_change_package`]).
+    pub(crate) fn package_changed(&mut self) {
+        self.layer.package_changed = true;
+    }
+
+    /// Remove the spec at `path`. Removing a prim also erases its descendant specs
+    /// and drops the leaf name from the owning prim's child-name list. Returns
+    /// `Ok(true)` when a spec was present and removed.
+    pub fn remove_spec(&mut self, path: &Path) -> Result<bool, AuthoringError> {
+        super::spec::remove_spec(self.data_mut(), path)
+    }
+
+    /// Mutably look up the prim spec at `path`.
+    pub fn prim_mut(&mut self, path: impl IntoPath) -> Result<Option<PrimSpecMut<'_>>, PathParseError> {
+        Ok(PrimSpecMut::get(self.data_mut(), try_into_path(path)?))
+    }
+
+    /// Mutably look up the attribute spec at a property path.
+    pub fn attribute_mut(&mut self, path: impl IntoPath) -> Result<Option<AttributeSpecMut<'_>>, PathParseError> {
+        Ok(AttributeSpecMut::get(self.data_mut(), try_into_path(path)?))
+    }
+
+    /// Mutably look up the relationship spec at a property path.
+    pub fn relationship_mut(&mut self, path: impl IntoPath) -> Result<Option<RelationshipSpecMut<'_>>, PathParseError> {
+        Ok(RelationshipSpecMut::get(self.data_mut(), try_into_path(path)?))
+    }
+
+    /// Mutably view the root pseudo-spec, which carries layer-wide metadata
+    /// (`defaultPrim`, `subLayers`, time codes, …). The spec is created on first
+    /// access if missing.
+    pub fn pseudo_root_mut(&mut self) -> Result<PseudoRootSpecMut<'_>, AuthoringError> {
+        let root = Path::abs_root();
+        match self.layer.data().spec_type(&root) {
+            Some(SpecType::PseudoRoot) => {}
+            Some(_) => {
+                return Err(AuthoringError::InvalidPath {
+                    path: root,
+                    reason: "root spec exists with non-PseudoRoot SpecType",
+                });
+            }
+            None => self.data_mut().create_spec(root, SpecType::PseudoRoot),
+        }
+        Ok(PseudoRootSpecMut::get(self.data_mut()).expect("just ensured a pseudo-root spec"))
+    }
+
+    /// Set the layer's `defaultPrim` metadata to `name` — a prim identifier, a
+    /// nested prim path, or either spelled absolutely (`"World"`,
+    /// `"World/Char"`, `"/World/Char"`). The token is stored as given;
+    /// [`default_prim_path`] reads both spellings.
+    ///
+    /// This is a checked authoring API, which is a deliberate divergence: C++
+    /// `SdfLayer::SetDefaultPrim` stores any token and defers every check to
+    /// `GetDefaultPrimAsPath`. Rejecting here keeps a value that names no prim
+    /// out of the layer in the first place; the spec-tier
+    /// [`PseudoRootSpecMut::set_default_prim`] remains the unvalidated escape
+    /// hatch for round-tripping data verbatim.
+    pub fn set_default_prim(&mut self, name: impl Into<String>) -> Result<(), AuthoringError> {
+        let name = name.into();
+        if default_prim_path(&name).is_none() {
+            return Err(AuthoringError::InvalidPath {
+                path: Path::abs_root(),
+                reason: "defaultPrim must name a prim",
+            });
+        }
+        self.pseudo_root_mut()?.set_default_prim(name);
+        Ok(())
+    }
+
+    /// Remove the layer's `defaultPrim` metadata. No-op when no pseudo-root spec
+    /// exists.
+    pub fn clear_default_prim(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::DefaultPrim)
+    }
+
+    /// Set the layer's entire list of namespace relocations. An empty list authors
+    /// an explicit "no relocates" opinion; use [`clear_relocates`](Self::clear_relocates)
+    /// to remove the opinion entirely.
+    pub fn set_relocates(&mut self, relocates: RelocateList) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_relocates(relocates);
+        Ok(())
+    }
+
+    /// Clear the layer's `relocates` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_relocates(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::LayerRelocates)
+    }
+
+    /// Replace the layer's `expressionVariables` dictionary, the values an
+    /// `${VAR}` expression resolves against (see
+    /// [`PseudoRootSpec::set_expression_variables`](crate::sdf::PseudoRootSpec::set_expression_variables)).
+    pub fn set_expression_variables(&mut self, vars: HashMap<String, Value>) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_expression_variables(vars);
+        Ok(())
+    }
+
+    /// Clear the layer's `expressionVariables` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_expression_variables(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::ExpressionVariables)
+    }
+
+    /// Set the layer's `startTimeCode`.
+    pub fn set_start_time_code(&mut self, time: f64) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_start_time_code(time);
+        Ok(())
+    }
+
+    /// Clear the layer's `startTimeCode` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_start_time_code(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::StartTimeCode)
+    }
+
+    /// Set the layer's `endTimeCode`.
+    pub fn set_end_time_code(&mut self, time: f64) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_end_time_code(time);
+        Ok(())
+    }
+
+    /// Clear the layer's `endTimeCode` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_end_time_code(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::EndTimeCode)
+    }
+
+    /// Set the layer's `timeCodesPerSecond`.
+    pub fn set_time_codes_per_second(&mut self, rate: f64) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_time_codes_per_second(rate);
+        Ok(())
+    }
+
+    /// Clear the layer's `timeCodesPerSecond` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_time_codes_per_second(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::TimeCodesPerSecond)
+    }
+
+    /// Set the layer's `framesPerSecond`.
+    pub fn set_frames_per_second(&mut self, rate: f64) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_frames_per_second(rate);
+        Ok(())
+    }
+
+    /// Clear the layer's `framesPerSecond` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_frames_per_second(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::FramesPerSecond)
+    }
+
+    /// Set the layer's `framePrecision`.
+    pub fn set_frame_precision(&mut self, precision: i32) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_frame_precision(precision);
+        Ok(())
+    }
+
+    /// Clear the layer's `framePrecision` opinion. No-op when no pseudo-root spec exists.
+    pub fn clear_frame_precision(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::FramePrecision)
+    }
+
+    /// Set the layer's `colorConfiguration`. Mirrors C++
+    /// `SdfLayer::SetColorConfiguration`.
+    pub fn set_color_configuration(&mut self, config: impl Into<sdf::AssetPath>) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_color_configuration(config);
+        Ok(())
+    }
+
+    /// Clear the layer's `colorConfiguration` opinion. No-op when no
+    /// pseudo-root spec exists. Mirrors C++
+    /// `SdfLayer::ClearColorConfiguration`.
+    pub fn clear_color_configuration(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::ColorConfiguration)
+    }
+
+    /// Set the layer's `colorManagementSystem`. Mirrors C++
+    /// `SdfLayer::SetColorManagementSystem`.
+    pub fn set_color_management_system(&mut self, cms: impl Into<tf::Token>) -> Result<(), AuthoringError> {
+        self.pseudo_root_mut()?.set_color_management_system(cms);
+        Ok(())
+    }
+
+    /// Clear the layer's `colorManagementSystem` opinion. No-op when no
+    /// pseudo-root spec exists. Mirrors C++
+    /// `SdfLayer::ClearColorManagementSystem`.
+    pub fn clear_color_management_system(&mut self) -> Result<(), AuthoringError> {
+        self.clear_root_field(FieldKey::ColorManagementSystem)
+    }
+
+    /// Remove a metadata field from the pseudo-root spec, if that spec exists. No-op
+    /// otherwise — clearing what isn't there must not materialize state.
+    fn clear_root_field(&mut self, key: FieldKey) -> Result<(), AuthoringError> {
+        // `erase_field` is a no-op when the pseudo-root spec is absent.
+        self.data_mut().erase_field(&Path::abs_root(), key.as_str());
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Layer")
+            .field("identifier", &self.identifier)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The prim path a `defaultPrim` token names, or `None` when it names no prim.
+///
+/// Mirrors C++ `SdfLayer::ConvertDefaultPrimTokenToPath`: the token may be
+/// absolute or relative, a relative one is anchored at the pseudo-root, and it
+/// must name a prim. C++ writes a nested default prim absolutely
+/// (`ConvertDefaultPrimPathToToken` emits a bare name only for a root prim), so
+/// accepting both spellings is what lets this port read a C++-authored layer.
+///
+/// ```text
+/// "World"       -> Some("/World")
+/// "World/Char"  -> Some("/World/Char")
+/// "/World/Char" -> Some("/World/Char")
+/// "World.attr"  -> None
+/// "/"           -> None
+/// ""            -> None
+/// ```
+///
+/// The relative anchors `.` and `..` yield `None`. For `..` that matches C++,
+/// which anchors it past the root to an empty path. For `.` it does not: C++
+/// anchors it to `/` and composes a pseudo-root arc that contributes nothing.
+/// The composed result is the same either way, so this port reports the
+/// unusable value instead of resolving it to a target no reference can use.
+pub fn default_prim_path(token: &str) -> Option<Path> {
+    let path = Path::new(token).ok()?;
+    // No identifier may begin with `.`, so the only prim paths whose text starts
+    // with one are the relative anchors `.`, `..`, and `../…`.
+    if !path.is_prim() || path.as_str().starts_with('.') {
+        return None;
+    }
+    Some(Path::abs_root().make_absolute(&path))
+}
+
+/// Author across several layers as one atomic transaction `txn`: run `f` to
+/// stage edits into every layer through its [`LayerEdit`] view, then commit
+/// them together, in the order the [`commit`](super::commit) module sets out.
+///
+/// Every layer's [`before_commit`](LayerSink::before_commit) runs first, and
+/// only once all accept are the subscribers prepared and the overlays drained,
+/// so a single vetoing sink, an authoring error from `f`, or a panic rolls
+/// every layer back, leaving none partially applied. The returned
+/// [`Committed`] holds the sinks' `after_commit` notifications for the caller
+/// to dispatch once it has released its borrows.
+///
+/// [`Layer::edit`] is the single-layer case of this.
+pub(crate) fn edit_layers<E: From<sink::Error>>(
+    targets: &mut [TargetLayer<'_>],
+    txn: TxnContext,
+    f: impl FnOnce(&mut [LayerEdit<'_>]) -> Result<(), E>,
+) -> Result<Committed, E> {
+    let mut guard = GroupEditGuard {
+        targets,
+        committed: false,
+    };
+    {
+        let mut edits: Vec<LayerEdit<'_>> = guard.edits();
+        f(&mut edits)?;
+        // `edits` drops at the block end, releasing the per-layer borrows for the
+        // commit phase below.
+    }
+    // Refill each layer's record and offer it to that layer's `before_commit`; a
+    // veto aborts before any subscriber sees the transaction.
+    for target in guard.targets.iter_mut() {
+        target.layer.veto(&txn)?;
+    }
+    // Every layer accepted: prepare the subscribers while the old data exists.
+    // An unwind from here on drops the prepared objects uncommitted.
+    let prepared: Vec<_> = guard
+        .targets
+        .iter()
+        .map(|TargetLayer { layer, subscribers }| layer.observed(subscribers).then(|| layer.prepare(subscribers, &txn)))
+        .collect();
+    // Drain each overlay into its backend, all layers before any record is
+    // handed on, so the whole group's data lands together.
+    let changed = guard.targets.iter().any(|target| !target.layer.changes.is_empty());
+    for TargetLayer { layer, .. } in guard.targets.iter_mut() {
+        // A change of a package the layer lies in leaves its content as it
+        // was.
+        layer.unsaved |= !layer.changes.entries().is_empty();
+        layer.package_changed = false;
+        layer.data.commit();
+        // A reload leaves the layer as its asset holds it, so saved.
+        if let Some(reloaded) = layer.reloading.take() {
+            layer.format = reloaded.format;
+            layer.modified = reloaded.modified;
+            layer.unsaved = false;
+        }
+    }
+    // The group is committed, so the guard's drop leaves every overlay in place.
+    guard.committed = true;
+    // Every record and notification is built before any subscriber is handed
+    // its record, so the transaction's notifications are whole however a
+    // subscriber's `commit` ends.
+    let mut notifications = Vec::new();
+    let mut landed = Vec::new();
+    for (TargetLayer { layer, .. }, prepared) in guard.targets.iter_mut().zip(prepared) {
+        let Some((footprint, prepared)) = prepared else {
+            continue;
+        };
+        // TODO(perf): an observed commit moves its change list into the record
+        // and the layer's next commit grows a fresh one; a record that shares
+        // the list (`Rc<ChangeList>`) would keep one buffer per layer.
+        let record = Rc::new(CommitRecord {
+            identifier: layer.identifier.clone(),
+            txn: txn.id,
+            changes: mem::take(&mut layer.changes),
+            // TODO(perf): every subscribed commit builds and sorts its
+            // footprint, which only a stage with a transaction observer reads;
+            // a subscriber that says it wants one would skip the rest.
+            footprint: Rc::new(footprint),
+            origin: txn.origin,
+        });
+        notifications.extend(layer.sinks.snapshot().into_iter().map(|sink| Notification {
+            sink,
+            record: Rc::clone(&record),
+        }));
+        landed.push((record, prepared));
+    }
+    for (record, prepared) in landed {
+        for subscriber in prepared {
+            if let Some(sink) = subscriber.commit(&record) {
+                notifications.push(Notification {
+                    sink,
+                    record: Rc::clone(&record),
+                });
+            }
+        }
+    }
+    Ok(Committed::new(notifications, changed))
+}
+
+/// Stage edits across the `targets` layers to verify they apply, then discard
+/// them all — the dry-run counterpart of [`edit_layers`]. Returns `f`'s
+/// authoring result while committing nothing and firing no sink, so a caller
+/// can check that an edit is valid (e.g. a namespace edit's `can_apply`)
+/// without mutating the layers or notifying observers.
+pub(crate) fn dry_run_layers<E>(
+    targets: &mut [TargetLayer<'_>],
+    f: impl FnOnce(&mut [LayerEdit<'_>]) -> Result<(), E>,
+) -> Result<(), E> {
+    // `committed` stays false, so the guard rolls every layer back on the way out,
+    // whether `f` succeeds or fails — a dry run leaves no staged state behind.
+    let mut guard = GroupEditGuard {
+        targets,
+        committed: false,
+    };
+    f(&mut guard.edits())
+}
+
+/// One layer of an [`edit_layers`] transaction, beside the crate-internal
+/// observers subscribed to it. A registry keeps the subscribers next to the
+/// layer, and a layer no registry holds has none.
+pub(crate) struct TargetLayer<'a> {
+    /// The layer the transaction edits.
+    pub(crate) layer: &'a mut Layer,
+    /// The observers prepared ahead of the layer's commit and committed with
+    /// it.
+    pub(crate) subscribers: &'a sink::Set<dyn Subscriber>,
+}
+
+/// Rolls every layer in an [`edit_layers`] group back unless the group commits —
+/// on an authoring error, a sink veto, or a panic — so a failed multi-layer edit
+/// strands no layer with a half-applied overlay.
+struct GroupEditGuard<'a, 'b> {
+    targets: &'b mut [TargetLayer<'a>],
+    committed: bool,
+}
+
+impl GroupEditGuard<'_, '_> {
+    /// An edit view of each layer, in order.
+    fn edits(&mut self) -> Vec<LayerEdit<'_>> {
+        self.targets
+            .iter_mut()
+            .map(|target| LayerEdit { layer: target.layer })
+            .collect()
+    }
+}
+
+impl Drop for GroupEditGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for target in self.targets.iter_mut() {
+            target.layer.rollback();
+        }
+    }
+}
+
+impl AssetTime {
+    /// Whether both name one modification of an asset (C++
+    /// `_ModificationTimesEqual`): two known times that are equal.
+    fn same(self, other: Self) -> bool {
+        matches!((self, other), (Self::At(a), Self::At(b)) if a == b)
+    }
+}
+
+/// The modification time of the asset `identifier` resolved to at `resolved`
+/// ([`ar::modification_timestamp`]).
+pub(crate) fn asset_time(resolver: &dyn ar::Resolver, identifier: &str, resolved: &ar::ResolvedPath) -> AssetTime {
+    ar::modification_timestamp(resolver, identifier, resolved).map_or(AssetTime::Unknown, AssetTime::At)
+}
+
+/// The edits that bring `old`'s content to `new`'s (C++
+/// `SdfLayer::_SetData`), so a change list names only what differs: a spec
+/// `new` lacks, or holds as another type, is erased, a missing one is
+/// created, and each field `new` holds differently is set or erased.
+///
+/// TODO(perf): every spec and field of both is read, the whole of a lazily
+/// decoded layer included, and the layer keeps its old storage (a crate
+/// file's buffer or mapping) under the changed fields it stages; one that
+/// reads its data on demand could take `new` whole and report that anything
+/// changed, as C++ `_AdoptData` does for data that streams.
+fn content_edits(old: &dyn AbstractData, new: &dyn AbstractData) -> Result<Vec<ContentEdit>, DataError> {
+    let mut edits = Vec::new();
+    // Deepest first, so a spec goes after those beneath it.
+    for path in old.spec_paths().iter().rev() {
+        if new.spec_type(path) != old.spec_type(path) {
+            edits.push(ContentEdit::EraseSpec(path.clone()));
+        }
+    }
+    // Parents first, as the paths sort.
+    for path in new.spec_paths() {
+        let Some(ty) = new.spec_type(&path) else {
+            continue;
+        };
+        // A spec erased or missing above is created with no fields.
+        let kept = old.spec_type(&path) == Some(ty);
+        if !kept {
+            edits.push(ContentEdit::CreateSpec(path.clone(), ty));
+        }
+        let fields = new.list_fields(&path).unwrap_or_default();
+        if kept {
+            for field in old.list_fields(&path).unwrap_or_default() {
+                if !fields.contains(&field) {
+                    edits.push(ContentEdit::EraseField(path.clone(), field));
+                }
+            }
+        }
+        for field in fields {
+            let Some(value) = new.try_field(&path, &field)? else {
+                continue;
+            };
+            // A value the old content cannot decode differs, so a reload
+            // repairs it.
+            let same = kept && matches!(old.try_field(&path, &field), Ok(Some(old)) if *old == *value);
+            if !same {
+                edits.push(ContentEdit::SetField(path.clone(), field, value.into_owned()));
+            }
+        }
+    }
+    Ok(edits)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::Result;
+    use crate::vt;
+
+    use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::sdf;
+    use crate::usda;
+    use crate::usdz;
+
+    /// A layer opened by any spelling of its path keeps the canonical
+    /// identifier, so it stays one identity and `save` finds the file it loaded
+    /// from. Every other load path canonicalizes first; this one must too.
+    #[test]
+    fn open_canonicalizes_identifier() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scene.usda");
+        std::fs::write(&path, "#usda 1.0\n")?;
+
+        // The same file, spelled with a redundant directory step.
+        let indirect = dir.path().join(".").join("scene.usda");
+        let mut layer = Layer::open(indirect.to_string_lossy())?;
+
+        assert_eq!(
+            layer.identifier(),
+            path.canonicalize()?.to_string_lossy(),
+            "the identifier is the canonical one, not the spelling passed in"
+        );
+        layer
+            .save()
+            .expect("a layer that loaded from a file can save back to it");
+        Ok(())
+    }
+
+    /// Writes `contents` to `path` with a modification time past any it had.
+    pub(crate) fn rewrite(path: &FsPath, contents: impl AsRef<[u8]>) -> Result<()> {
+        fs::write(path, contents)?;
+        touch_later(path)
+    }
+
+    /// Appends `text` to the file at `path`, as [`rewrite`] writes.
+    pub(crate) fn append(path: &FsPath, text: &str) -> Result<()> {
+        let old = fs::read_to_string(path)?;
+        rewrite(path, format!("{old}{text}"))
+    }
+
+    /// Sets the modification time of the file at `path` past any it had.
+    pub(crate) fn touch_later(path: &FsPath) -> Result<()> {
+        let later = SystemTime::now() + Duration::from_secs(60);
+        fs::File::options().write(true).open(path)?.set_modified(later)?;
+        Ok(())
+    }
+
+    /// A reload discards the unsaved edits of a layer whose file is unchanged.
+    #[test]
+    fn reload_discards_edits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scene.usda");
+        fs::write(&path, "#usda 1.0\ndef \"A\" {}\n")?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        layer.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/B", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+        assert!(layer.is_dirty());
+        assert!(layer.reload(false)?, "a dirty layer reloads");
+        assert!(!layer.is_dirty());
+        assert!(layer.prim("/B")?.is_none(), "the edit is gone");
+        assert!(layer.prim("/A")?.is_some());
+        Ok(())
+    }
+
+    /// A clean layer whose file is unchanged is not read again unless forced.
+    #[test]
+    fn reload_skips_unchanged() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scene.usda");
+        fs::write(&path, "#usda 1.0\ndef \"A\" {}\n")?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        assert!(!layer.reload(false)?);
+        assert!(layer.reload(true)?, "a forced reload reads the file");
+        Ok(())
+    }
+
+    /// A layer over shared data copies it at its first committed edit, and
+    /// leaves the shared data as it was; an edit that does not commit copies
+    /// nothing.
+    #[test]
+    fn from_shared_copies() -> Result<()> {
+        let mut data = Data::rooted();
+        sdf::PrimSpec::new(&mut data, "/A", sdf::Specifier::Def, "")?;
+        let shared = Arc::new(data);
+        // A layer on another thread reads the data, and an edit through one
+        // layer leaves another's as it was.
+        let elsewhere = Arc::clone(&shared);
+        let read = thread::spawn(move || {
+            Layer::from_shared("elsewhere", elsewhere)
+                .prim("/A")
+                .map(|a| a.is_some())
+        });
+        assert!(read.join().expect("the thread finishes")?);
+        let other = Layer::from_shared("other", Arc::clone(&shared));
+        let mut layer = Layer::from_shared("shared", Arc::clone(&shared));
+        assert!(layer.is_anonymous());
+        assert!(layer.prim("/A")?.is_some());
+        let refused = layer.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Refused", sdf::Specifier::Def, "")?;
+            Err(AuthoringError::InvalidPath {
+                path: sdf::Path::new("/Refused")?,
+                reason: "refused",
+            })
+        });
+        assert!(refused.is_err());
+        assert_eq!(Arc::strong_count(&shared), 3, "a rolled back edit copies nothing");
+        layer.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/B", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+        assert_eq!(Arc::strong_count(&shared), 2, "the commit copied the data");
+        assert!(layer.prim("/B")?.is_some());
+        assert!(other.prim("/B")?.is_none());
+        assert!(!shared.has_spec(&sdf::Path::new("/B")?));
+        Ok(())
+    }
+
+    /// A layer whose resolver reports no modification time is read again
+    /// on every reload, as C++ compares an unknown time equal to none.
+    #[test]
+    fn reload_unknown_time() -> Result<()> {
+        struct Timeless(ar::DefaultResolver);
+        impl ar::Resolver for Timeless {
+            fn create_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+                self.0.create_identifier(asset_path, anchor)
+            }
+            fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
+                self.0.resolve(asset_path)
+            }
+            fn resolve_for_new_asset(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
+                self.0.resolve_for_new_asset(asset_path)
+            }
+            fn open_asset(&self, resolved_path: &ar::ResolvedPath) -> io::Result<Box<dyn ar::Asset>> {
+                self.0.open_asset(resolved_path)
+            }
+            fn modification_timestamp(&self, _: &str, _: &ar::ResolvedPath) -> Option<SystemTime> {
+                None
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scene.usda");
+        fs::write(&path, "#usda 1.0\ndef \"A\" {}\n")?;
+        let mut layer = Layer::open_with(Timeless(ar::DefaultResolver::new()), path.to_string_lossy())?;
+        assert!(layer.reload(false)?);
+        Ok(())
+    }
+
+    /// A reload reads a changed file into the layer through an edit whose
+    /// change list names what changed and reports the reload.
+    #[test]
+    fn reload_reads_changed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("scene.usda");
+        fs::write(&path, "#usda 1.0\ndef \"A\" {}\ndef \"B\" {}\n")?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&seen);
+        layer.add_sink(move |_: &str, changes: &ChangeList| {
+            let paths: Vec<String> = changes.entries().iter().map(|(path, _)| path.to_string()).collect();
+            record.borrow_mut().push((changes.did_reload_content(), paths));
+        });
+        rewrite(&path, "#usda 1.0\ndef \"A\" {}\ndef \"C\" {}\n")?;
+        assert!(layer.reload(false)?);
+        assert!(layer.prim("/B")?.is_none());
+        assert!(layer.prim("/C")?.is_some());
+        let seen = seen.borrow();
+        let (reloaded, paths) = seen.last().expect("the reload committed");
+        assert!(reloaded);
+        assert!(paths.iter().any(|path| path == "/B") && paths.iter().any(|path| path == "/C"));
+        assert!(
+            !paths.iter().any(|path| path == "/A"),
+            "an unchanged spec is not named: {paths:?}"
+        );
+        assert!(!layer.reload(false)?, "the reload recorded the file's time");
+        Ok(())
+    }
+
+    /// A reload that finds the asset elsewhere than it was read from is
+    /// refused, and the layer is left as it is.
+    #[test]
+    fn reload_refuses_moved() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::write(second.join("scene.usda"), "#usda 1.0\ndef \"A\" {}\n")?;
+        let resolver = ar::DefaultResolver::with_search_paths([&first, &second]);
+        let mut layer = Layer::open_with(resolver, "scene.usda")?;
+        fs::write(first.join("scene.usda"), "#usda 1.0\ndef \"B\" {}\n")?;
+        let refused = layer.reload(true);
+        assert!(
+            matches!(refused, Err(crate::Error::Layer(sdf::LayerError::Moved { .. }))),
+            "{refused:?}"
+        );
+        assert!(layer.prim("/A")?.is_some());
+        Ok(())
+    }
+
+    /// An anonymous layer reloads empty, and an in-memory one with no asset
+    /// is left as it is.
+    #[test]
+    fn reload_without_asset() -> Result<()> {
+        let mut anonymous = Layer::new_anonymous("scratch");
+        anonymous.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+        assert!(anonymous.reload(false)?);
+        assert!(anonymous.prim("/A")?.is_none());
+        assert!(!anonymous.reload(false)?, "an empty anonymous layer stays as it is");
+
+        // The crate format skips an anonymous reload, so a layer whose tag
+        // names it keeps its content.
+        let mut crate_layer = Layer::new_anonymous("scene.usdc");
+        crate_layer.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+        assert!(!crate_layer.reload(false)?);
+        assert!(crate_layer.prim("/A")?.is_some());
+
+        // The format the tag names decides, though the content is text.
+        let mut bytes = Layer::from_bytes("schema.usd", b"#usda 1.0\ndef \"A\" {}\n".to_vec())?;
+        assert!(!bytes.reload(false)?);
+        assert!(bytes.prim("/A")?.is_some());
+
+        let mut memory = Layer::new_in_memory("memory.usda");
+        memory.edit(|e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "")?;
+            Ok(())
+        })?;
+        assert!(!memory.reload(false)?);
+        assert!(memory.prim("/A")?.is_some());
+        Ok(())
+    }
+
+    /// Paths a layer authors anchor to its directory. An empty path and an
+    /// anonymous identifier stay as they are.
+    #[test]
+    fn absolute_path_anchors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        fs::create_dir_all(root.join("scene/textures"))?;
+        fs::write(root.join("scene/scene.usda"), "#usda 1.0\n")?;
+        fs::write(root.join("scene/textures/wood.png"), "")?;
+        fs::write(root.join("shared.usda"), "#usda 1.0\n")?;
+        let layer = Layer::open(root.join("scene/scene.usda").to_string_lossy())?;
+
+        assert_eq!(
+            layer.absolute_path("./textures/wood.png"),
+            root.join("scene/textures/wood.png").to_string_lossy()
+        );
+        assert_eq!(
+            layer.absolute_path("../shared.usda"),
+            root.join("shared.usda").to_string_lossy()
+        );
+        assert_eq!(layer.absolute_path(""), "");
+        let anonymous = Layer::new_anonymous("other.usda");
+        assert_eq!(layer.absolute_path(anonymous.identifier()), anonymous.identifier());
+        Ok(())
+    }
+
+    /// The paths an anonymous layer authors are given no anchor.
+    #[test]
+    fn absolute_path_anonymous() {
+        let anonymous = Layer::new_anonymous("other.usda");
+        let unanchored = ar::Resolver::create_identifier(&ar::DefaultResolver::new(), "./wood.png", None);
+        assert_eq!(anonymous.absolute_path("./wood.png"), unanchored);
+    }
+
+    /// The paths a packaged layer authors anchor inside its package, next to
+    /// that layer.
+    #[test]
+    fn absolute_path_in_package() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let package = dir.path().canonicalize()?.join("pkg.usdz");
+        let mut writer = usdz::ArchiveWriter::create(&package)?;
+        writer.add_layer("root.usda", b"#usda 1.0\n")?;
+        writer.add_layer("sub/inner.usda", b"#usda 1.0\n")?;
+        writer.add_layer("sub/tex/b.usda", b"#usda 1.0\n")?;
+        writer.finish()?;
+        let package = package.to_string_lossy();
+        let inner = Layer::open(format!("{package}[sub/inner.usda]"))?;
+
+        assert_eq!(inner.absolute_path("tex/b.usda"), format!("{package}[sub/tex/b.usda]"));
+        assert_eq!(
+            inner.absolute_path("./tex/b.usda"),
+            format!("{package}[sub/tex/b.usda]")
+        );
+        Ok(())
+    }
+
+    /// Author through the layer's `edit` API and commit, for tests that build a
+    /// layer's content or metadata directly.
+    fn edit_layer(layer: &mut Layer, f: impl FnOnce(&mut LayerEdit<'_>)) {
+        layer
+            .edit(|e| {
+                f(e);
+                Ok(())
+            })
+            .expect("authored");
+    }
+
+    /// A crate layer written to `dir`: a prim with a kind-less spec and one
+    /// array attribute the layer decodes on demand.
+    fn crate_fixture(dir: &FsPath) -> Result<PathBuf> {
+        let path = dir.join("scene.usdc");
+        let text = format!(
+            "#usda 1.0\ndef \"World\"\n{{\n    float[] size = [{}]\n}}\n",
+            ["1"; 64].join(", ")
+        );
+        Layer::from_bytes("scene", text.into_bytes())?.export(path.to_string_lossy())?;
+        Ok(path)
+    }
+
+    /// The `kind` a layer answers for `/World`.
+    fn world_kind(layer: &Layer) -> Option<tf::Token> {
+        layer.prim("/World").unwrap().expect("the prim exists").kind()
+    }
+
+    /// Authors `kind = "component"` on `/World`, the edit the save tests
+    /// check survives.
+    fn set_component(layer: &mut Layer) {
+        edit_layer(layer, |e| {
+            e.prim_mut("/World")
+                .unwrap()
+                .expect("the prim exists")
+                .set_kind("component");
+        });
+    }
+
+    /// Saving a crate layer over its own file keeps the edit and the fields
+    /// the layer decodes on demand, and leaves no temporary file behind.
+    #[test]
+    fn save_crate_over_itself() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        set_component(&mut layer);
+        layer.save()?;
+
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&layer), component);
+        let size = layer
+            .data()
+            .field(&Path::new("/World.size")?, "default")
+            .expect("decoded on demand")
+            .into_owned();
+        assert_eq!(size, Value::FloatVec(vec![1.0; 64]));
+        assert_eq!(world_kind(&Layer::open(path.to_string_lossy())?), component);
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1, "no temporary file remains");
+        Ok(())
+    }
+
+    /// A replacement that fails leaves the edit in the layer and no temporary
+    /// file behind, and the next save succeeds once the way is clear.
+    #[test]
+    fn replace_failure_keeps_edits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        set_component(&mut layer);
+        // The destination becomes a directory, which the temporary file cannot
+        // be renamed over, after the file was written.
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        let error = layer.save().expect_err("the replacement fails");
+        assert!(matches!(error, ExportError::Replace { .. }), "{error:?}");
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&layer), component, "the edit survives in memory");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1, "no temporary file remains");
+
+        fs::remove_dir(&path)?;
+        layer.save()?;
+        assert_eq!(world_kind(&Layer::open(path.to_string_lossy())?), component);
+        Ok(())
+    }
+
+    /// Exporting over a symbolic link replaces the file the link reaches and
+    /// leaves the link in place.
+    #[cfg(unix)]
+    #[test]
+    fn export_through_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let target = crate_fixture(dir.path())?;
+        let link = dir.path().join("link.usdc");
+        symlink(&target, &link)?;
+        let mut layer = Layer::open(target.to_string_lossy())?;
+        set_component(&mut layer);
+        layer.export(link.to_string_lossy())?;
+        assert!(
+            fs::symlink_metadata(&link)?.file_type().is_symlink(),
+            "the link is kept"
+        );
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&Layer::open(target.to_string_lossy())?), component);
+        Ok(())
+    }
+
+    /// Replacing a file on Windows keeps its access control list: a layer
+    /// whose list is explicit and uninherited stays so after a save and an
+    /// export over it.
+    #[cfg(windows)]
+    #[test]
+    fn save_keeps_acl() -> Result<()> {
+        use std::env;
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        let file = path.to_str().expect("utf-8 temp path");
+        let icacls = |args: &[&str]| -> Result<String> {
+            let output = Command::new("icacls").args(args).output()?;
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        let grant = format!("{}:(R,W)", env::var("USERNAME").expect("USERNAME is set"));
+        icacls(&[file, "/inheritance:r", "/grant:r", &grant])?;
+        let before = icacls(&[file])?;
+        assert!(before.contains("(R,W)"), "{before}");
+
+        let mut layer = Layer::open(file)?;
+        set_component(&mut layer);
+        layer.save()?;
+        assert_eq!(icacls(&[file])?, before, "the list survives the save");
+        layer.export(file)?;
+        assert_eq!(icacls(&[file])?, before, "the list survives the export");
+        assert_eq!(world_kind(&Layer::open(file)?), Some(tf::Token::from("component")));
+        Ok(())
+    }
+
+    /// Replacing a file keeps its permissions: a private layer stays private
+    /// after a save and after an export over it.
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_permissions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        layer.save()?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        layer.export(path.to_string_lossy())?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    /// An export over an existing file leaves only that file behind, and one
+    /// that cannot create its temporary file leaves nothing.
+    #[test]
+    fn export_leaves_no_temp() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        let layer = Layer::open(path.to_string_lossy())?;
+        layer.export(path.to_string_lossy())?;
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        let missing = dir.path().join("missing").join("scene.usdc");
+        let error = layer.export(missing.to_string_lossy()).expect_err("no such directory");
+        assert!(matches!(error, ExportError::Create { .. }), "{error:?}");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
+    }
+
+    /// A view another layer holds does not block a save: the file is replaced
+    /// under it, the other layer goes on reading the bytes it mapped, and a
+    /// fresh open sees the edit.
+    #[cfg(feature = "mmap")]
+    #[test]
+    // The mapping opt-in is `unsafe` by contract, and this test, the only
+    // writer of its directory, can make the promise.
+    #[allow(unsafe_code)]
+    fn save_with_other_view() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        // SAFETY: only the save below writes the files in this directory, and
+        // a save never writes into a file it holds a view of: it replaces the
+        // file beside it.
+        let resolver = unsafe { ar::DefaultResolver::new().map_files() };
+        let registry = crate::sdf::LayerRegistry::new(Box::new(resolver));
+        let identifier = sdf::absolute_path_at(&registry, None, &path.to_string_lossy());
+        let mut editing = registry.open_layer(&identifier)?.expect("the layer resolves");
+        let other = registry.open_layer(&identifier)?.expect("the layer resolves");
+        set_component(&mut editing);
+
+        editing.save()?;
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&editing), component);
+        assert_eq!(world_kind(&other), None, "the other view reads the file it mapped");
+        let size = other
+            .data()
+            .field(&Path::new("/World.size")?, "default")
+            .expect("still decodes from its view")
+            .into_owned();
+        assert_eq!(size, Value::FloatVec(vec![1.0; 64]));
+        assert_eq!(world_kind(&Layer::open(path.to_string_lossy())?), component);
+        Ok(())
+    }
+
+    /// `new_anonymous` mints a unique `anon:<n>:<tag>` identifier each call, so
+    /// two layers given the same tag never alias; `is_anonymous` recognizes them
+    /// while a verbatim `new_in_memory` layer is not anonymous.
+    #[test]
+    fn anonymous_identifiers_unique() {
+        let a = Layer::new_anonymous("scene.usda");
+        let b = Layer::new_anonymous("scene.usda");
+        assert_ne!(a.identifier(), b.identifier());
+        assert!(a.identifier().ends_with(":scene.usda"));
+        assert!(a.is_anonymous() && b.is_anonymous());
+        assert!(!Layer::new_in_memory("scene.usda").is_anonymous());
+    }
+
+    /// `set_relocates` / `relocates` round-trip the authored pairs, and the
+    /// pairs land under the pseudo-root's `layerRelocates` field.
+    #[test]
+    fn relocates_round_trip() {
+        let mut layer = Layer::new_anonymous("test.usda");
+        assert!(!layer.has_relocates());
+        assert!(layer.relocates().is_empty());
+
+        let pairs = vec![
+            (Path::new("/Rig/Model").unwrap(), Path::new("/Group/Model").unwrap()),
+            (Path::new("/Rig/Dead").unwrap(), Path::default()),
+        ];
+        edit_layer(&mut layer, |e| {
+            e.set_relocates(pairs.clone()).unwrap();
+        });
+
+        assert!(layer.has_relocates());
+        assert_eq!(layer.relocates(), pairs);
+    }
+
+    /// An explicit empty list is still an opinion (`HasRelocates` is true), while
+    /// `clear_relocates` removes the opinion entirely.
+    #[test]
+    fn empty_opinion_vs_cleared() {
+        let mut layer = Layer::new_anonymous("test.usda");
+
+        edit_layer(&mut layer, |e| {
+            e.set_relocates(RelocateList::new()).unwrap();
+        });
+        assert!(layer.has_relocates());
+        assert!(layer.relocates().is_empty());
+
+        edit_layer(&mut layer, |e| {
+            e.clear_relocates().unwrap();
+        });
+        assert!(!layer.has_relocates());
+        assert!(layer.relocates().is_empty());
+    }
+
+    /// The five time-code fields round-trip through set/get and report the
+    /// documented unauthored defaults before any opinion is written.
+    #[test]
+    fn time_code_round_trip() {
+        let mut layer = Layer::new_anonymous("test.usda");
+        assert!(!layer.has_start_time_code());
+        assert_eq!(layer.start_time_code(), 0.0);
+        assert_eq!(layer.end_time_code(), 0.0);
+        assert_eq!(layer.frame_precision(), 3);
+
+        edit_layer(&mut layer, |e| {
+            e.set_start_time_code(1.0).unwrap();
+            e.set_end_time_code(48.0).unwrap();
+            e.set_frame_precision(6).unwrap();
+        });
+
+        assert!(layer.has_start_time_code());
+        assert_eq!(layer.start_time_code(), 1.0);
+        assert_eq!(layer.end_time_code(), 48.0);
+        assert_eq!(layer.frame_precision(), 6);
+    }
+
+    /// `timeCodesPerSecond` falls back to the authored `framesPerSecond`, then
+    /// to `24.0`, when no `timeCodesPerSecond` opinion is authored.
+    #[test]
+    fn tcps_fps_fallback() {
+        let mut layer = Layer::new_anonymous("test.usda");
+        assert_eq!(layer.time_codes_per_second(), 24.0);
+        assert_eq!(layer.frames_per_second(), 24.0);
+
+        edit_layer(&mut layer, |e| {
+            e.set_frames_per_second(30.0).unwrap();
+        });
+        assert_eq!(layer.time_codes_per_second(), 30.0);
+
+        edit_layer(&mut layer, |e| {
+            e.set_time_codes_per_second(48.0).unwrap();
+        });
+        assert_eq!(layer.time_codes_per_second(), 48.0);
+    }
+
+    /// `clear_*` removes the opinion so `has_*` reports false and the getter
+    /// returns the unauthored default again.
+    #[test]
+    fn clear_time_code() {
+        let mut layer = Layer::new_anonymous("test.usda");
+        edit_layer(&mut layer, |e| {
+            e.set_start_time_code(5.0).unwrap();
+        });
+        assert!(layer.has_start_time_code());
+
+        edit_layer(&mut layer, |e| {
+            e.clear_start_time_code().unwrap();
+        });
+        assert!(!layer.has_start_time_code());
+        assert_eq!(layer.start_time_code(), 0.0);
+    }
+
+    /// `edit` commits the batch and returns the recorded `ChangeList`.
+    #[test]
+    fn edit_commits() {
+        use crate::sdf::{PrimSpec, Specifier};
+        let mut layer = Layer::new_anonymous("test.usda");
+        let changed = layer
+            .edit(|l| {
+                PrimSpec::new(l.data_mut(), "/World", Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .expect("no error or veto");
+        assert!(changed);
+        assert!(layer.prim(Path::new("/World").unwrap()).unwrap().is_some());
+    }
+
+    /// `edit` rolls the batch back when the closure returns an error, leaving the
+    /// layer untouched and reusable.
+    #[test]
+    fn edit_rolls_back_on_error() {
+        use crate::sdf::{PrimSpec, Specifier};
+        let mut layer = Layer::new_anonymous("test.usda");
+        let result: Result<bool, EditError> = layer.edit(|l| {
+            PrimSpec::new(l.data_mut(), "/A", Specifier::Def, "Xform")?;
+            Err(AuthoringError::InvalidPath {
+                path: Path::abs_root(),
+                reason: "test",
+            })
+        });
+        assert!(result.is_err());
+        assert!(
+            layer.prim(Path::new("/A").unwrap()).unwrap().is_none(),
+            "the staged edit rolled back"
+        );
+        assert!(!layer.is_dirty());
+    }
+
+    /// A panic mid-`edit` unwinds cleanly: the guard rolls the staged edits back,
+    /// so the layer is reusable afterwards.
+    #[test]
+    fn edit_recovers_on_panic() {
+        use crate::sdf::{PrimSpec, Specifier};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let mut layer = Layer::new_anonymous("test.usda");
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _: Result<bool, EditError> = layer.edit(|l| {
+                PrimSpec::new(l.data_mut(), "/A", Specifier::Def, "Xform").expect("authored");
+                panic!("boom");
+            });
+        }));
+        assert!(panicked.is_err(), "the panic propagates");
+        assert!(
+            layer.prim(Path::new("/A").unwrap()).unwrap().is_none(),
+            "the staged edit rolled back"
+        );
+        assert!(!layer.is_dirty(), "no staged edits or recorded changes remain");
+
+        // The layer is still usable afterwards.
+        let changed = layer
+            .edit(|l| {
+                PrimSpec::new(l.data_mut(), "/B", Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .expect("no error");
+        assert!(changed);
+        assert!(layer.prim(Path::new("/B").unwrap()).unwrap().is_some());
+    }
+
+    /// A panicking `after_commit` cannot strand a partially committed group:
+    /// `edit_layers` commits every layer's data before notifying any sink, so both
+    /// layers land even when one's `after_commit` unwinds.
+    #[test]
+    fn group_commit_atomic_on_panic() {
+        use crate::sdf::{PrimSpec, Specifier};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let mut a = Layer::new_anonymous("a.usda");
+        let mut b = Layer::new_anonymous("b.usda");
+        a.add_sink(|_: &str, _: &ChangeList| panic!("boom"));
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let none = sink::Set::default();
+            let mut targets = [&mut a, &mut b].map(|layer| TargetLayer {
+                layer,
+                subscribers: &none,
+            });
+            let _ = edit_layers(&mut targets, TxnContext::new(None), |edits| {
+                PrimSpec::new(edits[0].data_mut(), "/A", Specifier::Def, "Xform").expect("authored a");
+                PrimSpec::new(edits[1].data_mut(), "/B", Specifier::Def, "Xform").expect("authored b");
+                Ok::<(), EditError>(())
+            })
+            .map(Committed::dispatch);
+        }));
+        assert!(panicked.is_err(), "the after_commit panic propagates");
+        assert!(
+            a.prim(Path::new("/A").unwrap()).unwrap().is_some(),
+            "layer a committed despite the panic"
+        );
+        assert!(
+            b.prim(Path::new("/B").unwrap()).unwrap().is_some(),
+            "layer b committed despite the panic"
+        );
+    }
+
+    /// `discard_changes` keeps committed content in the backend and leaves
+    /// nothing staged, so a layer joining a stage is composed fresh with no stale
+    /// change record.
+    #[test]
+    fn discard_changes_keeps_content() {
+        use crate::sdf::{PrimSpec, Specifier};
+
+        let mut layer = Layer::new_anonymous("test.usda");
+        edit_layer(&mut layer, |e| {
+            PrimSpec::new(e.data_mut(), "/World", Specifier::Def, "Xform").unwrap();
+        });
+
+        layer.discard_changes();
+        assert!(layer.data.is_empty(), "nothing staged remains");
+        assert!(
+            layer.prim(Path::new("/World").unwrap()).unwrap().is_some(),
+            "the authored content survives"
+        );
+    }
+
+    /// The C++ `ConvertDefaultPrimTokenToPath` contract
+    /// (`pxr/usd/sdf/testenv/testSdfLayer.py`), plus the one documented
+    /// difference: `.` resolves to `/` there and to nothing here.
+    #[test]
+    fn default_prim_path_forms() {
+        for (token, want) in [
+            ("/foo", "/foo"),
+            ("/foo/bar", "/foo/bar"),
+            ("foo", "/foo"),
+            ("foo/bar", "/foo/bar"),
+        ] {
+            assert_eq!(default_prim_path(token).as_ref().map(Path::as_str), Some(want));
+        }
+        for token in ["/foo.prop", "/", "//", "", "..", "."] {
+            assert_eq!(default_prim_path(token), None, "{token} names no prim");
+        }
+    }
+
+    /// The setter accepts either spelling of a prim path and rejects a value
+    /// that names no prim, matching what `default_prim_path` will read back.
+    #[test]
+    fn set_default_prim_forms() {
+        let mut layer = Layer::new_anonymous("anon.usda");
+        for name in ["World", "World/Char", "/World/Char"] {
+            edit_layer(&mut layer, |e| {
+                e.set_default_prim(name).expect("names a prim");
+            });
+            assert_eq!(layer.pseudo_root().unwrap().default_prim().as_deref(), Some(name));
+        }
+        edit_layer(&mut layer, |e| {
+            assert!(e.set_default_prim("World.attr").is_err(), "a property names no prim");
+            assert!(e.set_default_prim("/").is_err(), "the pseudo-root names no prim");
+        });
+    }
+
+    /// Authoring layer metadata on a backend that lacks a pseudo-root spec
+    /// materializes the pseudo-root, so a follow-up read sees the field; clearing
+    /// the opinion removes it again.
+    #[test]
+    fn metadata_on_rootless_backend() {
+        let root = Path::abs_root();
+        let default_prim = FieldKey::DefaultPrim.as_str();
+
+        let mut layer = Layer::new("rootless.usda", Box::new(Data::new()));
+        edit_layer(&mut layer, |e| {
+            e.set_default_prim("World").unwrap();
+        });
+        assert!(layer.data().has_field(&root, default_prim));
+
+        edit_layer(&mut layer, |e| {
+            e.clear_default_prim().unwrap();
+        });
+        assert!(!layer.data().has_field(&root, default_prim));
+    }
+
+    /// A recording [`LayerSink`] for the tests below.
+    #[derive(Default)]
+    struct Recorder {
+        before: std::cell::Cell<u32>,
+        after: std::cell::Cell<u32>,
+        veto: bool,
+    }
+
+    impl LayerSink for std::rc::Rc<Recorder> {
+        fn before_commit(&self, _change: &PendingLayerChange<'_>) -> Result<(), sink::Error> {
+            self.before.set(self.before.get() + 1);
+            if self.veto {
+                return Err(sink::Error::new("vetoed"));
+            }
+            Ok(())
+        }
+        fn after_commit(&self, _change: &CommittedLayerChange<'_>) {
+            self.after.set(self.after.get() + 1);
+        }
+    }
+
+    /// A committed edit fires the layer sink's `before_commit` then
+    /// `after_commit` once, with the edit landed.
+    #[test]
+    fn layer_sink_fires() {
+        use crate::sdf::{PrimSpec, Specifier};
+        let mut layer = Layer::new_anonymous("test.usda");
+        let rec = std::rc::Rc::new(Recorder::default());
+        layer.add_sink(rec.clone());
+
+        layer
+            .edit(|l| {
+                PrimSpec::new(l.data_mut(), "/World", Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .expect("sink accepts");
+
+        assert_eq!((rec.before.get(), rec.after.get()), (1, 1));
+        assert!(layer.prim(Path::new("/World").unwrap()).unwrap().is_some());
+    }
+
+    /// A `before_commit` rejection rolls the edit back: `after_commit` never
+    /// fires and the backend is untouched.
+    #[test]
+    fn layer_sink_veto_rolls_back() {
+        use crate::sdf::{PrimSpec, Specifier};
+        let mut layer = Layer::new_anonymous("test.usda");
+        let rec = std::rc::Rc::new(Recorder {
+            veto: true,
+            ..Default::default()
+        });
+        layer.add_sink(rec.clone());
+
+        let result = layer.edit(|l| {
+            PrimSpec::new(l.data_mut(), "/World", Specifier::Def, "Xform")?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(EditError::Rejected(_))), "the sink vetoes");
+
+        assert_eq!((rec.before.get(), rec.after.get()), (1, 0), "after_commit never fired");
+        assert!(
+            layer.prim(Path::new("/World").unwrap()).unwrap().is_none(),
+            "the edit rolled back"
+        );
+        assert!(!layer.is_dirty());
+    }
+
+    /// A removed sink no longer fires.
+    #[test]
+    fn layer_sink_removed() {
+        use crate::sdf::{PrimSpec, Specifier};
+        let mut layer = Layer::new_anonymous("test.usda");
+        let rec = std::rc::Rc::new(Recorder::default());
+        let id = layer.add_sink(rec.clone());
+        layer.remove_sink(id);
+
+        layer
+            .edit(|l| {
+                PrimSpec::new(l.data_mut(), "/World", Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .expect("no sink");
+        assert_eq!((rec.before.get(), rec.after.get()), (0, 0));
+    }
+
+    #[test]
+    fn export_dispatches_on_extension() -> Result<()> {
+        use crate::sdf::{self, SpecType};
+
+        let mut data = sdf::Data::new();
+        let root = sdf::Path::abs_root();
+        let ps = data.create_spec(root, SpecType::PseudoRoot);
+        ps.add("primChildren", vt::Value::TokenVec(vec!["Foo".into()]));
+        let foo = sdf::path("/Foo")?;
+        let sp = data.create_spec(foo, SpecType::Prim);
+        sp.add("specifier", vt::Value::Specifier(sdf::Specifier::Def));
+        sp.add("typeName", vt::Value::Token("Xform".into()));
+
+        let layer = sdf::Layer::new("test://layer", Box::new(data));
+        let dir = tempfile::tempdir()?;
+
+        let usda_path = dir.path().join("layer-save.usda");
+        let usdc_path = dir.path().join("layer-save.usdc");
+        let usdz_path = dir.path().join("layer-save.usdz");
+
+        layer.export(usda_path.to_str().unwrap())?;
+        layer.export(usdc_path.to_str().unwrap())?;
+        layer.export(usdz_path.to_str().unwrap())?;
+
+        assert!(std::fs::metadata(&usda_path)?.len() > 0);
+        assert!(std::fs::metadata(&usdc_path)?.len() > 0);
+        assert!(std::fs::metadata(&usdz_path)?.len() > 0);
+
+        // The usdz should contain an entry we can read back.
+        let archive = crate::usdz::Archive::open(&usdz_path)?;
+        let name = archive.root_entry()?.expect("usdz has a layer");
+        assert!(name.ends_with(".usdc"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_usd_writes_binary() -> Result<()> {
+        use crate::sdf::{self, SpecType};
+
+        let mut data = sdf::Data::new();
+        let root = sdf::Path::abs_root();
+        let ps = data.create_spec(root, SpecType::PseudoRoot);
+        ps.add("primChildren", vt::Value::TokenVec(vec!["Bar".into()]));
+        let bar = sdf::path("/Bar")?;
+        let sp = data.create_spec(bar.clone(), SpecType::Prim);
+        sp.add("specifier", vt::Value::Specifier(sdf::Specifier::Def));
+        sp.add("typeName", vt::Value::Token("Cube".into()));
+
+        let layer = sdf::Layer::new("test://layer-usd", Box::new(data));
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("layer-save.usd");
+        layer.export(path.to_str().unwrap())?;
+
+        // Writer chose binary for `.usd` — first bytes must be the USDC magic.
+        let bytes = std::fs::read(&path)?;
+        assert!(
+            bytes.starts_with(crate::usdc::MAGIC),
+            "writer should emit binary for .usd, got magic {:?}",
+            &bytes[..crate::usdc::MAGIC.len().min(bytes.len())],
+        );
+
+        // The registry's content-sniff must accept it as binary.
+        let round = sdf::LayerRegistry::default()
+            .open_layer(path.to_str().unwrap())?
+            .expect("the layer opens");
+        let round = round.data();
+        assert_eq!(round.spec_type(&bar), Some(SpecType::Prim));
+        assert_eq!(
+            round.field(&bar, "typeName").unwrap().into_owned(),
+            vt::Value::Token("Cube".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn export_rejects_unknown_ext() {
+        use crate::sdf::{self, SpecType};
+        let mut data = sdf::Data::new();
+        data.create_spec(sdf::Path::abs_root(), SpecType::PseudoRoot);
+        let layer = sdf::Layer::new("test://layer", Box::new(data));
+        let err = layer.export("/tmp/openusd-bad.xyz").unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn save_writes_identifier() -> Result<()> {
+        use crate::sdf::{self, SpecType};
+
+        let mut data = sdf::Data::new();
+        data.create_spec(sdf::Path::abs_root(), SpecType::PseudoRoot);
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("by-identifier.usda");
+        let mut layer = sdf::Layer::new(path.to_str().unwrap(), Box::new(data));
+        layer.save()?;
+
+        let bytes = std::fs::read(&path)?;
+        assert!(
+            bytes.starts_with(b"#usda"),
+            "save() should write text to a .usda identifier"
+        );
+        Ok(())
+    }
+
+    /// A layer saves in the format it was read in, so text read from a `.usd`
+    /// file stays text, where the extension alone would pick binary.
+    #[test]
+    fn save_keeps_format() -> Result<()> {
+        use crate::sdf::{PrimSpec, Specifier};
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("text.usd");
+        fs::write(&path, "#usda 1.0\n")?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        layer.edit(|edit| {
+            PrimSpec::new(edit.data_mut(), "/Saved", Specifier::Def, "Xform")?;
+            Ok(())
+        })?;
+        layer.save()?;
+
+        let saved = fs::read_to_string(&path)?;
+        assert!(saved.starts_with("#usda"), "a text .usd saves as text");
+        assert!(saved.contains("Saved"));
+        Ok(())
+    }
+
+    #[test]
+    fn save_rejects_anonymous() {
+        let mut layer = sdf::Layer::new_anonymous("scratch");
+        let err = layer.save().unwrap_err();
+        assert!(err.to_string().contains("anonymous"));
+    }
+
+    #[test]
+    fn save_rejects_non_file_identifier() {
+        use crate::sdf::{self, SpecType};
+        let mut data = sdf::Data::new();
+        data.create_spec(sdf::Path::abs_root(), SpecType::PseudoRoot);
+        // A non-anonymous layer whose identifier is not an absolute file path
+        // (a scheme-style asset identifier) cannot be saved to its identifier.
+        let mut layer = sdf::Layer::new("scheme://host/x.usda", Box::new(data));
+        let err = layer.save().unwrap_err();
+        assert!(err.to_string().contains("absolute file path"));
+    }
+
+    #[test]
+    fn save_rejects_usdz_in_place() {
+        use crate::sdf::{self, SpecType};
+        let mut data = sdf::Data::new();
+        data.create_spec(sdf::Path::abs_root(), SpecType::PseudoRoot);
+        // usdz is writable as a new copy but not editable in place: saving over
+        // a package would discard its other assets, so save() must refuse it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkg.usdz");
+        let mut layer = sdf::Layer::new(path.to_str().unwrap(), Box::new(data));
+        let err = layer.save().unwrap_err();
+        assert!(err.to_string().contains("not editable"));
+    }
+
+    /// A layer opened from a package reads in its root layer's format, but
+    /// saving it would write over the archive, so save refuses it and the
+    /// package is left whole. So does a layer opened inside the package.
+    #[test]
+    fn save_rejects_opened_package() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let package = dir.path().canonicalize()?.join("pkg.usdz");
+        let mut writer = usdz::ArchiveWriter::create(&package)?;
+        writer.add_layer("root.usda", b"#usda 1.0\n")?;
+        writer.add_layer("sub/inner.usda", b"#usda 1.0\n")?;
+        writer.finish()?;
+        let before = fs::read(&package)?;
+        let package_path = package.to_string_lossy();
+
+        let mut root = Layer::open(&package_path)?;
+        assert!(matches!(root.save(), Err(ExportError::NotEditable { .. })));
+        let mut inner = Layer::open(format!("{package_path}[sub/inner.usda]"))?;
+        assert!(inner.save().is_err(), "a packaged layer has no file of its own");
+
+        assert_eq!(fs::read(&package)?, before, "the package is untouched");
+        assert_eq!(fs::read_dir(dir.path())?.count(), 1, "nothing was written beside it");
+        Ok(())
+    }
+
+    #[test]
+    fn export_to_string_is_usda() -> Result<()> {
+        use crate::sdf::{self, SpecType};
+
+        let mut data = sdf::Data::new();
+        let ps = data.create_spec(sdf::Path::abs_root(), SpecType::PseudoRoot);
+        ps.add("primChildren", vt::Value::TokenVec(vec!["Foo".into()]));
+        let sp = data.create_spec(sdf::path("/Foo")?, SpecType::Prim);
+        sp.add("specifier", vt::Value::Specifier(sdf::Specifier::Def));
+
+        // A binary identifier must not influence the textual form.
+        let layer = sdf::Layer::new("scratch.usdc", Box::new(data));
+        let text = layer.export_to_string()?;
+        assert!(text.starts_with("#usda"), "export_to_string must emit usda text");
+        assert!(text.contains("\"Foo\""), "export_to_string must include the prim");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Authoring API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_prim_basic() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/World", sdf::Specifier::Def, "Xform")
+                .unwrap()
+                .set_kind("group");
+        });
+
+        let world = layer.prim("/World")?.expect("prim authored");
+        assert_eq!(world.type_name().as_deref(), Some("Xform"));
+        assert_eq!(world.specifier(), Some(sdf::Specifier::Def));
+        assert_eq!(world.kind().as_deref(), Some("group"));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_ancestor_chain() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A/B/C", sdf::Specifier::Def, "Mesh").unwrap();
+        });
+
+        // Leaf is Def; ancestors are Over.
+        assert_eq!(
+            layer.prim("/A/B/C")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Def)
+        );
+        assert_eq!(
+            layer.prim("/A/B")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Over)
+        );
+        assert_eq!(
+            layer.prim("/A")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Over)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prim_children() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/World", sdf::Specifier::Def, "Xform").unwrap();
+            sdf::PrimSpec::new(e.data_mut(), "/World/Mesh", sdf::Specifier::Def, "Mesh").unwrap();
+            sdf::PrimSpec::new(e.data_mut(), "/World/Cube", sdf::Specifier::Def, "Cube").unwrap();
+        });
+
+        let root = layer.pseudo_root().expect("pseudo-root present");
+        let root_children = root.prim_children().unwrap();
+        let root_children: Vec<&str> = root_children.iter().map(|t| t.as_str()).collect();
+        assert_eq!(root_children, ["World"]);
+
+        let world = layer.prim("/World")?.expect("prim");
+        let world_children = world.prim_children().unwrap();
+        let world_children: Vec<&str> = world_children.iter().map(|t| t.as_str()).collect();
+        assert_eq!(world_children, ["Mesh", "Cube"]);
+        Ok(())
+    }
+
+    #[test]
+    fn property_children() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Mesh", sdf::Specifier::Def, "Mesh").unwrap();
+            sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/Mesh.points",
+                "point3f[]",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/Mesh.normals",
+                "normal3f[]",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            sdf::RelationshipSpec::new(e.data_mut(), "/Mesh.material:binding", sdf::Variability::Varying, false)
+                .unwrap();
+        });
+
+        let mesh = layer.prim("/Mesh")?.expect("prim");
+        let props = mesh.property_children().unwrap();
+        let props: Vec<&str> = props.iter().map(|t| t.as_str()).collect();
+        assert_eq!(props, ["points", "normals", "material:binding"]);
+        Ok(())
+    }
+
+    #[test]
+    fn relationship_variability() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::RelationshipSpec::new(e.data_mut(), "/Mesh.material:binding", sdf::Variability::Uniform, false)
+                .unwrap();
+            // A declaration is never rewritten: creating over the spec is an error.
+            let error =
+                sdf::RelationshipSpec::new(e.data_mut(), "/Mesh.material:binding", sdf::Variability::Varying, false)
+                    .expect_err("a spec already at the path");
+            assert!(matches!(error, sdf::AuthoringError::InvalidPath { .. }));
+            sdf::RelationshipSpec::new(e.data_mut(), "/Mesh.varying", sdf::Variability::Varying, false).unwrap();
+        });
+
+        let rel = layer.relationship("/Mesh.material:binding")?.expect("relationship");
+        assert_eq!(rel.variability(), sdf::Variability::Uniform);
+        // Varying is the fallback, so it is never written out.
+        let rel = layer.relationship("/Mesh.varying")?.expect("relationship");
+        assert_eq!(rel.variability(), sdf::Variability::Varying);
+        assert!(rel.field(sdf::FieldKey::Variability.as_str()).ok().flatten().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bad_prim_children_errors() {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            e.data_mut().set_field(
+                &sdf::Path::abs_root(),
+                sdf::ChildrenKey::PrimChildren.as_str(),
+                vt::Value::String("bad".into()),
+            );
+        });
+
+        let err = layer
+            .edit(|e| {
+                sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+
+        let value = layer
+            .data()
+            .field(&sdf::Path::abs_root(), sdf::ChildrenKey::PrimChildren.as_str())
+            .unwrap()
+            .into_owned();
+        assert!(matches!(value, vt::Value::String(value) if value == "bad"));
+    }
+
+    #[test]
+    fn bad_property_children_errors() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Mesh", sdf::Specifier::Def, "Mesh").unwrap();
+            e.data_mut().set_field(
+                &sdf::path("/Mesh").unwrap(),
+                sdf::ChildrenKey::PropertyChildren.as_str(),
+                vt::Value::String("bad".into()),
+            );
+        });
+
+        let err = layer
+            .edit(|e| {
+                sdf::RelationshipSpec::new(e.data_mut(), "/Mesh.material:binding", sdf::Variability::Varying, false)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+
+        assert!(!layer.data().has_spec(&sdf::path("/Mesh.material:binding").unwrap()));
+        let value = layer
+            .data()
+            .field(
+                &sdf::path("/Mesh").unwrap(),
+                sdf::ChildrenKey::PropertyChildren.as_str(),
+            )
+            .unwrap()
+            .into_owned();
+        assert!(matches!(value, vt::Value::String(value) if value == "bad"));
+        Ok(())
+    }
+
+    #[test]
+    fn attr_samples() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Sphere", sdf::Specifier::Def, "Sphere").unwrap();
+            let mut radius = sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/Sphere.radius",
+                "double",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            radius
+                .set_default(vt::Value::Double(2.5))
+                .expect("value fits the declared type");
+            radius
+                .set_time_sample(0.0, vt::Value::Double(1.0))
+                .expect("value fits the declared type");
+            radius
+                .set_time_sample(10.0, vt::Value::Double(3.0))
+                .expect("value fits the declared type");
+            // Out-of-order insert lands in sorted position.
+            radius
+                .set_time_sample(5.0, vt::Value::Double(2.0))
+                .expect("value fits the declared type");
+        });
+
+        let read = layer.attribute("/Sphere.radius")?.expect("attr");
+        assert_eq!(read.type_name(), Some(sdf::ValueTypeName::DOUBLE));
+        assert_eq!(read.default(), Some(vt::Value::Double(2.5)));
+        let samples = read.time_samples().expect("samples authored");
+        let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![0.0, 5.0, 10.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_ancestor_type() {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        // Plant a non-Prim spec at a prim-shaped path through the data API.
+        edit_layer(&mut layer, |e| {
+            e.data_mut()
+                .create_spec(sdf::path("/A").unwrap(), sdf::SpecType::Attribute);
+        });
+
+        let err = layer
+            .edit(|e| {
+                sdf::PrimSpec::new(e.data_mut(), "/A/B", sdf::Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+        let err = layer
+            .edit(|e| {
+                sdf::AttributeSpec::new(e.data_mut(), "/A.x", "double", sdf::Variability::Varying, false)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_prim_chain_creation_is_atomic() {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        let bad_child = sdf::path("/A/B").unwrap();
+        edit_layer(&mut layer, |e| {
+            e.data_mut().create_spec(bad_child, sdf::SpecType::Attribute);
+        });
+
+        let err = layer
+            .edit(|e| {
+                sdf::PrimSpec::new(e.data_mut(), "/A/B", sdf::Specifier::Def, "Xform")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+
+        assert!(!layer.data().has_spec(&sdf::path("/A").unwrap()));
+        assert!(
+            layer
+                .data()
+                .try_field(&sdf::Path::abs_root(), sdf::ChildrenKey::PrimChildren.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nan_time_sample() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Sphere", sdf::Specifier::Def, "Sphere").unwrap();
+            let mut r = sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/Sphere.radius",
+                "double",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            r.set_time_sample(1.0, vt::Value::Double(1.0))
+                .expect("value fits the declared type");
+            r.set_time_sample(f64::NAN, vt::Value::Double(99.0))
+                .expect("value fits the declared type");
+            r.set_time_sample(2.0, vt::Value::Double(2.0))
+                .expect("value fits the declared type");
+        });
+        // NaN does not collide with finite samples — both finite values survive.
+        let samples = layer
+            .attribute("/Sphere.radius")?
+            .unwrap()
+            .time_samples()
+            .unwrap()
+            .clone();
+        let finite: Vec<f64> = samples.iter().map(|(t, _)| *t).filter(|t| t.is_finite()).collect();
+        assert_eq!(finite, vec![1.0, 2.0]);
+
+        // erase_time_sample(NaN) finds the NaN entry: the sample-time order
+        // places a NaN, so it is a locatable time like any other.
+        let mut erased = false;
+        edit_layer(&mut layer, |e| {
+            erased = e
+                .attribute_mut("/Sphere.radius")
+                .unwrap()
+                .unwrap()
+                .erase_time_sample(f64::NAN)
+                .expect("samples readable");
+        });
+        assert!(erased);
+        let times: Vec<f64> = layer
+            .attribute("/Sphere.radius")?
+            .unwrap()
+            .time_samples()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(times, vec![1.0, 2.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn override_prim() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::over(e.data_mut(), "/A/B").unwrap();
+        });
+
+        assert_eq!(
+            layer.prim("/A")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Over)
+        );
+        assert_eq!(
+            layer.prim("/A/B")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Over)
+        );
+
+        // override_prim on an existing def leaves the specifier untouched.
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Defined", sdf::Specifier::Def, "Xform").unwrap();
+            sdf::PrimSpec::over(e.data_mut(), "/Defined").unwrap();
+        });
+        assert_eq!(
+            layer.prim("/Defined")?.and_then(|p| p.specifier()),
+            Some(sdf::Specifier::Def)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pseudo_root_metadata() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        edit_layer(&mut layer, |e| {
+            let mut root = e.pseudo_root_mut().expect("writable");
+            root.set_default_prim("World");
+            root.set_doc("auto-generated");
+            root.set_start_time_code(1.0);
+            root.set_end_time_code(24.0);
+            root.add_sublayer("./over.usda");
+            root.add_sublayer("./over.usda");
+        });
+        let root = layer.pseudo_root().expect("present");
+        assert_eq!(root.default_prim().as_deref(), Some("World"));
+        assert_eq!(root.doc().as_deref(), Some("auto-generated"));
+        assert_eq!(root.start_time_code(), Some(1.0));
+        assert_eq!(root.end_time_code(), Some(24.0));
+        assert_eq!(
+            root.sublayers(),
+            Some(vec!["./over.usda".to_string(), "./over.usda".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_paths() {
+        let mut layer = sdf::Layer::new_anonymous("anon.usda");
+        // Whether authoring `f` fails with an `InvalidPath` authoring error.
+        fn invalid(
+            layer: &mut sdf::Layer,
+            f: impl FnOnce(&mut sdf::LayerEdit<'_>) -> Result<(), sdf::AuthoringError>,
+        ) -> bool {
+            matches!(
+                layer.edit(f).unwrap_err(),
+                sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+            )
+        }
+        assert!(invalid(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/", sdf::Specifier::Def, "Xform")?;
+            Ok(())
+        }));
+        assert!(invalid(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A.foo", sdf::Specifier::Def, "Xform")?;
+            Ok(())
+        }));
+        assert!(invalid(&mut layer, |e| {
+            sdf::AttributeSpec::new(e.data_mut(), "/A", "double", sdf::Variability::Varying, false)?;
+            Ok(())
+        }));
+        // Relative property paths must error, not panic in ensure_prim_chain.
+        assert!(invalid(&mut layer, |e| {
+            sdf::AttributeSpec::new(e.data_mut(), "A.foo", "double", sdf::Variability::Varying, false)?;
+            Ok(())
+        }));
+        assert!(invalid(&mut layer, |e| {
+            sdf::RelationshipSpec::new(e.data_mut(), "A.foo", sdf::Variability::Varying, false)?;
+            Ok(())
+        }));
+        // Root-level property paths (`/.foo`) are not parseable at all, so
+        // they surface as a parse error rather than an authoring rejection.
+        assert!(matches!(
+            layer
+                .edit(|e| {
+                    sdf::AttributeSpec::new(e.data_mut(), "/.foo", "double", sdf::Variability::Varying, false)?;
+                    Ok(())
+                })
+                .unwrap_err(),
+            sdf::EditError::Author(sdf::AuthoringError::Parse(_))
+        ));
+        // Target-bracket property paths slip past `is_property` because the
+        // tail after the last `.` is alphanumeric — split_property_path must reject them.
+        assert!(invalid(&mut layer, |e| {
+            sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/A.rel[/Target].attr",
+                "double",
+                sdf::Variability::Varying,
+                false,
+            )?;
+            Ok(())
+        }));
+        // Well-formed variant selections are authorable (they build the variant
+        // set / variant scaffolding), but malformed ones — here an empty
+        // selection — must still be rejected.
+        assert!(invalid(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/A{x=}child", sdf::Specifier::Def, "Xform")?;
+            Ok(())
+        }));
+    }
+
+    /// Authoring a prim inside a variant builds the full variant set / variant
+    /// scaffolding with correct spec types and child registration.
+    #[test]
+    fn variant_authoring() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("variants.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Prim", sdf::Specifier::Def, "Xform").unwrap();
+            sdf::PrimSpec::new(e.data_mut(), "/Prim{set=sel}child", sdf::Specifier::Def, "Scope").unwrap();
+        });
+
+        assert_eq!(layer.data().spec_type(&sdf::path("/Prim")?), Some(sdf::SpecType::Prim));
+        assert_eq!(
+            layer.data().spec_type(&sdf::path("/Prim{set=}")?),
+            Some(sdf::SpecType::VariantSet)
+        );
+        assert_eq!(
+            layer.data().spec_type(&sdf::path("/Prim{set=sel}")?),
+            Some(sdf::SpecType::Variant)
+        );
+        assert_eq!(
+            layer.data().spec_type(&sdf::path("/Prim{set=sel}child")?),
+            Some(sdf::SpecType::Prim)
+        );
+
+        let token_vec = |path: &str, key: sdf::ChildrenKey| -> Result<Vec<String>> {
+            match layer.data().field(&sdf::path(path)?, key.as_str())?.into_owned() {
+                vt::Value::TokenVec(v) => Ok(v.into_iter().map(Into::into).collect()),
+                other => panic!("expected TokenVec at {path}, got {other:?}"),
+            }
+        };
+        assert_eq!(token_vec("/Prim", sdf::ChildrenKey::VariantSetChildren)?, vec!["set"]);
+        assert_eq!(
+            token_vec("/Prim{set=}", sdf::ChildrenKey::VariantChildren)?,
+            vec!["sel"]
+        );
+        assert_eq!(
+            token_vec("/Prim{set=sel}", sdf::ChildrenKey::PrimChildren)?,
+            vec!["child"]
+        );
+        Ok(())
+    }
+
+    /// A variant-selection leaf takes no `def`, which would write a specifier
+    /// onto the variant spec, and an `over` authors the variant spec itself.
+    #[test]
+    fn prim_authoring_variant_leaf() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("variants.usda");
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::new(e.data_mut(), "/Prim", sdf::Specifier::Def, "Xform").unwrap();
+        });
+        assert!(matches!(
+            layer
+                .edit(|e| {
+                    sdf::PrimSpec::new(e.data_mut(), "/Prim{set=sel}", sdf::Specifier::Def, "Xform")?;
+                    Ok(())
+                })
+                .unwrap_err(),
+            sdf::EditError::Author(sdf::AuthoringError::InvalidPath { .. })
+        ));
+        // The rejected `def` authored no variant spec.
+        let variant = sdf::path("/Prim{set=sel}")?;
+        assert_eq!(layer.data().spec_type(&variant), None);
+
+        edit_layer(&mut layer, |e| {
+            sdf::PrimSpec::over(e.data_mut(), "/Prim{set=sel}").unwrap();
+        });
+        assert_eq!(layer.data().spec_type(&variant), Some(sdf::SpecType::Variant));
+        Ok(())
+    }
+
+    #[test]
+    fn usda_roundtrip() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("scene.usda");
+        let material = sdf::path("/World/Material")?;
+        edit_layer(&mut layer, |e| {
+            e.pseudo_root_mut().unwrap().set_default_prim("World");
+            sdf::PrimSpec::new(e.data_mut(), "/World", sdf::Specifier::Def, "Xform").unwrap();
+            let mut sphere = sdf::PrimSpec::new(e.data_mut(), "/World/Sphere", sdf::Specifier::Def, "Sphere").unwrap();
+            sphere.set_kind("component");
+            let mut radius = sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/World/Sphere.radius",
+                "double",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            radius
+                .set_default(vt::Value::Double(1.5))
+                .expect("value fits the declared type");
+            sdf::PrimSpec::new(e.data_mut(), &material, sdf::Specifier::Def, "Material").unwrap();
+            let mut binding = sdf::RelationshipSpec::new(
+                e.data_mut(),
+                "/World/Sphere.material:binding",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            binding.edit_targets().set([material.clone()]).unwrap();
+            let mut surface = sdf::AttributeSpec::new(
+                e.data_mut(),
+                "/World/Sphere.inputs:surface",
+                "token",
+                sdf::Variability::Varying,
+                false,
+            )
+            .unwrap();
+            surface
+                .edit_connections()
+                .set([sdf::path("/World/Material.outputs:surface").unwrap()])
+                .unwrap();
+        });
+
+        let tmp = std::env::temp_dir().join("openusd_authoring_roundtrip.usda");
+        layer.export(tmp.to_str().unwrap())?;
+
+        let parsed = usda::read_file(&tmp)?;
+        assert_eq!(parsed.spec_type(&sdf::path("/World")?), Some(sdf::SpecType::Prim));
+        assert_eq!(
+            parsed.spec_type(&sdf::path("/World/Sphere")?),
+            Some(sdf::SpecType::Prim)
+        );
+        assert_eq!(
+            parsed.spec_type(&sdf::path("/World/Sphere.radius")?),
+            Some(sdf::SpecType::Attribute)
+        );
+        assert_eq!(
+            parsed
+                .field(&sdf::Path::abs_root(), sdf::FieldKey::DefaultPrim.as_str())?
+                .into_owned(),
+            vt::Value::Token("World".into())
+        );
+        let targets = parsed
+            .field(
+                &sdf::path("/World/Sphere.material:binding")?,
+                sdf::FieldKey::TargetPaths.as_str(),
+            )?
+            .into_owned()
+            .try_as_path_list_op()
+            .expect("relationship targets as PathListOp");
+        assert!(targets.is_explicit());
+        assert_eq!(targets.explicit_items(), vec![material]);
+        let connections = parsed
+            .field(
+                &sdf::path("/World/Sphere.inputs:surface")?,
+                sdf::FieldKey::ConnectionPaths.as_str(),
+            )?
+            .into_owned()
+            .try_as_path_list_op()
+            .expect("connection paths as PathListOp");
+        assert!(connections.is_explicit());
+        assert_eq!(
+            connections.explicit_items(),
+            vec![sdf::path("/World/Material.outputs:surface")?]
+        );
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
+
+    /// Puts `layer` behind a resolver that opens every asset to what `open`
+    /// gives, as if the layer had been read through it.
+    fn opened_through(layer: &mut Layer, open: impl Fn() -> io::Result<Box<dyn ar::Asset>> + 'static) {
+        layer.resolver = Some(Rc::new(ar::tests::TestResolver(open)));
+    }
+
+    /// A layer read from its file is clean, a committed edit makes it dirty,
+    /// and a save cleans it.
+    #[test]
+    fn save_clears_dirty() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        assert!(!layer.is_dirty());
+        set_component(&mut layer);
+        assert!(layer.is_dirty());
+        layer.save()?;
+        assert!(!layer.is_dirty());
+        Ok(())
+    }
+
+    /// The crate fixture in `dir`, read into memory and edited, with its
+    /// path.
+    fn edited_fixture(dir: &FsPath) -> Result<(PathBuf, Layer)> {
+        let path = crate_fixture(dir)?;
+        let mut layer = Layer::open(path.to_string_lossy())?;
+        set_component(&mut layer);
+        Ok((path, layer))
+    }
+
+    /// An asset over `bytes` that shares them through a source standing in
+    /// for a mapping when `mapping` is set, and for bytes in memory
+    /// otherwise. `sources` collects a handle that is shared with each
+    /// source made; its count tells whether a view of the source lives.
+    fn shared_asset(bytes: Vec<u8>, mapping: bool, sources: &RefCell<Vec<ar::tests::AdviceLog>>) -> Box<dyn ar::Asset> {
+        let (buffer, log) = ar::tests::recording_source(bytes, mapping);
+        sources.borrow_mut().push(log);
+        Box::new(io::Cursor::new(ar::AssetBuffer::Shared(buffer)))
+    }
+
+    /// How many of `sources` a view still holds alive.
+    fn live_sources(sources: &RefCell<Vec<ar::tests::AdviceLog>>) -> usize {
+        sources.borrow().iter().filter(|log| Arc::strong_count(log) > 1).count()
+    }
+
+    /// A save through the registry puts the layer on the mapping the
+    /// resolver opens of the saved file, and the layer decodes from it.
+    #[test]
+    fn save_remaps() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        let sources = Rc::new(RefCell::new(Vec::new()));
+        opened_through(&mut layer, {
+            let (path, sources) = (path.clone(), Rc::clone(&sources));
+            move || Ok(shared_asset(fs::read(&path)?, true, &sources))
+        });
+
+        layer.save()?;
+        assert_eq!(sources.borrow().len(), 1, "the saved file is opened once");
+        assert_eq!(live_sources(&sources), 1, "the layer holds the mapping");
+        assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
+        let size = layer.data().field(&Path::new("/World.size")?, "default")?;
+        assert_eq!(size.into_owned(), Value::from(vec![1.0_f32; 64]));
+        Ok(())
+    }
+
+    /// A resolver that answers with a mapping of the file as it was before
+    /// the save leaves the layer on the bytes it wrote: the saved values
+    /// stay, and nothing reports a change.
+    #[test]
+    fn save_refuses_stale() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        let fired = Rc::new(Cell::new(0));
+        layer.add_sink({
+            let fired = Rc::clone(&fired);
+            move |_: &str, _: &ChangeList| fired.set(fired.get() + 1)
+        });
+        let before = fs::read(&path)?;
+        let sources = Rc::new(RefCell::new(Vec::new()));
+        opened_through(&mut layer, {
+            let sources = Rc::clone(&sources);
+            move || Ok(shared_asset(before.clone(), true, &sources))
+        });
+
+        layer.save()?;
+        assert_eq!(sources.borrow().len(), 1);
+        assert_eq!(live_sources(&sources), 0, "the stale mapping is let go");
+        assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
+        assert_eq!(fired.get(), 0, "a save is not a layer change");
+        assert_eq!(
+            world_kind(&Layer::open(path.to_string_lossy())?),
+            Some(tf::Token::from("component"))
+        );
+        Ok(())
+    }
+
+    /// Shared bytes that are held in memory are not adopted, though they
+    /// equal the file: the layer already holds those bytes.
+    #[test]
+    fn save_skips_heap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        let sources = Rc::new(RefCell::new(Vec::new()));
+        opened_through(&mut layer, {
+            let sources = Rc::clone(&sources);
+            move || Ok(shared_asset(fs::read(&path)?, false, &sources))
+        });
+
+        layer.save()?;
+        assert_eq!(sources.borrow().len(), 1);
+        assert_eq!(live_sources(&sources), 0);
+        assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
+        Ok(())
+    }
+
+    /// An asset that shares no bytes is opened and dropped without a byte
+    /// being read from it.
+    #[test]
+    fn save_reads_nothing() -> Result<()> {
+        /// An asset that counts the reads made of it.
+        struct Counting(io::Cursor<Vec<u8>>, Arc<AtomicUsize>);
+
+        impl io::Read for Counting {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.read(buffer)
+            }
+        }
+
+        impl io::Seek for Counting {
+            fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+                self.0.seek(position)
+            }
+        }
+
+        impl ar::Asset for Counting {
+            fn size(&self) -> io::Result<u64> {
+                Ok(self.0.get_ref().len() as u64)
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        let (opens, reads) = (Rc::new(Cell::new(0)), Arc::new(AtomicUsize::new(0)));
+        opened_through(&mut layer, {
+            let (opens, reads) = (Rc::clone(&opens), Arc::clone(&reads));
+            move || {
+                opens.set(opens.get() + 1);
+                Ok(Box::new(Counting(
+                    io::Cursor::new(fs::read(&path)?),
+                    Arc::clone(&reads),
+                )))
+            }
+        });
+
+        layer.save()?;
+        assert_eq!(opens.get(), 1);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
+        Ok(())
+    }
+
+    /// A saved file the resolver cannot open afterwards is still a save: the
+    /// layer stays on the bytes it wrote.
+    #[test]
+    fn save_survives_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        opened_through(&mut layer, || Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+
+        layer.save()?;
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&layer), component);
+        assert_eq!(world_kind(&Layer::open(path.to_string_lossy())?), component);
+        Ok(())
+    }
+
+    /// A replacement that fails through the registry keeps the edit in
+    /// memory as a plain save does, and asks the resolver for nothing.
+    #[test]
+    fn save_replace_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (path, mut layer) = edited_fixture(dir.path())?;
+        let opens = Rc::new(Cell::new(0));
+        opened_through(&mut layer, {
+            let opens = Rc::clone(&opens);
+            move || {
+                opens.set(opens.get() + 1);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        });
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+
+        let error = layer.save().expect_err("the replacement fails");
+        assert!(matches!(error, ExportError::Replace { .. }), "{error:?}");
+        assert_eq!(opens.get(), 0);
+        assert_eq!(world_kind(&layer), Some(tf::Token::from("component")));
+        Ok(())
+    }
+
+    /// Through a resolver that maps files, the saved layer reads the new
+    /// file through a mapping, a layer that viewed the old file goes on
+    /// reading it, and a fresh open sees the edit.
+    #[cfg(feature = "mmap")]
+    #[test]
+    // The mapping opt-in is `unsafe` by contract, and this test, the only
+    // writer of its directory, can make the promise.
+    #[allow(unsafe_code)]
+    fn save_mapped() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = crate_fixture(dir.path())?;
+        // SAFETY: only the save below writes the files in this directory, and
+        // a save never writes into a file it holds a view of: it replaces the
+        // file beside it.
+        let resolver = unsafe { ar::DefaultResolver::new().map_files() };
+        let registry = sdf::LayerRegistry::new(Box::new(resolver));
+        let identifier = sdf::absolute_path_at(&registry, None, &path.to_string_lossy());
+        let mut editing = registry.open_layer(&identifier)?.expect("the layer resolves");
+        let other = registry.open_layer(&identifier)?.expect("the layer resolves");
+        set_component(&mut editing);
+
+        editing.save()?;
+        let component = Some(tf::Token::from("component"));
+        assert_eq!(world_kind(&editing), component);
+        assert_eq!(world_kind(&other), None, "the other view reads the file it mapped");
+        assert_eq!(world_kind(&Layer::open(path.to_string_lossy())?), component);
+        let size = editing.data().field(&Path::new("/World.size")?, "default")?;
+        assert_eq!(size.into_owned(), Value::from(vec![1.0_f32; 64]));
+
+        // A mapped file is open with write sharing denied. The new file
+        // refuses a writer for as long as the saved layer views it.
+        #[cfg(windows)]
+        {
+            let write = || fs::OpenOptions::new().write(true).open(&path);
+            assert!(write().is_err(), "the saved layer maps its file");
+            drop(editing);
+            assert!(write().is_ok(), "the mapping went with the layer");
+        }
+        Ok(())
+    }
+}

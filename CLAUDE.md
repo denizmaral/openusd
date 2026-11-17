@@ -1,34 +1,199 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with
+code in this repository.
 
 ## Project Overview
 
-This is a pure Rust implementation of OpenUSD (Universal Scene Description), Pixar's open-source framework for 3D computer graphics data interchange. The project aims to provide native Rust support without C++ dependencies for reading and writing USD files.
+This is a pure Rust implementation of OpenUSD (Universal Scene Description),
+Pixar's open-source framework for 3D computer graphics data interchange. The
+project aims to provide native Rust support without C++ dependencies for reading
+and writing USD files.
 
 ## Architecture
 
-The codebase is organized into three main modules:
+The repository is a Cargo workspace of three crates. `crates/openusd` is the
+core library, `crates/openusd-schemas` the domain schemas layered on it, and
+`crates/openusd-build` the schema view generator that `openusd-schemas` runs as
+a build dependency; shared package properties, dependency versions, and the
+lint table live in the root `Cargo.toml`. Module paths in the bullets below are
+relative to a crate's `src/`.
 
-- **`sdf/`** - Scene Description Foundations: Core data types, traits, and abstractions corresponding to USD's SDF module. Contains the `AbstractData` trait that defines the interface for accessing scene description data.
+The core crate mirrors the C++ OpenUSD SDK's module layout. The bullets below
+are a navigational map — what each module is, where to start reading, and the
+types that name its main seams. They say what a type is for, not how it behaves:
+each module's own `//!` doc comment, and each item's own doc comment, are the
+source of truth for specifics.
 
-- **`usda/`** - Text format (.usda) reader: Parser implementation for USD's ASCII text format using logos for tokenization and a recursive descent parser.
+- **`tf/`** - Tools Foundation (C++ `Tf`): low-level utilities, chiefly
+  `tf::Token`, the interned-identifier string behind every `TfToken`-equivalent
+  API, and `tf::HashState` (`tf/hash.rs`), C++ `Tf_HashState`, the state
+  `TfHash` accumulates over byte strings, for names C++ derives from a hash
+  code.
 
-- **`usdc/`** - Binary format (.usdc) reader: Implementation for USD's binary crate format, including compressed data handling and efficient memory layout parsing.
+- **`vt/`** - Value Types (C++ `Vt`): `vt::Value` (C++ `VtValue`), the value
+  an attribute or metadata field holds, and `vt::Dictionary` (C++
+  `VtDictionary`), with the casts out of a value (`FromValue`, `CastError`,
+  and `vt/coerce.rs`, C++ `VtValue::CastToTypeid`), the scalar and array
+  kinds (`vt/array.rs`), and the text C++ streams for one
+  (`vt/stream_out.rs`, C++ `VtStreamOut`).
+  `Value` is a closed enum, so it names the `sdf` value types it holds. Start
+  at `vt/mod.rs`.
 
-The `AbstractData` trait in `sdf/mod.rs` serves as the central abstraction, providing a unified interface for both text and binary format readers.
+- **`sdf/`** - Scene Description Foundations (C++ `Sdf`): the core data model.
+  `AbstractData` is the unified read/write backend interface the text, binary,
+  and archive readers all implement; `Path` and `Layer` (C++ `SdfLayer`) are
+  the everyday types. A `Layer`'s edits run through
+  `Layer::edit` (a closure over a `LayerEdit` view) as atomic copy-on-write
+  transactions that derive a `ChangeList` for composition invalidation and fire
+  per-layer `LayerSink`s at the commit seam (`sdf/layer.rs`, `sdf/change.rs`,
+  `sdf/sink.rs`); spec authoring lives on the typed views (`PrimSpec::new` and
+  friends). Also here: the pluggable `FileFormat` read/write seam, the
+  `LayerRegistry` that owns asset loading and format dispatch (composition opens
+  reference/payload targets on demand through it, so an un-visited subtree never
+  loads) and holds layers shared through `LayerHandle`s, each lending its one
+  layer to read as a `LayerGuard` (C++
+  `SdfLayer::FindOrOpen`, `sdf/layer_store.rs`, with the commit protocol its
+  edits run in `sdf/commit.rs`), the live spec handles over them
+  (`sdf/handle.rs`, C++ `SdfPrimSpecHandle` and friends), the
+  variable-expression engine (`sdf/expr.rs`), the anchoring of an authored
+  path at its layer over the package listings the layer store holds
+  (`sdf/anchor.rs`, C++ `SdfComputeAssetPathRelativeToLayer`), the asset-path
+  resolution tail that anchors an `asset` value against its authoring layer and
+  evaluates any expression in it (`sdf/asset_path.rs`, C++
+  `SdfResolveAssetPaths`; `pcp` and `usd` each supply their own anchor and
+  variable scope), the path-expression engine behind pattern-based collections
+  (`sdf/path_expr/`), the namespace-aware spec-copy primitive
+  (`sdf/copy.rs`), and the list edits: `Spec::edit_list` rewrites a list-op
+  field, and `PathListEdit` (C++ `SdfPathEditorProxy`) edits a spec's path
+  lists anchored at its prim, a property's targets or connections and a
+  prim's inherits or specializes. Start at `sdf/mod.rs`.
+
+- **`usda/`** - Text format `.usda`: logos lexer + recursive-descent parser.
+  `Parser` builds the scene hierarchy over a `Cursor` (one-token lookahead and
+  the span bookkeeping behind `ParseError`'s line/column diagnostics),
+  delegating value decoding to the free functions in `types`; `TextWriter`
+  emits.
+
+- **`usdc/`** - Binary crate format `.usdc` (compressed). `CrateData` /
+  `CrateWriter`.
+
+- **`usdz/`** - ZIP-based `.usdz` package. `Archive` / `ArchiveWriter`.
+
+- **`ar/`** - Asset Resolution (C++ `Ar`): the `Resolver` trait maps `@...@`
+  asset paths to physical locations; `DefaultResolver` searches the filesystem.
+  `CacheScope` (C++ `ArResolverScopedCache`) is the span, on one thread, over
+  which opened packages are kept.
+  `UdimPath` (C++ `UsdShadeUdimUtils`) is a texture path standing for a set of
+  tiles, with the tiles a resolver finds for it.
+
+- **`pcp/`** - Prim Cache Population, the composition engine (C++ `Pcp`):
+  LIVERPS strength ordering across layers, kept a pure function of `(graph,
+  context, cached indices)` so it stays parallelizable. Composition drives layer
+  loading: a reference/payload target opens on first use and the demand travels
+  out through `BuildOutput` to the stage's load barrier. A build reads layer
+  content through `LayerView`, the graph with one borrow of its layers' store.
+  Start at `pcp/mod.rs` — it has the LIVERPS overview and a per-file structure
+  table.
+
+- **`usd/`** - Composed stage API (C++ `Usd`): `usd::Stage` is the handle that
+  delegates composition to `pcp::IndexCache`; `Prim`, `Attribute`,
+  `Relationship`, and the schema views are `Clone` value types over it, and
+  stage-tier authoring routes through the current `EditTarget`, with
+  `Stage::edit` batching several prim and property writes into one layer
+  transaction and `Stage::batch_edit` for atomic multi-layer edits. Notable
+  sub-surfaces:
+  `usd/schema_registry.rs` + `usd/prim_definition.rs` + `usd/prim_type_info.rs`
+  (C++ `UsdSchemaRegistry` / `UsdPrimDefinition` / `UsdPrimTypeInfo` — the
+  schema type table and the property fallbacks it supplies, built from
+  per-family manifest + schematics text), `usd/resolve_info.rs` (`ResolveInfo` /
+  `ResolveInfoSource` — where a value read found its answer, over
+  `pcp::value_resolve`'s shared walk), `usd/sink.rs` (`StageSink`
+  composed-change observers, `Provenance`), `usd/diff.rs` (the transferable
+  `Diff` and `Stage::apply_diff`), `usd/capture.rs` (`UndoStage` /
+  `ReplayStage`, recording wrappers over the change seam), `usd/editor.rs`
+  (namespace editing), `usd/list_edit.rs` (`ListEdit`, C++ `UsdInherits` /
+  `UsdSpecializes` / `UsdReferences` / `UsdPayloads`, a prim's arc lists
+  edited on the edit target), `usd/color_space.rs` (the color-space
+  resolution of C++ `UsdColorSpaceAPI` and `UsdColorSpaceDefinitionAPI`,
+  with the per-stage `ColorSpaceCache`), `usd/object.rs` (`Object` and
+  `Property`, C++ `UsdObject` and `UsdProperty`: the metadata a prim and its
+  properties share), `usd/composition.rs` (private
+  `StageComposition`: owns
+  the layer graph, index cache, and pending-edit queue, and the operations over
+  them — reconciliation, the composed-query/load fixpoint, demand loading,
+  interning, muting, load rules, construction — calling back to `Stage` through
+  `CompositionHooks`). Start at `usd/stage.rs`. Public users import modules
+  (`use openusd::{sdf, usd};`); the only root-level re-exports are
+  `openusd::Error` and `openusd::Result` (`src/error.rs`), the crate-wide error
+  enum every module error nests into. A `#[macro_export]` macro necessarily
+  binds at the root too: `impl_token_value` is `#[doc(hidden)]` there and
+  documented as `vt::impl_token_value`, the module that owns what it is about,
+  and `include_schema!` is the one macro documented at the root itself.
+
+- **`usd_utils/`** - Utilities over layers and stages (C++ `UsdUtils`):
+  `all_dependencies` (C++ `UsdUtilsComputeAllDependencies`),
+  `create_usdz_package` (C++ `UsdUtilsCreateNewUsdzPackage`) and
+  `modify_asset_paths` (C++ `UsdUtilsModifyAssetPaths`). `walk.rs` is the walk
+  over the asset paths a layer authors, under a `Visit` policy; `discover.rs`
+  the breadth-first discovery of the files a root reaches (`Root`, an asset
+  path or a layer in hand; `Discovery` / `Source`, with a scope of its own
+  for each package the stage holds layers in); `package.rs` the placement of
+  each source at one entry and the write.
+  Start at `usd_utils/mod.rs`.
+
+- **`openusd-schemas`** - A separate crate (`crates/openusd-schemas`), not a
+  module of the core: domain schemas layered on `sdf` / `usd`, not part of the
+  AOUSD core spec. It depends on `openusd`, so the core must never reference it.
+  Feature-gated per family (`geom`, `lux`, `media`, `physics`, `proc`, `render`,
+  `semantics`, `shade`, `skel`, `ui`, `vol`; `shade` and several others
+  enable `geom`, and `lux`, `physics` and `render` enable `shade`). See the
+  table in its `lib.rs`.
+
+- **`openusd-build`** - A separate crate (`crates/openusd-build`): the schema
+  view generator `openusd-schemas` runs as a build dependency. It loads a schema
+  library's schematics and manifest, and the metadata fields and kinds its
+  `plugInfo.json` declares, resolves and validates them over the composed
+  stage, and emits the Rust views and token tables the schema crate
+  includes (`load` → `resolve` → `validate` → `emit`; start at its `lib.rs`).
+  Its golden tests under `tests/` regenerate with `UPDATE_EXPECTED=1`.
+
+- **`kind`** - Kinds (C++ `Kind`): `kind::Registry` (C++ `KindRegistry`) is
+  the table of known kinds and their base kinds, holding the built-in model
+  hierarchy plus the kinds a site declares as `kind::Decl`s. It is the single
+  file `kind.rs` and depends on `tf` only. A schema family carries the
+  declarations (`usd::SchemaFamily::kinds`), and a stage reads the table
+  through `usd::SchemaRegistry::kinds`.
+
+- **`gf/`** - Graphics Foundations (C++ `Gf`): `bytemuck::Pod` vector /
+  quaternion / matrix types for bulk binary serialization, row-major /
+  row-vector convention, each bridging to `vt::Value` via `From` / `TryFrom`;
+  `gf::Rotation` (C++ `GfRotation`), the axis-and-angle rotation the xformOp
+  rotations are built through; `gf::DualQuatd` (C++ `GfDualQuatd`), the
+  rigid transform dual-quaternion skinning blends; `gf::Interval` (C++
+  `GfInterval`), the open-or-closed-ended span a time-sample query is asked
+  over;
+  `gf::Range3d` and `gf::BBox3d` (C++ `GfRange3d`, `GfBBox3d`), the
+  axis-aligned box and the box-with-a-matrix that bounds are computed in; and
+  `gf::Camera` and `gf::Frustum` (C++ `GfCamera`, `GfFrustum`), a camera
+  as a plain value and the volume it sees, with `gf::ProjectionParams` for
+  what a projection matrix projects and `gf::Plane` and `gf::Ray` for the
+  frustum's intersection tests; and `gf::ColorSpace` and `gf::Color` (C++
+  `GfColorSpace`, `GfColor`), a color space built from primaries or a matrix,
+  with the conversions C++ takes from its bundled nanocolor library, and an
+  RGB triple in one. See `gf/mod.rs` for the conventions.
 
 ## Development Commands
 
 ```bash
-# Build the project
-cargo build
+# Build the workspace (use --all-features to include the gated schema families)
+cargo build --workspace --all-features
 
 # Run tests (including comprehensive format validation tests)
-cargo test
+cargo test --workspace --all-targets --all-features
 
 # Lint with Clippy (strict warnings as errors)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Format code
 cargo fmt
@@ -36,61 +201,243 @@ cargo fmt
 # Check formatting
 cargo fmt --all -- --check --files-with-diff
 
-# Generate documentation
-cargo doc --no-deps
+# Generate documentation (a broken or private intra-doc link is an error)
+cargo doc --workspace --no-deps --all-features
 
 # Run security/dependency audits
 cargo deny check
 
 # Run examples
-cargo run --example dump_usdc -- path/to/file.usd
+cargo run -p openusd --example dump_usdc -- path/to/file.usd
 ```
+
+## ROADMAP.md Style
+
+Keep `ROADMAP.md` rows concise. Each Notes cell should cover three things only:
+
+1. Whether it is done — the status emoji in the Status column handles this;
+   the Notes cell does not need to restate it.
+2. What to read — name the key types or traits a reader would look for
+   (e.g. `sdf::ChangeList`, `usd::NamespaceEditor`). Do not describe what
+   those types do; their own doc comments are the source of truth.
+3. What is remaining — a short `Remaining — X; Y` clause, or a `Remaining:`
+   bullet list when there are several distinct items, for anything materially
+   incomplete. Drop it once nothing is left.
+
+Avoid enumerating every method, variant, or edge case handled. If the
+implementation is complete and unremarkable, a one-line entry is fine.
+
+## Planning New Features
+
+When implementing a new feature from the spec:
+
+1. Read `docs/aousd_core_spec_1.0.1.pdf` to understand how the feature works and
+   what it does
+2. Research how the C++ OpenUSD implementation handles it:
+   https://github.com/PixarAnimationStudios/OpenUSD
+3. Review the Python reference implementation if applicable:
+   `vendor/core-spec-supplemental-release_dec2025/`
 
 ## Code Standards
 
-- Project targets Rust version specified in `rust-toolchain.toml` with MSRV defined in `clippy.toml`
+- Project targets Rust version specified in `rust-toolchain.toml` with MSRV
+  defined in `clippy.toml`
 - Maximum line width: 120 characters (rustfmt.toml)
 - All warnings treated as errors in CI
+- The `[lints]` section of `Cargo.toml` sets every lint to `deny`, so findings
+  block a plain `cargo build` and are never optional. Silence one only with a
+  narrowly scoped `#[allow(...)]` carrying a comment for why; do not downgrade
+  or delete the entry in `Cargo.toml` to make a finding go away. Words that
+  `clippy::doc_markdown` should ignore go in `clippy.toml`'s `doc-valid-idents`
 - Comprehensive test coverage (50% minimum) with grcov
 - Security auditing with cargo-deny
+- Pre-1.0: backward compatibility is not a constraint. Prefer the cleanest
+  design and change or remove public APIs freely; don't keep deprecated shims,
+  compatibility shims, or worse-but-compatible behavior. Update all call sites
+  in the same change.
+- Prefer an architecturally correct design over a quick, dirty, or bandaid fix.
+  Fix the root cause at the layer that owns the concept, not the symptom at the
+  call site. A special case layered onto shared infrastructure (an `if this one
+  format` branch, or a value re-derived from a string because the right field
+  was not carried) signals the fix is at the wrong altitude — generalize the
+  mechanism or carry the missing state instead. When a module mirrors C++
+  OpenUSD, factor the concern the way the C++ model does (e.g. a layer's lexical
+  identifier vs. its resolved real path).
+- Fix a gap you find in the current session, even when it sits outside the
+  module you set out to change. Leave a `TODO` only for a large remaining
+  gap that needs its own planning, or for one whose fix diverges
+  significantly from the work currently planned. Name the missing
+  generalization in it. A `TODO` never stands in for a fix that fits in the current change.
+  `TODO(rayon)` / `TODO(perf)` markers for performance seams are separate
+  (see Code Quality).
 
 ## Code Quality
 
 - Write clean and idiomatic Rust code
 - Less is better - prefer functionality offered by stdlib
+- Don't write a function or method whose body is just a call to another
+  free-standing function (a thin delegating wrapper, e.g. `fn open_stack(&self,
+  p) { open_layer_stack(self.resolver(), p) }`). Call the free function directly
+  at the call site. A method earns its place only when it adds something —
+  encapsulating private state, a non-trivial default, or an invariant
+- Keep `pcp` composition free of interior mutability: no `Cell`/`RefCell` (and
+  no `Mutex`) on `LayerGraph`, `IndexCache`, the indexer, or anything a per-prim
+  build reads. A build is a pure function of its `&`-inputs, so anything it
+  discovers (errors, demanded-but-unloaded layers) travels out through its
+  return value (`BuildOutput`), not a shared mutable cell. Accumulate such
+  results in an owned field and merge them up; the cache holds the deferred list
+  as a plain `Vec` it mutates through `&mut self`
+- Order a file top-down by importance so the first thing a reader sees is the
+  main type, not a helper: the primary type definition (and the structs it
+  depends on) first, then its `impl` blocks, then free-standing helper
+  functions, then the `#[cfg(test)] mod tests`. Don't open a file with a small
+  private helper.
 - Code requires documentation
-- Proof read and reword docs and/or comments as needed
-
-## Git
-
-- Keep commit messages brief and to the point
-- Use a short, descriptive commit title (50 characters or less)
-- Include a brief commit body that summarizes changes in 1-3 sentences when needed (wrap at 120 characters)
-- Keep commits focused and atomic - one logical change per commit
-- Don't add "Generated with Claude Code" to commit messages or pull request descriptions
-- Don't add "Co-Authored-By: Claude noreply@anthropic.com" to commit messages or pull request descriptions
-- Before opening a PR or making a commit, make sure the code passes lint, formatting, and unit tests
+- Proof read and reword docs and/or comments as needed. The `writing-review`
+  skill is the revision pass for comments, docs, and commit messages; run it
+  before handing any of them over
+- Do not use `**bold** — description` pattern in doc comments or bullet lists;
+  use plain text or link directly to the item instead
+- A doc comment documents only its own item. Don't describe another type,
+  module, or method inside it (e.g. don't enumerate a `Layer`'s methods in a
+  `Relocate` type alias's doc); document each item on the item itself and use an
+  intra-doc link (`` [`Foo`] ``) when a cross-reference is genuinely needed
+- Do not use decorative box-drawing section-divider comments (e.g. `// ──
+  Section ──────`); group code with a plain `//` comment or rely on the item's
+  own doc comment
+- Never remove comments during refactoring if they are still applicable
+- Comments must describe the code as it stands, not its edit history or the
+  alternatives it didn't take. Don't justify the absence or removal of code, and
+  don't contrast the chosen approach with a rejected one (e.g. "no separate X
+  pre-check is needed here", "X was removed because…", "assign directly rather
+  than through Y", "instead of calling Z", "we use A so we don't B"). This
+  includes contrasts with a prior implementation's performance or shape — "a
+  subtree walk rather than a full scan", "O(1) instead of the previous O(n)",
+  "now keyed by path" — which only make sense to someone who saw the old code;
+  state the present behavior positively ("walks the `prefix` subtree") instead.
+  Such notes only make sense to someone who saw the prior version or the
+  alternative and are noise to a fresh reader. State what the present code does
+  and a rationale that stands on its own, not what it no longer does or could
+  have done.
+- Don't reference planning phases or steps (e.g. "Phase 1", "Step 2") in code,
+  comments, names, fixtures, or commit messages; describe what the code does or,
+  for deferred work, name the missing feature in a `TODO`
+- Wrap prose at 80 characters — Markdown, plans, design write-ups, and
+  doc-comment text; Rust code still follows rustfmt (120)
+- Mark performance/parallelism opportunities with a `TODO(rayon)` (or
+  `TODO(perf)`) comment in new code and when refactoring existing code, instead
+  of optimizing prematurely; say what is independent or parallelizable so the
+  seam is actionable later
+- Prefer laconic names. Pick the shortest name that reads clearly beside its
+  siblings, and cite the C++ counterpart in the doc comment; a C++ name is not
+  transliterated into the identifier (`PointInstancer::mask_at` for C++
+  `ComputeMaskAtTime`, `Xformable::affects_transform` for
+  `IsTransformationAffectedByAttrNamed`). A name does not repeat what its type
+  or module already says (`Subset::create`, not `Subset::create_geom_subset`).
+  Drop a `compute_` or `get_` prefix (`BBox3d::centroid`,
+  `TetMesh::surface_faces`),
+  keeping `compute_` only where the plain name is the read of the authored
+  value (`compute_points_at_time` beside the generated `points_at`)
+- Re-export key types from module roots so users can access them without deep
+  paths (e.g. `sdf::FieldKey` not `sdf::schema::FieldKey`)
+- Reference types through their module, not a fully-qualified or bare path: `use
+  crate::{sdf, gf, tf};` then write `sdf::TimeCode`, `gf::Vec3f`, `tf::Token`.
+  Don't write inline `crate::tf::Token::from(...)` (or `openusd::tf::Token` in
+  tests), and don't `use crate::tf::Token;` to get a bare `Token` when
+  `tf::Token` reads clearly (it also avoids clashes, e.g. the `usda` lexer's own
+  `Token`)
+- Don't write a fully-qualified `std` path inline (e.g.
+  `std::collections::HashMap::new()`, `std::cell::RefCell::new(...)`,
+  `std::mem::swap(...)`). Add a `use` at the top of the file and reference the
+  short name (`HashMap::new()`, `RefCell::new(...)`, `mem::swap(...)` after `use
+  std::mem`). This applies to every `std::` (and external-crate) path: import
+  it, then use the short form
+- Avoid raw path string manipulations; use `Path` methods instead of building or
+  parsing path strings manually
+- Mutate a `Cell` / `RefCell` through its own methods, not a deref-assignment:
+  prefer `cell.replace(v)`, `cell.replace_with(|old| …)`, `cell.take()`, and
+  (for `Cell`) `cell.set(v)` / `cell.get()` over `*cell.borrow_mut() = v` or
+  `*cell.borrow_mut() += …`; when you hold `&mut self`, reach the value with
+  `cell.get_mut()` to skip the runtime borrow entirely. Use a `Cell` (not a
+  `RefCell`) for a `Copy` field like a counter or flag
+- Don't add "Generated with Claude Code" or "Co-Authored-By: Claude" to commits,
+  PRs, or release notes
 
 ## Testing
 
-The test suite includes extensive binary format tests using fixture files in `fixtures/` directory. Tests validate:
-- Data type parsing (integers, floats, strings, arrays, etc.)
-- USD-specific types (paths, references, payloads, layer offsets)
-- Compression handling
-- Time-sampled data
-- Scene hierarchy traversal
+Integration tests live in each crate's `tests/` directory and read fixture
+files from its `fixtures/`. Four suites in the core crate are compliance
+checks against external references: `composition.rs` regenerates the vendor
+`pcp.txt` composition dumps byte-for-byte, `text_format.rs` compares parsed
+`.usda` files with the Python reference implementation's output,
+`text_writer_baselines.rs` writes C++ `testSdfParsing` baselines back
+byte-for-byte, and `flatten_baselines.rs` flattens the C++ `testUsdFlatten2`
+cases into the text C++ wrote for them. The `openusd-build`
+goldens under its `tests/` regenerate with `UPDATE_EXPECTED=1`.
 
-Test fixtures are small USD files covering specific format features and edge cases.
+Prefer using USD assets from `vendor/usd-wg-assets/` for test fixtures when a
+suitable file exists. Only add new files to a crate's `fixtures/` when vendor
+assets don't cover the specific case needed.
+
+Test code never sits beside production code. Every test-only item — a helper
+function, a fixture builder, a constructor that only tests call — lives inside
+a `#[cfg(test)] mod tests { … }` block, and nothing test-only appears at a
+module's top level even gated with `#[cfg(test)]`. That includes
+`#[cfg(test)] impl Type { … }` blocks: a `#[cfg(test)]` attribute on an item in
+the main body still puts test code in the middle of the file a reader is trying
+to follow.
+
+A helper several modules' tests share lives in the `mod tests` of the module
+that owns the type it is about, declared `pub(crate)`, and is reached by path:
+`crate::sdf::layer_registry::tests::collect_with_arcs(…)`. Don't add a separate
+`test_support` module for it.
+
+Test function names are terse: 2–4 underscore-separated words. Match the
+existing naming convention of the file. Prefer `add_api_schema_dup_delete` over
+`add_api_schema_clears_duplicate_delete_opinions`, `light_api_skips_non_light`
+over `read_light_api_returns_none_on_non_light_prim`. Drop redundant prefixes
+like `read_`/`reads_` when the test file already targets a reader; favour the
+subject + outcome (`light_api_via_applied_schema`) over verbose sentences.
+
+To pull a typed payload out of a `Value` in tests, use the `EnumTryAs`-generated
+`try_as_*()` accessor followed by `unwrap()`/`expect("…")` rather than a `let
+Value::Variant(x) = … else { panic!() }` block. Keep the descriptive message by
+preferring `expect`.
 
 ## Dependencies
 
 Key external dependencies:
-- `anyhow` - Error handling
+- `bitflags` - Bitflag sets (e.g. `PrimPredicate`)
 - `bytemuck` - Safe transmutation for binary data
-- `half` - 16-bit floating point support
+- `derive_more` - Derive macros for the arithmetic operators on `gf` vectors and
+  `Deref` on the `sdf` spec views
+- `half` - 16-bit floating point support (re-exported as `f16`)
 - `logos` - Lexer generator for USDA tokenization
 - `lz4_flex` - Compression for binary format
+- `memmap2` (optional, `mmap` feature) - Read-only file mappings a resolver
+  opts into with `ar::DefaultResolver::map_files`
 - `num-traits` - Numeric traits
-- `strum` - Enum utilities
+- `regex-lite` - Lightweight regex engine for the `matches_regex` expression
+  function
+- `rustc-hash` - The hash a path computes from its text, and
+  `sdf::PathHasher`, the hasher of `sdf::PathMap`, `sdf::PathSet` and the
+  maps keyed by `&sdf::Path`, whose keys carry a hash of their own
+- `strum` - Enum derive macros (Display, EnumIs, EnumTryAs, IntoStaticStr, etc.)
+- `thiserror` - Error type derive macros behind every error type, from the
+  per-module errors (`sdf::AuthoringError`, `pcp::QueryError`) up to the root
+  `openusd::Error` they nest into
+- `windows-sys` (Windows only) - The Win32 security API, through which a
+  replaced layer file keeps its access control list
+- `zip` - USDZ archive reading
+- `zmij` - The shortest digits of a float or double, chosen as C++
+  double-conversion chooses them, behind the text writer's numbers
+- `serde` (optional, `serde` feature) - Serialization support
 
-The project maintains a minimal dependency footprint and uses cargo-deny to prevent license conflicts and vulnerability introduction.
+Domain schemas live in the separate `openusd-schemas` crate, one feature per
+family (`geom`, `lux`, `media`, `physics`, `proc`, `render`, `semantics`,
+`shade`, `skel`, `ui`, `vol`); use `--workspace --all-features` when building,
+testing, or linting.
+
+The project maintains a minimal dependency footprint and uses cargo-deny to
+prevent license conflicts and vulnerability introduction. Allowed licenses: MIT,
+Apache-2.0, Zlib, Unicode-3.0.

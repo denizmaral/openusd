@@ -1,0 +1,2588 @@
+//! Spec handles over the [`sdf::AbstractData`] field API, plus the [`SpecData`]
+//! storage record they read and write.
+//!
+//! [`SpecData`] is the per-path storage record — a spec type plus its fields in
+//! authored order — that the in-memory [`Data`](crate::sdf::Data) backend keeps
+//! (the analogue of C++ `SdfData`'s private `_SpecData`). The typed views are
+//! something else entirely: thin handles holding `(data, path)` whose accessors
+//! read and write through [`sdf::AbstractData::try_field`] / [`sdf::AbstractData::set_field`],
+//! exactly like C++ `SdfSpec` and its subclasses, which hold `(layer, path)` and
+//! carry no copy. Because they go through the abstract interface, a view works
+//! on any backend, not just `Data`.
+//!
+//! The hierarchy mirrors C++ (`SdfSpec` → `SdfPropertySpec` → `SdfAttributeSpec`
+//! / `SdfRelationshipSpec`):
+//!
+//! ```text
+//! Spec ── PrimSpec
+//!     ├── PseudoRootSpec
+//!     └── PropertySpec ── AttributeSpec
+//!                     └── RelationshipSpec
+//! ```
+//!
+//! Each typed view newtype-wraps the one above it and uses `Deref`/`DerefMut`
+//! so the base accessors are reachable. A view is generic over its borrow `B`
+//! — `&'a dyn sdf::AbstractData` for reads (the default) or `&'a mut dyn sdf::AbstractData`
+//! for writes (the `*Mut` aliases) — so one type serves both modes while the
+//! generic stays out of the public surface.
+//!
+//! Spec creation lives on the views themselves — [`PrimSpec::new`],
+//! [`AttributeSpec::new`], [`RelationshipSpec::new`] (mirroring C++
+//! `Sdf*Spec::New`) — which handle the write-side bookkeeping (`primChildren` /
+//! `propertyChildren` ordering, ancestor specifiers). Read-only lookups go
+//! through [`Layer::prim`](crate::sdf::Layer::prim) and friends.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+
+use strum::{Display, EnumCount, FromRepr};
+
+use crate::tf;
+use crate::{sdf, vt};
+
+/// An enum that specifies the type of an object.
+/// Objects are entities that have fields and are addressable by path.
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, FromRepr, EnumCount, Display)]
+pub enum SpecType {
+    // The unknown type has a value of 0 so that SdfSpecType() is unknown.
+    #[default]
+    Unknown = 0,
+
+    // Real concrete types
+    Attribute = 1,
+    Connection = 2,
+    Expression = 3,
+    Mapper = 4,
+    MapperArg = 5,
+    Prim = 6,
+    PseudoRoot = 7,
+    Relationship = 8,
+    RelationshipTarget = 9,
+    Variant = 10,
+    VariantSet = 11,
+}
+
+impl SpecType {
+    /// Whether a spec of this type is viewed as a prim spec: a prim or a
+    /// variant, which C++ `Sdf_SpecType` casts to `SdfPrimSpec`.
+    pub fn is_prim_or_variant(self) -> bool {
+        matches!(self, SpecType::Prim | SpecType::Variant)
+    }
+}
+
+/// Implements `Debug` for a spec-handle newtype by delegating to its inner
+/// handle, so the data reference it holds is not required to be `Debug`.
+macro_rules! impl_spec_debug {
+    ($($ty:ident),+ $(,)?) => {$(
+        impl<'a, B: Deref<Target = dyn sdf::AbstractData + 'a>> fmt::Debug for $ty<'a, B> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+    )+};
+}
+
+/// Per-path storage record kept by the in-memory [`Data`](crate::sdf::Data)
+/// backend: a [`SpecType`](sdf::SpecType) plus the spec's fields in authored
+/// order. The analogue of C++ `SdfData`'s private `_SpecData`.
+///
+/// This is backend storage, distinct from the [`Spec`] handle that reads and
+/// writes it through the [`sdf::AbstractData`] interface. Fields are stored in
+/// authored order, which is required for faithful text round-tripping.
+#[derive(Debug, Clone)]
+pub struct SpecData {
+    /// The type of this spec (prim, attribute, relationship, etc.).
+    pub ty: sdf::SpecType,
+    /// The fields stored on this spec, in authored order.
+    pub fields: Vec<(String, vt::Value)>,
+}
+
+/// Errors raised by typed spec-level authoring helpers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SpecError {
+    /// A field exists with a value type that cannot be edited by the requested helper.
+    #[error("field {field} exists with non-{expected} value")]
+    FieldType {
+        /// The authored field name.
+        field: &'static str,
+        /// The required value type.
+        expected: &'static str,
+    },
+}
+
+impl SpecData {
+    /// Creates a new empty spec record of the given type.
+    pub fn new(ty: sdf::SpecType) -> Self {
+        Self { ty, fields: Vec::new() }
+    }
+
+    /// Insert or replace a field. If the key already exists, its value is
+    /// overwritten in place and its position is preserved.
+    pub fn add(&mut self, key: impl AsRef<str>, value: impl Into<vt::Value>) {
+        let key = key.as_ref();
+        let value = value.into();
+        if let Some(slot) = self.fields.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = value;
+        } else {
+            self.fields.push((key.to_owned(), value));
+        }
+    }
+
+    /// Adds the list-op statement `value`, which authors the list `ty` names,
+    /// to the field `key`: where the field already holds a list op of the
+    /// same kind, that list's items are merged into it through
+    /// [`ListOp::merge_op`](sdf::ListOp::merge_op), so several statements for
+    /// one field accumulate. Otherwise `value` replaces the field.
+    // Each arm binds a different `ListOp<T>`, so the textually identical bodies
+    // are distinct `merge_op` instantiations and cannot share an arm.
+    #[allow(clippy::match_same_arms)]
+    pub fn add_list_op(&mut self, key: impl AsRef<str>, ty: sdf::ListOpType, value: vt::Value) {
+        let key = key.as_ref();
+        let Some(slot) = self.get_mut(key) else {
+            self.add(key, value);
+            return;
+        };
+        use vt::Value::{
+            Int64ListOp, IntListOp, PathListOp, PayloadListOp, ReferenceListOp, StringListOp, TokenListOp,
+            UInt64ListOp, UIntListOp, UnregisteredValueListOp,
+        };
+        match (slot, value) {
+            (TokenListOp(existing), TokenListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (StringListOp(existing), StringListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (PathListOp(existing), PathListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (ReferenceListOp(existing), ReferenceListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (PayloadListOp(existing), PayloadListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (IntListOp(existing), IntListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (Int64ListOp(existing), Int64ListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (UIntListOp(existing), UIntListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (UInt64ListOp(existing), UInt64ListOp(incoming)) => existing.merge_op(ty, incoming.into_items(ty)),
+            (UnregisteredValueListOp(existing), UnregisteredValueListOp(incoming)) => {
+                existing.merge_op(ty, incoming.into_items(ty));
+            }
+            (slot, value) => *slot = value,
+        }
+    }
+
+    /// Look up a field by name.
+    pub fn get(&self, key: &str) -> Option<&vt::Value> {
+        self.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Mutably look up a field by name. Useful for in-place edits to composite
+    /// values (time-sample maps, list ops) without cloning.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut vt::Value> {
+        self.fields.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Returns `true` if the spec has a field with the given name.
+    pub fn contains(&self, key: &str) -> bool {
+        self.fields.iter().any(|(k, _)| k == key)
+    }
+
+    /// Remove a field by name, returning its value if present.
+    pub fn remove(&mut self, key: &str) -> Option<vt::Value> {
+        let idx = self.fields.iter().position(|(k, _)| k == key)?;
+        Some(self.fields.remove(idx).1)
+    }
+
+    /// Merge fields from `other` into `self`, upserting each by name.
+    pub fn extend_from(&mut self, other: SpecData) {
+        for (k, v) in other.fields {
+            self.add(k, v);
+        }
+    }
+}
+
+/// Base spec handle — a `(data, path)` reference into an [`sdf::AbstractData`],
+/// paralleling C++ `SdfSpec`. Field accessors read and write through the
+/// abstract interface; the handle holds no copy of the spec.
+///
+/// `B` is the borrow: `&'a dyn sdf::AbstractData` for reads (the default) or
+/// `&'a mut dyn sdf::AbstractData` for writes ([`SpecMut`]). The typed views
+/// ([`PrimSpec`], [`AttributeSpec`], …) wrap this and reach its accessors
+/// through `Deref`.
+pub struct Spec<'a, B> {
+    data: B,
+    path: sdf::Path,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a, B: Deref<Target = dyn sdf::AbstractData + 'a>> fmt::Debug for Spec<'a, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Spec")
+            .field("path", &self.path)
+            .field("type", &self.spec_type())
+            .finish()
+    }
+}
+
+impl_spec_debug!(PrimSpec, PseudoRootSpec, PropertySpec, AttributeSpec, RelationshipSpec);
+
+/// A read-only base spec handle (`Spec` over a shared borrow).
+pub type SpecRef<'a> = Spec<'a, &'a dyn sdf::AbstractData>;
+
+/// A mutable base spec handle (`Spec` over an exclusive borrow).
+pub type SpecMut<'a> = Spec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a, B> Spec<'a, B> {
+    pub(crate) fn wrap(data: B, path: sdf::Path) -> Self {
+        Self {
+            data,
+            path,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, B> Spec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// The path this handle refers to.
+    pub fn path(&self) -> &sdf::Path {
+        &self.path
+    }
+
+    /// The type of the spec at this path, if any.
+    pub fn spec_type(&self) -> Option<sdf::SpecType> {
+        self.data.spec_type(&self.path)
+    }
+
+    /// Reads `key` as an owned value, propagating a decode failure. `Ok(None)`
+    /// means the field (or spec) is unauthored; `Err` means a present field
+    /// could not be decoded. Read accessors swallow the error via
+    /// [`get`](Self::get); read-modify-write authoring keeps it so an
+    /// undecodable field is not mistaken for "absent" and overwritten.
+    pub fn field(&self, key: &str) -> Result<Option<vt::Value>, sdf::DataError> {
+        Ok(self.data.try_field(&self.path, key)?.map(|c| c.into_owned()))
+    }
+
+    /// Reads `key` as `T`, treating a missing field, a decode failure, and a
+    /// type mismatch all as `None`. The typed read accessor; `T = vt::Value`
+    /// returns the raw value. Read-modify-write authoring uses
+    /// [`field`](Self::field) instead, which keeps the decode error so an
+    /// undecodable field is never mistaken for absent and overwritten.
+    pub fn get<T: TryFrom<vt::Value>>(&self, key: impl AsRef<str>) -> Option<T> {
+        self.field(key.as_ref()).ok().flatten()?.get()
+    }
+
+    /// Reads `key` as `T` for authoring, keeping every failure: `Ok(None)`
+    /// when unauthored, a decode failure as a `DataError`, and a field
+    /// holding any variant but the one `expected` names as
+    /// `SpecError::FieldType`. The read behind every declaration field an
+    /// authoring path consults, so a malformed field is never mistaken for
+    /// absent.
+    pub(crate) fn typed_field<T: TryFrom<vt::Value>>(
+        &self,
+        key: sdf::FieldKey,
+        expected: &'static str,
+    ) -> Result<Option<T>, sdf::AuthoringError> {
+        let Some(value) = self.field(key.as_str())? else {
+            return Ok(None);
+        };
+        T::try_from(value).map(Some).map_err(|_| {
+            SpecError::FieldType {
+                field: key.as_str(),
+                expected,
+            }
+            .into()
+        })
+    }
+
+    /// Whether `key` is authored on this spec.
+    pub fn has_field(&self, key: &str) -> bool {
+        self.data.has_field(&self.path, key)
+    }
+
+    /// The authored field names on this spec, in authored order.
+    pub fn fields(&self) -> Vec<String> {
+        self.data.list_fields(&self.path).unwrap_or_default()
+    }
+}
+
+impl<'a, B> Spec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Sets (or replaces) `key`.
+    pub fn set(&mut self, key: impl AsRef<str>, value: impl Into<vt::Value>) {
+        self.data.set_field(&self.path, key.as_ref(), value.into());
+    }
+
+    /// Removes `key` if authored.
+    pub fn erase(&mut self, key: &str) {
+        self.data.erase_field(&self.path, key);
+    }
+
+    /// Rewrites with `f` the list op `key` holds, an op holding nothing
+    /// where the field is unauthored (C++ `SdfListEditorProxy` over the
+    /// field); a field holding anything else is
+    /// [`FieldType`](sdf::SpecError::FieldType), never overwritten. The op
+    /// is written back, or the field erased where the op is left neither
+    /// explicit nor holding an item.
+    pub fn edit_list<T, R>(
+        &mut self,
+        key: sdf::FieldKey,
+        f: impl FnOnce(&mut sdf::ListOp<T>) -> R,
+    ) -> Result<R, sdf::AuthoringError>
+    where
+        T: Clone + PartialEq + Hash,
+        sdf::ListOp<T>: Into<vt::Value> + TryFrom<vt::Value>,
+    {
+        let held = self.typed_field::<sdf::ListOp<T>>(key, "list op")?.unwrap_or_default();
+        // TODO(perf): the op is copied and compared whole on every edit; `f`
+        // reporting whether it changed anything would spare a long list both.
+        let mut op = held.clone();
+        let result = f(&mut op);
+        if op != held {
+            set_or_erase(
+                &mut *self.data,
+                &self.path,
+                key.as_str(),
+                (!op.is_empty()).then(|| op.into()),
+            );
+        }
+        Ok(result)
+    }
+}
+
+/// Typed view of a prim spec. Parallel to C++ `SdfPrimSpec`.
+///
+/// Read-only over a shared borrow. [`PrimSpecMut`] aliases this same
+/// handle with an exclusive borrow, so it has both read and write methods.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
+pub struct PrimSpec<'a, B>(Spec<'a, B>);
+
+/// Read-only typed view of a prim spec.
+pub type PrimSpecRef<'a> = PrimSpec<'a, &'a dyn sdf::AbstractData>;
+
+/// Mutable typed view of a prim spec. Parallel to C++ `SdfPrimSpec`.
+pub type PrimSpecMut<'a> = PrimSpec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a> PrimSpecRef<'a> {
+    /// Returns a read-only view of the prim spec at `path`, or `None` if no
+    /// prim spec exists there. A variant spec (`/Prim{set=sel}`) is viewed as
+    /// a prim spec too, as C++ `SdfVariantSpec::GetPrimSpec` views it.
+    pub(crate) fn get(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        holds_prim(data, &path).then(|| Self::at(data, path))
+    }
+
+    /// A read-only view of `path` in `data`, checking no spec kind: for data
+    /// holding no spec at `path`, where every accessor answers as for an
+    /// unauthored field. Over a spec of another kind it would read that
+    /// spec's fields; [`get`](Self::get) is the checked constructor.
+    pub(crate) fn at(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Self {
+        Self(Spec::wrap(data, path))
+    }
+}
+
+impl<'a> PrimSpecMut<'a> {
+    /// Returns a mutable view of the prim spec at `path`, or `None` if no prim
+    /// spec exists there. A variant spec is viewed as one too, as
+    /// [`PrimSpecRef::get`] views it.
+    pub(crate) fn get(data: &'a mut dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        holds_prim(data, &path).then(|| Self(Spec::wrap(data, path)))
+    }
+
+    /// Create or upgrade the prim spec at `path` with `specifier` and
+    /// `type_name`, mirroring C++ `SdfPrimSpec::New`. An empty `type_name`
+    /// leaves `typeName` unauthored. Missing ancestor specs are created as
+    /// `over` and each parent's `primChildren` is updated. When `data` is a
+    /// layer's staging overlay, the structural change is captured when the layer
+    /// derives its [`ChangeList`](sdf::ChangeList) at flush.
+    pub fn new(
+        data: &'a mut dyn sdf::AbstractData,
+        path: impl sdf::IntoPath,
+        specifier: sdf::Specifier,
+        type_name: impl Into<String>,
+    ) -> Result<Self, sdf::AuthoringError> {
+        let path = sdf::try_into_path(path)?;
+        let type_name: String = type_name.into();
+        require_prim_leaf(&path)?;
+        ensure_prim_chain(data, &path)?;
+        data.set_field(
+            &path,
+            sdf::FieldKey::Specifier.as_str(),
+            vt::Value::Specifier(specifier),
+        );
+        if !type_name.is_empty() {
+            data.set_field(&path, sdf::FieldKey::TypeName.as_str(), vt::Value::token(type_name));
+        }
+        Ok(Self::get(data, path).expect("ensure_prim_chain created a prim spec"))
+    }
+
+    /// Ensure an `over` prim spec exists at `path`, creating it and any missing
+    /// ancestors as `over` while leaving existing `def`/`class` specs unchanged.
+    /// Mirrors C++ `SdfCreatePrimInLayer` / `UsdStage::OverridePrim`.
+    ///
+    /// A variant-selection leaf (`/Prim{set=sel}`) names the variant spec,
+    /// which is created with its variant set and viewed as a prim spec, as C++
+    /// `SdfCreatePrimInLayer` authors inside a variant. No `specifier` is
+    /// authored on it. The pseudo-root, a property path and a bare
+    /// variant-set path (`/Prim{set=}`) are
+    /// [`InvalidPath`](sdf::AuthoringError::InvalidPath).
+    pub fn over(data: &'a mut dyn sdf::AbstractData, path: impl sdf::IntoPath) -> Result<Self, sdf::AuthoringError> {
+        let path = sdf::try_into_path(path)?;
+        ensure_prim_chain(data, &path)?;
+        Ok(Self::get(data, path).expect("ensure_prim_chain created a prim or variant spec"))
+    }
+}
+
+impl<'a, B> PrimSpec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Authored `typeName` (e.g. `"Xform"`, `"Mesh"`). `None` if unset.
+    pub fn type_name(&self) -> Option<tf::Token> {
+        self.get(sdf::FieldKey::TypeName)
+    }
+
+    /// Authored `specifier` (`def`, `over`, `class`). `None` if unset.
+    pub fn specifier(&self) -> Option<sdf::Specifier> {
+        self.get(sdf::FieldKey::Specifier)
+    }
+
+    /// Authored `kind` metadata (e.g. `"component"`, `"group"`).
+    pub fn kind(&self) -> Option<tf::Token> {
+        self.get(sdf::FieldKey::Kind)
+    }
+
+    /// Authored `active` flag. `None` if unset (USD defaults to active).
+    pub fn is_active(&self) -> Option<bool> {
+        self.get(sdf::FieldKey::Active)
+    }
+
+    /// Authored `hidden` flag.
+    pub fn is_hidden(&self) -> Option<bool> {
+        self.get(sdf::FieldKey::Hidden)
+    }
+
+    /// Authored `instanceable` flag.
+    pub fn is_instanceable(&self) -> Option<bool> {
+        self.get(sdf::FieldKey::Instanceable)
+    }
+
+    /// Names of child prims, in declared order. `None` if unset.
+    pub fn prim_children(&self) -> Option<Vec<tf::Token>> {
+        self.get(sdf::ChildrenKey::PrimChildren)
+    }
+
+    /// Names of child properties, in declared order. `None` if unset.
+    pub fn property_children(&self) -> Option<Vec<tf::Token>> {
+        self.get(sdf::ChildrenKey::PropertyChildren)
+    }
+
+    /// Authored `apiSchemas` list op, if present.
+    pub fn api_schemas(&self) -> Option<sdf::TokenListOp> {
+        self.get(sdf::FieldKey::ApiSchemas)
+    }
+
+    /// The variant selections the spec authors, by variant set (C++
+    /// `SdfPrimSpec::GetVariantSelections`). An empty selection is a blocked
+    /// one; a set the spec says nothing about has no entry.
+    pub fn variant_selections(&self) -> HashMap<String, String> {
+        self.get(sdf::FieldKey::VariantSelection).unwrap_or_default()
+    }
+
+    /// The authored `variantSetNames` list op (C++
+    /// `SdfPrimSpec::GetVariantSetNameList`).
+    pub fn variant_set_names(&self) -> Option<sdf::StringListOp> {
+        self.get(sdf::FieldKey::VariantSetNames)
+    }
+}
+
+impl<'a, B> PrimSpec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Set the `typeName` field. An empty `name` clears the field instead of
+    /// authoring `vt::Value::Token("")`, so a prim with no type round-trips
+    /// identically to one whose type was never authored.
+    pub fn set_type_name(&mut self, name: impl Into<tf::Token>) {
+        let name = name.into();
+        if name.is_empty() {
+            self.erase(sdf::FieldKey::TypeName.as_str());
+        } else {
+            self.set(sdf::FieldKey::TypeName.as_str(), vt::Value::Token(name));
+        }
+    }
+
+    /// Set the `specifier` field.
+    pub fn set_specifier(&mut self, specifier: sdf::Specifier) {
+        self.set(sdf::FieldKey::Specifier.as_str(), vt::Value::Specifier(specifier));
+    }
+
+    /// Select `selection` in variant set `set` (C++
+    /// `SdfPrimSpec::SetVariantSelection`). Both must be valid variant names.
+    /// The empty name is [`sdf::AuthoringError::EmptyVariantSelection`], where
+    /// C++ erases the entry: a blocked selection is
+    /// [`block_variant_selection`](Self::block_variant_selection)'s, and no
+    /// selection [`clear_variant_selection`](Self::clear_variant_selection)'s.
+    pub fn set_variant_selection(&mut self, set: &str, selection: &str) -> Result<(), sdf::AuthoringError> {
+        if selection.is_empty() {
+            return Err(sdf::AuthoringError::EmptyVariantSelection {
+                prim: self.path().clone(),
+                set: set.to_string(),
+            });
+        }
+        self.path().append_variant_selection(set, selection)?;
+        self.edit_variant_selections(|selections| {
+            selections.insert(set.to_string(), selection.to_string()).as_deref() != Some(selection)
+        })
+    }
+
+    /// Drop the selection of variant set `set`, so a weaker one composes (C++
+    /// `SdfPrimSpec::SetVariantSelection(set, "")`).
+    pub fn clear_variant_selection(&mut self, set: &str) -> Result<(), sdf::AuthoringError> {
+        self.edit_variant_selections(|selections| selections.remove(set).is_some())
+    }
+
+    /// Select no variant of `set`, a valid variant set name, hiding the
+    /// selections weaker layers author (C++
+    /// `SdfPrimSpec::BlockVariantSelection`).
+    pub fn block_variant_selection(&mut self, set: &str) -> Result<(), sdf::AuthoringError> {
+        self.path().append_variant_selection(set, "")?;
+        self.edit_variant_selections(|selections| {
+            selections.insert(set.to_string(), String::new()).as_deref() != Some("")
+        })
+    }
+
+    /// Create the spec of variant set `name` under this prim, listing it in
+    /// `variantSetChildren`, and answer whether it was created (C++
+    /// `SdfVariantSetSpec::New`).
+    pub fn add_variant_set(&mut self, name: &str) -> Result<bool, sdf::AuthoringError> {
+        let path = self.path().append_variant_selection(name, "")?;
+        let created = self.0.data.spec_type(&path).is_none();
+        ensure_variant_set(&mut *self.0.data, &path)?;
+        Ok(created)
+    }
+
+    /// Create the spec of variant `name` in variant set `set`, with the set
+    /// itself where it is missing, and answer whether the variant was created
+    /// (C++ `SdfVariantSpec::New`).
+    pub fn add_variant(&mut self, set: &str, name: &str) -> Result<bool, sdf::AuthoringError> {
+        let path = self.path().append_variant_selection(set, name)?;
+        let created = self.0.data.spec_type(&path).is_none();
+        ensure_prim_chain(&mut *self.0.data, &path)?;
+        Ok(created)
+    }
+
+    /// Rewrite the `variantSelection` map through `edit`, which answers whether
+    /// it changed the map, erasing the field once it holds no entry. An edit
+    /// that changes nothing writes nothing.
+    fn edit_variant_selections(
+        &mut self,
+        edit: impl FnOnce(&mut HashMap<String, String>) -> bool,
+    ) -> Result<(), sdf::AuthoringError> {
+        let mut selections: HashMap<String, String> = self
+            .typed_field(sdf::FieldKey::VariantSelection, "VariantSelectionMap")?
+            .unwrap_or_default();
+        if !edit(&mut selections) {
+            return Ok(());
+        }
+        let key = sdf::FieldKey::VariantSelection.as_str();
+        match selections.is_empty() {
+            true => self.erase(key),
+            false => self.set(key, vt::Value::VariantSelectionMap(selections)),
+        }
+        Ok(())
+    }
+
+    /// The `inheritPaths` list as it is edited (C++
+    /// `SdfPrimSpec::GetInheritPathList`), anchored at the prim less its
+    /// variant selections.
+    pub fn edit_inherits(&mut self) -> sdf::PathListEdit<'_, 'a, B> {
+        let anchor = self.path().prim_path().strip_variant_selections();
+        sdf::PathListEdit::new(self, sdf::FieldKey::InheritPaths, anchor)
+    }
+
+    /// The `specializes` list as it is edited (C++
+    /// `SdfPrimSpec::GetSpecializesPathList`), anchored at the prim less its
+    /// variant selections.
+    pub fn edit_specializes(&mut self) -> sdf::PathListEdit<'_, 'a, B> {
+        let anchor = self.path().prim_path().strip_variant_selections();
+        sdf::PathListEdit::new(self, sdf::FieldKey::Specializes, anchor)
+    }
+
+    /// Set the `kind` metadata.
+    pub fn set_kind(&mut self, kind: impl Into<tf::Token>) {
+        self.set(sdf::FieldKey::Kind.as_str(), vt::Value::token(kind));
+    }
+
+    /// Set the `active` flag.
+    pub fn set_active(&mut self, active: bool) {
+        self.set(sdf::FieldKey::Active.as_str(), vt::Value::Bool(active));
+    }
+
+    /// Set the `hidden` flag.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.set(sdf::FieldKey::Hidden.as_str(), vt::Value::Bool(hidden));
+    }
+
+    /// Set the `instanceable` flag.
+    pub fn set_instanceable(&mut self, instanceable: bool) {
+        self.set(sdf::FieldKey::Instanceable.as_str(), vt::Value::Bool(instanceable));
+    }
+
+    /// Add an applied API schema token to this prim's `apiSchemas` list op.
+    ///
+    /// Mirrors C++ `UsdPrim::AddAppliedSchema`. When the schema is not yet
+    /// authored locally in any opinion bucket, the name is pushed onto
+    /// `explicit_items` for explicit ops, otherwise onto `prepended_items`.
+    /// Existing explicit/prepended/appended opinions are left in place and
+    /// treated as already applied (no duplicate add). A local delete of the
+    /// same name is always removed so applying a schema in the same edit
+    /// target cancels an earlier removal.
+    ///
+    /// Returns `Ok(true)` whenever the local list op changed (whether by
+    /// adding the schema, by clearing a pending delete, or both); `Ok(false)`
+    /// when the call was a no-op.
+    pub fn add_applied_schema(&mut self, name: impl Into<String>) -> Result<bool, sdf::AuthoringError> {
+        let name: tf::Token = name.into().into();
+        self.edit_list(sdf::FieldKey::ApiSchemas, |op| add_applied_schema_to_list_op(op, name))
+    }
+}
+
+fn add_applied_schema_to_list_op(op: &mut sdf::TokenListOp, name: tf::Token) -> bool {
+    let already_applied = op.explicit_items().contains(&name)
+        || op.prepended_items().contains(&name)
+        || op.appended_items().contains(&name)
+        // Non-explicit `add` opinions already contribute the schema without changing list position.
+        || (!op.is_explicit() && op.added_items().contains(&name));
+
+    let changed = op.remove_item(sdf::ListOpType::Deleted, &name);
+
+    if already_applied {
+        return changed;
+    }
+
+    let ty = match op.is_explicit() {
+        true => sdf::ListOpType::Explicit,
+        false => sdf::ListOpType::Prepended,
+    };
+    op.push(ty, name);
+    true
+}
+
+/// Typed view of the layer's root pseudo-spec. Parallel to C++
+/// `SdfPseudoRootSpec`; carries layer-wide metadata (`defaultPrim`,
+/// `subLayers`, time codes, etc.).
+///
+/// Read-only over a shared borrow. [`PseudoRootSpecMut`] aliases this
+/// same handle with an exclusive borrow, so it has both read and write methods.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
+pub struct PseudoRootSpec<'a, B>(Spec<'a, B>);
+
+/// Read-only typed view of the layer's root pseudo-spec.
+pub type PseudoRootSpecRef<'a> = PseudoRootSpec<'a, &'a dyn sdf::AbstractData>;
+
+/// Mutable typed view of the layer's root pseudo-spec. Parallel to C++ `SdfPseudoRootSpec`.
+pub type PseudoRootSpecMut<'a> = PseudoRootSpec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a> PseudoRootSpecRef<'a> {
+    /// Returns a read-only view of the pseudo-root spec, or `None` if the
+    /// layer has no pseudo-root spec.
+    pub(crate) fn get(data: &'a dyn sdf::AbstractData) -> Option<Self> {
+        matches!(data.spec_type(&sdf::Path::abs_root()), Some(sdf::SpecType::PseudoRoot)).then(|| Self::at(data))
+    }
+
+    /// A read-only view of the pseudo-root path in `data`, checking no spec
+    /// kind: for data holding no spec there; [`get`](Self::get) is the
+    /// checked constructor.
+    pub(crate) fn at(data: &'a dyn sdf::AbstractData) -> Self {
+        Self(Spec::wrap(data, sdf::Path::abs_root()))
+    }
+}
+
+impl<'a> PseudoRootSpecMut<'a> {
+    /// Returns a mutable view of the pseudo-root spec, or `None` if the layer
+    /// has no pseudo-root spec.
+    pub(crate) fn get(data: &'a mut dyn sdf::AbstractData) -> Option<Self> {
+        let path = sdf::Path::abs_root();
+        matches!(data.spec_type(&path), Some(sdf::SpecType::PseudoRoot)).then(|| Self(Spec::wrap(data, path)))
+    }
+}
+
+impl<'a, B> PseudoRootSpec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// `defaultPrim` token, if authored.
+    pub fn default_prim(&self) -> Option<tf::Token> {
+        self.get(sdf::FieldKey::DefaultPrim)
+    }
+
+    /// Sublayer asset paths in strength order (strongest first).
+    pub fn sublayers(&self) -> Option<Vec<String>> {
+        self.get(sdf::FieldKey::SubLayers)
+    }
+
+    /// Namespace relocations authored in this layer's metadata.
+    pub fn relocates(&self) -> Option<sdf::RelocateList> {
+        self.get(sdf::FieldKey::LayerRelocates)
+    }
+
+    /// The layer's `doc` field.
+    pub fn doc(&self) -> Option<String> {
+        self.get(sdf::FieldKey::Documentation)
+    }
+
+    /// Layer start time code.
+    pub fn start_time_code(&self) -> Option<f64> {
+        self.get(sdf::FieldKey::StartTimeCode)
+    }
+
+    /// Layer end time code.
+    pub fn end_time_code(&self) -> Option<f64> {
+        self.get(sdf::FieldKey::EndTimeCode)
+    }
+
+    /// Time codes per second.
+    pub fn time_codes_per_second(&self) -> Option<f64> {
+        self.get(sdf::FieldKey::TimeCodesPerSecond)
+    }
+
+    /// Frames per second.
+    pub fn frames_per_second(&self) -> Option<f64> {
+        self.get(sdf::FieldKey::FramesPerSecond)
+    }
+
+    /// The `colorConfiguration` asset, if authored (C++
+    /// `SdfLayer::GetColorConfiguration`).
+    pub fn color_configuration(&self) -> Option<sdf::AssetPath> {
+        self.get(sdf::FieldKey::ColorConfiguration)
+    }
+
+    /// The `colorManagementSystem` token, if authored (C++
+    /// `SdfLayer::GetColorManagementSystem`).
+    pub fn color_management_system(&self) -> Option<tf::Token> {
+        self.get(sdf::FieldKey::ColorManagementSystem)
+    }
+
+    /// Number of decimal digits printed for sub-frame time codes.
+    pub fn frame_precision(&self) -> Option<i32> {
+        self.get(sdf::FieldKey::FramePrecision)
+    }
+
+    /// Names of root prims in declared order.
+    pub fn prim_children(&self) -> Option<Vec<tf::Token>> {
+        self.get(sdf::ChildrenKey::PrimChildren)
+    }
+}
+
+impl<'a, B> PseudoRootSpec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Set the `defaultPrim` token without validation.
+    ///
+    /// This spec-tier setter writes whatever token it is given. The
+    /// validating front door is [`crate::sdf::LayerEdit::set_default_prim`],
+    /// which rejects malformed values; use this method when you need to
+    /// bypass that check (e.g. round-tripping spec data verbatim).
+    pub fn set_default_prim(&mut self, name: impl Into<tf::Token>) {
+        self.set(sdf::FieldKey::DefaultPrim.as_str(), vt::Value::token(name));
+    }
+
+    /// Replace the sublayer list with the given asset paths.
+    pub fn set_sublayers<I, S>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let paths: Vec<String> = paths.into_iter().map(Into::into).collect();
+        self.set(sdf::FieldKey::SubLayers.as_str(), vt::Value::StringVec(paths));
+    }
+
+    /// Replace this layer's namespace relocations with `relocates`. An empty list
+    /// authors an explicit "no relocates" opinion, distinct from clearing the
+    /// field, which removes the opinion entirely.
+    pub fn set_relocates(&mut self, relocates: sdf::RelocateList) {
+        self.set(sdf::FieldKey::LayerRelocates.as_str(), vt::Value::Relocates(relocates));
+    }
+
+    /// Replace this layer's `expressionVariables` dictionary — the named values an
+    /// `${VAR}` expression resolves against in a sublayer asset path or a
+    /// reference/payload target (C++ layer expression variables, composed across
+    /// the layer stack and arcs by `pcp`). An empty map authors an explicit empty
+    /// dictionary, distinct from clearing the field, which removes the opinion
+    /// entirely.
+    pub fn set_expression_variables(&mut self, vars: HashMap<String, vt::Value>) {
+        self.set(
+            sdf::FieldKey::ExpressionVariables.as_str(),
+            vt::Value::Dictionary(vars.into()),
+        );
+    }
+
+    /// Append a sublayer asset path. Duplicate entries are preserved because
+    /// USD layer offsets and strength ordering make repeated sublayer arcs
+    /// meaningful. Always writes the field as `vt::Value::StringVec` so the
+    /// USDA/USDC writers emit it (they match `StringVec` only).
+    pub fn add_sublayer(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        let mut paths = self.sublayer_paths().unwrap_or_default();
+        paths.push(path);
+        self.set(sdf::FieldKey::SubLayers.as_str(), vt::Value::StringVec(paths));
+    }
+
+    /// Insert a sublayer asset path and its layer offset at `pos` (clamped to
+    /// the current sublayer count), keeping `subLayers` and `subLayerOffsets`
+    /// index-aligned. A shorter `subLayerOffsets` is padded with
+    /// [`LayerOffset::IDENTITY`](sdf::LayerOffset::IDENTITY) so the offset at
+    /// every position matches its sublayer. Writes `subLayers` as
+    /// `vt::Value::StringVec` so the USDA/USDC writers emit it.
+    pub fn insert_sublayer(&mut self, pos: usize, path: impl Into<String>, offset: sdf::LayerOffset) {
+        let mut paths = self.sublayer_paths().unwrap_or_default();
+        let mut offsets = self.sublayer_offsets(paths.len());
+        let pos = pos.min(paths.len());
+        paths.insert(pos, path.into());
+        offsets.insert(pos, offset);
+        self.set(sdf::FieldKey::SubLayers.as_str(), vt::Value::StringVec(paths));
+        self.set(
+            sdf::FieldKey::SubLayerOffsets.as_str(),
+            vt::Value::LayerOffsetVec(offsets),
+        );
+    }
+
+    /// Remove the first `subLayers` entry matching `path` and its aligned
+    /// `subLayerOffsets` entry, returning whether anything was removed.
+    pub fn remove_sublayer(&mut self, path: &str) -> bool {
+        let Some(mut paths) = self.sublayer_paths() else {
+            return false;
+        };
+        let Some(idx) = paths.iter().position(|p| p == path) else {
+            return false;
+        };
+        let mut offsets = self.sublayer_offsets(paths.len());
+        paths.remove(idx);
+        offsets.remove(idx);
+        self.set(sdf::FieldKey::SubLayers.as_str(), vt::Value::StringVec(paths));
+        self.set(
+            sdf::FieldKey::SubLayerOffsets.as_str(),
+            vt::Value::LayerOffsetVec(offsets),
+        );
+        true
+    }
+
+    /// Reads and decodes the `subLayers` field (a `StringVec` of asset-path
+    /// strings). `None` when unauthored or stored with an unexpected value type.
+    /// Read-only: every caller rewrites the field with its own `set`, so this
+    /// must not erase it (an erase-then-bail would drop a malformed value).
+    fn sublayer_paths(&self) -> Option<Vec<String>> {
+        self.get(sdf::FieldKey::SubLayers)
+    }
+
+    /// Reads and decodes the `subLayerOffsets` field, padded to `len` with
+    /// [`LayerOffset::IDENTITY`](sdf::LayerOffset::IDENTITY) so it stays
+    /// index-aligned with the sublayer paths.
+    fn sublayer_offsets(&self, len: usize) -> Vec<sdf::LayerOffset> {
+        let mut offsets = self
+            .get::<Vec<sdf::LayerOffset>>(sdf::FieldKey::SubLayerOffsets)
+            .unwrap_or_default();
+        offsets.resize(len, sdf::LayerOffset::IDENTITY);
+        offsets
+    }
+
+    /// Set the layer's `doc` field.
+    pub fn set_doc(&mut self, doc: impl Into<String>) {
+        self.set(sdf::FieldKey::Documentation.as_str(), vt::Value::String(doc.into()));
+    }
+
+    /// Set the layer start time code.
+    pub fn set_start_time_code(&mut self, time: f64) {
+        self.set(sdf::FieldKey::StartTimeCode.as_str(), vt::Value::Double(time));
+    }
+
+    /// Set the layer end time code.
+    pub fn set_end_time_code(&mut self, time: f64) {
+        self.set(sdf::FieldKey::EndTimeCode.as_str(), vt::Value::Double(time));
+    }
+
+    /// Set the time codes per second.
+    pub fn set_time_codes_per_second(&mut self, rate: f64) {
+        self.set(sdf::FieldKey::TimeCodesPerSecond.as_str(), vt::Value::Double(rate));
+    }
+
+    /// Set the frames per second.
+    pub fn set_frames_per_second(&mut self, rate: f64) {
+        self.set(sdf::FieldKey::FramesPerSecond.as_str(), vt::Value::Double(rate));
+    }
+
+    /// Set the number of decimal digits printed for sub-frame time codes.
+    pub fn set_frame_precision(&mut self, precision: i32) {
+        self.set(sdf::FieldKey::FramePrecision.as_str(), vt::Value::Int(precision));
+    }
+
+    /// Set the `colorConfiguration` asset.
+    pub fn set_color_configuration(&mut self, config: impl Into<sdf::AssetPath>) {
+        self.set(
+            sdf::FieldKey::ColorConfiguration.as_str(),
+            vt::Value::AssetPath(config.into()),
+        );
+    }
+
+    /// Set the `colorManagementSystem` token.
+    pub fn set_color_management_system(&mut self, cms: impl Into<tf::Token>) {
+        self.set(sdf::FieldKey::ColorManagementSystem.as_str(), vt::Value::token(cms));
+    }
+}
+
+/// Typed view shared by attributes and relationships. Parallel to C++
+/// `SdfPropertySpec`; carries the `variability` / `custom` metadata common to
+/// both property kinds.
+///
+/// [`AttributeSpec`] and [`RelationshipSpec`] wrap this, so its accessors are
+/// reachable on them through `Deref`.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
+pub struct PropertySpec<'a, B>(Spec<'a, B>);
+
+/// Read-only typed view of a property spec.
+pub type PropertySpecRef<'a> = PropertySpec<'a, &'a dyn sdf::AbstractData>;
+
+/// Mutable typed view of a property spec. Parallel to C++ `SdfPropertySpec`.
+pub type PropertySpecMut<'a> = PropertySpec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a, B> PropertySpec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Property variability. Defaults to [`sdf::Variability::Varying`] if unset.
+    pub fn variability(&self) -> sdf::Variability {
+        self.get(sdf::FieldKey::Variability)
+            .unwrap_or(sdf::Variability::Varying)
+    }
+
+    /// Whether the property is `custom`. Defaults to `false` if unset.
+    pub fn is_custom(&self) -> bool {
+        self.get(sdf::FieldKey::Custom).unwrap_or(false)
+    }
+}
+
+impl<'a, B> PropertySpec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Set the `custom` flag.
+    pub fn set_custom(&mut self, custom: bool) {
+        self.set(sdf::FieldKey::Custom.as_str(), vt::Value::Bool(custom));
+    }
+}
+
+/// Typed view of an attribute spec. Parallel to C++ `SdfAttributeSpec`
+/// (a `SdfPropertySpec`).
+///
+/// Read-only over a shared borrow. [`AttributeSpecMut`] aliases this
+/// same handle with an exclusive borrow, so it has both read and write methods.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
+pub struct AttributeSpec<'a, B>(PropertySpec<'a, B>);
+
+/// Read-only typed view of an attribute spec.
+pub type AttributeSpecRef<'a> = AttributeSpec<'a, &'a dyn sdf::AbstractData>;
+
+/// Mutable typed view of an attribute spec. Parallel to C++ `SdfAttributeSpec`.
+pub type AttributeSpecMut<'a> = AttributeSpec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a> AttributeSpecRef<'a> {
+    /// Returns a read-only view of the attribute spec at `path`, or `None` if
+    /// no attribute spec exists there.
+    pub(crate) fn get(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        matches!(data.spec_type(&path), Some(sdf::SpecType::Attribute)).then(|| Self::at(data, path))
+    }
+
+    /// A read-only view of `path` in `data`, checking no spec kind: for data
+    /// holding no spec at `path`, where every accessor answers as for an
+    /// unauthored field. Over a spec of another kind it would read that
+    /// spec's fields; [`get`](Self::get) is the checked constructor.
+    pub(crate) fn at(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Self {
+        Self(PropertySpec(Spec::wrap(data, path)))
+    }
+}
+
+impl<'a> AttributeSpecMut<'a> {
+    /// Returns a mutable view of the attribute spec at `path`, or `None` if no
+    /// attribute spec exists there.
+    pub(crate) fn get(data: &'a mut dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        matches!(data.spec_type(&path), Some(sdf::SpecType::Attribute))
+            .then(|| Self(PropertySpec(Spec::wrap(data, path))))
+    }
+
+    /// Create an attribute spec at `path` (a property path like
+    /// `/World/Mesh.points`), mirroring C++ `SdfAttributeSpec::New`. The owning
+    /// prim is auto-created as `over` if missing and its `propertyChildren` is
+    /// updated. `type_name` and `variability` are construction parameters; the
+    /// type is stored as spelled, and only an empty spelling is rejected (an
+    /// unregistered one is carried, as C++'s `FindOrCreateType` temporary is).
+    /// A spec already at `path` is an error: a declaration is never rewritten.
+    pub fn new(
+        data: &'a mut dyn sdf::AbstractData,
+        path: impl sdf::IntoPath,
+        type_name: impl Into<sdf::ValueTypeName>,
+        variability: sdf::Variability,
+        custom: bool,
+    ) -> Result<Self, sdf::AuthoringError> {
+        let path = sdf::try_into_path(path)?;
+        let type_name = type_name.into();
+        if type_name.as_str().is_empty() {
+            return Err(sdf::ValueTypeError::Empty.into());
+        }
+        create_property_spec(
+            data,
+            &path,
+            sdf::SpecType::Attribute,
+            Some(type_name),
+            variability,
+            custom,
+        )?;
+        Ok(Self::get(data, path).expect("created above"))
+    }
+}
+
+/// The states an attribute's `timeSamples` field can legitimately be in.
+///
+/// A whole-field value block is a valid opinion that blocks weaker layers'
+/// samples (the resolver honours it, and C++ authors it through
+/// `SdfLayer::SetTimeSample`), so it is distinct from a malformed field.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TimeSamplesField {
+    Absent,
+    Blocked,
+    Samples(sdf::TimeSampleMap),
+}
+
+impl<'a, B> AttributeSpec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Attribute value type name (e.g. `double`, `float3[]`) as spelled in the
+    /// `typeName` field; a spelling the type table does not know reads back as
+    /// an unregistered name (C++ `SdfPropertySpec::GetTypeName`).
+    pub fn type_name(&self) -> Option<sdf::ValueTypeName> {
+        self.get::<tf::Token>(sdf::FieldKey::TypeName)
+            .map(sdf::ValueTypeName::from)
+    }
+
+    /// The declared type, read fallibly for authoring: `Ok(None)` when the
+    /// spec has no `typeName`, a decode failure as a `DataError`, and a field
+    /// holding anything but a token as `SpecError::FieldType`. The
+    /// read-modify-write setters and stage authoring read this, so a malformed
+    /// declaration is an error.
+    pub(crate) fn declared_type(&self) -> Result<Option<sdf::ValueTypeName>, sdf::AuthoringError> {
+        Ok(self
+            .typed_field::<tf::Token>(sdf::FieldKey::TypeName, "token")?
+            .map(sdf::ValueTypeName::from))
+    }
+
+    /// The `timeSamples` field in its three legitimate states, read fallibly:
+    /// a decode failure is a `DataError`, and a value that is neither a sample
+    /// map nor a block is `SpecError::FieldType`.
+    pub(crate) fn time_samples_field(&self) -> Result<TimeSamplesField, sdf::AuthoringError> {
+        Ok(match self.field(sdf::FieldKey::TimeSamples.as_str())? {
+            None => TimeSamplesField::Absent,
+            Some(vt::Value::ValueBlock | vt::Value::None) => TimeSamplesField::Blocked,
+            Some(vt::Value::TimeSamples(map)) => TimeSamplesField::Samples(map),
+            Some(_) => {
+                return Err(SpecError::FieldType {
+                    field: sdf::FieldKey::TimeSamples.as_str(),
+                    expected: "TimeSamples",
+                }
+                .into());
+            }
+        })
+    }
+
+    /// Default value, if authored.
+    pub fn default(&self) -> Option<vt::Value> {
+        self.get(sdf::FieldKey::Default)
+    }
+
+    /// Time-sample map, if authored. Ordered as an [`sdf::TimeSampleMap`] is
+    /// whenever a reader or [`AttributeSpecMut::set_time_sample`] established
+    /// the field; this reads it back as stored, so a raw field write is
+    /// returned as it was written.
+    pub fn time_samples(&self) -> Option<Vec<(f64, vt::Value)>> {
+        self.get(sdf::FieldKey::TimeSamples)
+    }
+
+    /// The unit this attribute's values are expressed in (C++
+    /// `SdfAttributeSpec::GetDisplayUnit`): the authored `displayUnit`, and
+    /// otherwise the unit its declared type measures in.
+    ///
+    /// Total, because a unit is always wanted and never worth an error. A
+    /// `displayUnit` naming no unit, or holding something that is not a name
+    /// at all, falls back the way an unauthored one does, and a spec with no
+    /// `typeName` — or one the type table does not know — answers
+    /// [`sdf::Unit::Default`]. Whatever was authored stays readable as the
+    /// field it was written as.
+    pub fn display_unit(&self) -> sdf::Unit {
+        self.get::<tf::Token>(sdf::FieldKey::DisplayUnit)
+            .and_then(|name| sdf::Unit::from_name(name.as_str()))
+            .unwrap_or_else(|| self.type_name().map_or(sdf::Unit::Default, |ty| ty.default_unit()))
+    }
+
+    /// The `colorSpace` token, if authored (C++
+    /// `SdfAttributeSpec::GetColorSpace`).
+    pub fn color_space(&self) -> Option<tf::Token> {
+        self.get(sdf::FieldKey::ColorSpace)
+    }
+
+    /// Whether the spec authors `colorSpace` (C++
+    /// `SdfAttributeSpec::HasColorSpace`).
+    pub fn has_color_space(&self) -> bool {
+        self.has_field(sdf::FieldKey::ColorSpace.as_str())
+    }
+
+    /// `allowedTokens` array, if authored.
+    pub fn allowed_tokens(&self) -> Option<Vec<tf::Token>> {
+        self.get(sdf::FieldKey::AllowedTokens)
+    }
+
+    /// Authored `connectionPaths` list op, if present.
+    pub fn connection_path_list(&self) -> Option<sdf::PathListOp> {
+        self.get(sdf::FieldKey::ConnectionPaths)
+    }
+
+    /// Whether `connectionPaths` is authored as a list op that says something:
+    /// an explicit list, empty or not, or one with items (C++
+    /// `SdfAttributeSpec::HasConnectionPaths`).
+    pub fn has_connection_paths(&self) -> bool {
+        self.connection_path_list().is_some_and(|op| !op.is_empty())
+    }
+}
+
+impl<'a, B> AttributeSpec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Set the `default` value, coerced to the declared type (C++
+    /// `SdfPropertySpec::SetDefaultValue`): a block always passes, a value of
+    /// the declared kind is stored as is, a convertible one is converted
+    /// through [`Value::coerce_to_kind`](vt::Value::coerce_to_kind), and a
+    /// relative path expression is anchored against the owning prim. Fails
+    /// when the spec declares no usable type or the value does not fit.
+    pub fn set_default(&mut self, value: impl Into<vt::Value>) -> Result<(), sdf::AuthoringError> {
+        let value = self.coerce_for_declared(value.into())?;
+        self.set_default_raw(value);
+        Ok(())
+    }
+
+    /// Clear any authored `default`.
+    pub fn clear_default(&mut self) {
+        self.erase(sdf::FieldKey::Default.as_str());
+    }
+
+    /// Insert or replace a time sample at `time`, coerced like
+    /// [`set_default`](Self::set_default) (C++ `SdfLayer::SetTimeSample`).
+    /// Samples are kept sorted by time so consumers can binary-search.
+    pub fn set_time_sample(&mut self, time: f64, value: impl Into<vt::Value>) -> Result<(), sdf::AuthoringError> {
+        let value = self.coerce_for_declared(value.into())?;
+        self.set_time_sample_raw(time, value)
+    }
+
+    /// Replace every time sample with `samples`, each coerced like
+    /// [`set_default`](Self::set_default), in one write (C++
+    /// `SdfLayer::SetField` of `timeSamples`). Where two samples share a time
+    /// the later wins. No sample is written when one does not fit.
+    pub fn set_time_samples(
+        &mut self,
+        samples: impl IntoIterator<Item = (f64, vt::Value)>,
+    ) -> Result<(), sdf::AuthoringError> {
+        let mut map = Vec::new();
+        for (time, value) in samples {
+            upsert_time_sample(&mut map, time, self.coerce_for_declared(value)?);
+        }
+        self.set(sdf::FieldKey::TimeSamples.as_str(), vt::Value::TimeSamples(map));
+        Ok(())
+    }
+
+    /// Redeclare the value type (C++ `SdfAttributeSpec::SetTypeName`). An
+    /// empty spelling is rejected, and the spec's `default` and every time
+    /// sample must pass the new type's
+    /// [`validate`](sdf::ValueTypeName::validate) — a block passes, an opaque
+    /// value never does — so the spec stays self-consistent with the values it
+    /// holds. C++ writes the token as plain metadata; the validation is this
+    /// crate's divergence. A whole-field sample block is accepted without
+    /// decoding a sample.
+    pub fn set_type_name(&mut self, type_name: impl Into<sdf::ValueTypeName>) -> Result<(), sdf::AuthoringError> {
+        let type_name = type_name.into();
+        if type_name.as_str().is_empty() {
+            return Err(sdf::ValueTypeError::Empty.into());
+        }
+        if let Some(default) = self.field(sdf::FieldKey::Default.as_str())? {
+            type_name.validate(&default)?;
+        }
+        // TODO(perf): `time_samples_field` clones the map to classify it; a
+        // borrowed classification would validate the samples in place.
+        if let TimeSamplesField::Samples(samples) = self.time_samples_field()? {
+            for (_, sample) in &samples {
+                type_name.validate(sample)?;
+            }
+        }
+        self.set(sdf::FieldKey::TypeName.as_str(), vt::Value::Token(type_name.as_token()));
+        Ok(())
+    }
+
+    /// Writes `default` as given, with no coercion. For the stage tier, which
+    /// validates against the composed declaration before it writes.
+    pub(crate) fn set_default_raw(&mut self, value: vt::Value) {
+        self.set(sdf::FieldKey::Default.as_str(), value);
+    }
+
+    /// Inserts or replaces the sample at `time` as given, with no coercion. A
+    /// whole-field block starts a fresh map, like an absent field (C++
+    /// `SdfData::SetTimeSample` replaces a non-map field the same way). For
+    /// the stage tier, which validates against the composed declaration
+    /// before it writes.
+    pub(crate) fn set_time_sample_raw(&mut self, time: f64, value: vt::Value) -> Result<(), sdf::AuthoringError> {
+        self.insert_time_samples_raw([(time, value)])
+    }
+
+    /// Inserts or replaces each of `samples` as given, with no coercion, in
+    /// one write of the sample map, the later of two at one time winning. A
+    /// whole-field block starts a fresh map, as in
+    /// [`set_time_sample_raw`](Self::set_time_sample_raw).
+    pub(crate) fn insert_time_samples_raw(
+        &mut self,
+        samples: impl IntoIterator<Item = (f64, vt::Value)>,
+    ) -> Result<(), sdf::AuthoringError> {
+        // TODO(perf): the upsert reads, clones and rewrites the whole map, so
+        // authoring n samples one call at a time is quadratic; an in-place
+        // sample insert on `AbstractData` would make it linear.
+        let mut map = match self.time_samples_field()? {
+            TimeSamplesField::Samples(map) => map,
+            TimeSamplesField::Absent | TimeSamplesField::Blocked => Vec::new(),
+        };
+        for (time, value) in samples {
+            upsert_time_sample(&mut map, time, value);
+        }
+        self.set(sdf::FieldKey::TimeSamples.as_str(), vt::Value::TimeSamples(map));
+        Ok(())
+    }
+
+    /// Erase the time sample at `time`. Returns `Ok(true)` if a sample was
+    /// removed; an absent or blocked field is `Ok(false)` and stays as it is.
+    /// If this was the last sample, the `timeSamples` field is cleared entirely
+    /// so the spec round-trips identically to one that never authored samples.
+    pub fn erase_time_sample(&mut self, time: f64) -> Result<bool, sdf::AuthoringError> {
+        let TimeSamplesField::Samples(mut map) = self.time_samples_field()? else {
+            return Ok(false);
+        };
+        let Ok(idx) = map.binary_search_by(|(t, _)| sdf::compare_sample_times(*t, time)) else {
+            return Ok(false);
+        };
+        map.remove(idx);
+        if map.is_empty() {
+            self.erase(sdf::FieldKey::TimeSamples.as_str());
+        } else {
+            self.set(sdf::FieldKey::TimeSamples.as_str(), vt::Value::TimeSamples(map));
+        }
+        Ok(true)
+    }
+
+    /// The value the declared type accepts for `value`: the declaration read
+    /// fallibly (a spec with none declares no usable type), a relative path
+    /// expression anchored against the owning prim, then the declared type's
+    /// coercion.
+    fn coerce_for_declared(&self, value: vt::Value) -> Result<vt::Value, sdf::AuthoringError> {
+        let declared = self.declared_type()?.ok_or(sdf::ValueTypeError::Empty)?;
+        let mut anchor = None;
+        let value = value
+            .map_path_expressions(|expr| {
+                expr.make_absolute(anchor.get_or_insert_with(|| self.path().nearest_prim_path()))
+            })
+            .unwrap_or(value);
+        Ok(declared.coerce(value)?)
+    }
+
+    /// Set the `colorSpace` token (C++ `SdfAttributeSpec::SetColorSpace`).
+    pub fn set_color_space(&mut self, color_space: impl Into<tf::Token>) {
+        self.set(sdf::FieldKey::ColorSpace.as_str(), vt::Value::token(color_space));
+    }
+
+    /// Clear any authored `colorSpace` (C++
+    /// `SdfAttributeSpec::ClearColorSpace`).
+    pub fn clear_color_space(&mut self) {
+        self.erase(sdf::FieldKey::ColorSpace.as_str());
+    }
+
+    /// Set the `allowedTokens` array.
+    pub fn set_allowed_tokens<I, S>(&mut self, tokens: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<tf::Token>,
+    {
+        let tokens: Vec<tf::Token> = tokens.into_iter().map(Into::into).collect();
+        self.set(sdf::FieldKey::AllowedTokens.as_str(), vt::Value::TokenVec(tokens));
+    }
+
+    /// The `connectionPaths` list as it is edited (C++
+    /// `SdfAttributeSpec::GetConnectionPathList`).
+    pub fn edit_connections(&mut self) -> sdf::PathListEdit<'_, 'a, B> {
+        let anchor = self.path().prim_path();
+        sdf::PathListEdit::new(self, sdf::FieldKey::ConnectionPaths, anchor)
+    }
+}
+
+/// Inserts or replaces the sample at `time` in `map`'s order (see
+/// [`sdf::TimeSampleMap`]); a replaced sample keeps the time as it was
+/// spelled.
+fn upsert_time_sample(map: &mut Vec<(f64, vt::Value)>, time: f64, value: vt::Value) {
+    match map.binary_search_by(|(t, _)| sdf::compare_sample_times(*t, time)) {
+        Ok(idx) => map[idx].1 = value,
+        Err(idx) => map.insert(idx, (time, value)),
+    }
+}
+
+/// Typed view of a relationship spec. Parallel to C++ `SdfRelationshipSpec`
+/// (a `SdfPropertySpec`).
+///
+/// Read-only over a shared borrow. [`RelationshipSpecMut`] aliases this
+/// same handle with an exclusive borrow, so it has both read and write methods.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
+pub struct RelationshipSpec<'a, B>(PropertySpec<'a, B>);
+
+/// Read-only typed view of a relationship spec.
+pub type RelationshipSpecRef<'a> = RelationshipSpec<'a, &'a dyn sdf::AbstractData>;
+
+/// Mutable typed view of a relationship spec. Parallel to C++ `SdfRelationshipSpec`.
+pub type RelationshipSpecMut<'a> = RelationshipSpec<'a, &'a mut dyn sdf::AbstractData>;
+
+impl<'a> RelationshipSpecRef<'a> {
+    /// Returns a read-only view of the relationship spec at `path`, or `None`
+    /// if no relationship spec exists there.
+    pub(crate) fn get(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        matches!(data.spec_type(&path), Some(sdf::SpecType::Relationship)).then(|| Self::at(data, path))
+    }
+
+    /// A read-only view of `path` in `data`, checking no spec kind: for data
+    /// holding no spec at `path`, where every accessor answers as for an
+    /// unauthored field. Over a spec of another kind it would read that
+    /// spec's fields; [`get`](Self::get) is the checked constructor.
+    pub(crate) fn at(data: &'a dyn sdf::AbstractData, path: sdf::Path) -> Self {
+        Self(PropertySpec(Spec::wrap(data, path)))
+    }
+}
+
+impl<'a> RelationshipSpecMut<'a> {
+    /// Returns a mutable view of the relationship spec at `path`, or `None` if
+    /// no relationship spec exists there.
+    pub(crate) fn get(data: &'a mut dyn sdf::AbstractData, path: sdf::Path) -> Option<Self> {
+        matches!(data.spec_type(&path), Some(sdf::SpecType::Relationship))
+            .then(|| Self(PropertySpec(Spec::wrap(data, path))))
+    }
+
+    /// Create a relationship spec at `path`, mirroring C++
+    /// `SdfRelationshipSpec::New`. The owning prim is auto-created as `over` if
+    /// missing and its `propertyChildren` is updated. `variability` and `custom`
+    /// are construction parameters.
+    pub fn new(
+        data: &'a mut dyn sdf::AbstractData,
+        path: impl sdf::IntoPath,
+        variability: sdf::Variability,
+        custom: bool,
+    ) -> Result<Self, sdf::AuthoringError> {
+        let path = sdf::try_into_path(path)?;
+        create_property_spec(data, &path, sdf::SpecType::Relationship, None, variability, custom)?;
+        Ok(Self::get(data, path).expect("created above"))
+    }
+}
+
+impl<'a, B> RelationshipSpec<'a, B>
+where
+    B: Deref<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// Authored `targetPaths` list op, if present.
+    pub fn target_path_list(&self) -> Option<sdf::PathListOp> {
+        self.get(sdf::FieldKey::TargetPaths)
+    }
+}
+
+impl<'a, B> RelationshipSpec<'a, B>
+where
+    B: DerefMut<Target = dyn sdf::AbstractData + 'a>,
+{
+    /// The `targetPaths` list as it is edited (C++
+    /// `SdfRelationshipSpec::GetTargetPathList`).
+    pub fn edit_targets(&mut self) -> sdf::PathListEdit<'_, 'a, B> {
+        let anchor = self.path().prim_path();
+        sdf::PathListEdit::new(self, sdf::FieldKey::TargetPaths, anchor)
+    }
+}
+
+/// Create the property spec at `path` (a property path), shared by
+/// [`AttributeSpec::new`] and [`RelationshipSpec::new`]. Auto-creates the owning
+/// prim chain as `over`, registers `property_name` in `propertyChildren`, then
+/// authors `typeName` (attributes only), `variability`, and `custom`. A spec
+/// already at `path`, of either kind, is an error (C++ `SdfLayer::_CreateSpec`):
+/// a declaration is never rewritten, and a caller that wants get-or-create
+/// looks the spec up first.
+pub(crate) fn create_property_spec(
+    data: &mut dyn sdf::AbstractData,
+    path: &sdf::Path,
+    spec_type: sdf::SpecType,
+    type_name: Option<sdf::ValueTypeName>,
+    variability: sdf::Variability,
+    custom: bool,
+) -> Result<(), sdf::AuthoringError> {
+    let (prim_path, property_name) = split_property_path(path)?;
+    if data.has_spec(path) {
+        return Err(sdf::AuthoringError::InvalidPath {
+            path: path.clone(),
+            reason: "a property spec already exists here",
+        });
+    }
+    validate_token_vec(data, &prim_path, sdf::ChildrenKey::PropertyChildren)?;
+    ensure_prim_chain(data, &prim_path)?;
+    add_to_token_vec(data, &prim_path, sdf::ChildrenKey::PropertyChildren, &property_name)?;
+
+    data.create_spec(path.clone(), spec_type);
+    if let Some(type_name) = type_name {
+        data.set_field(
+            path,
+            sdf::FieldKey::TypeName.as_str(),
+            vt::Value::Token(type_name.as_token()),
+        );
+    }
+    let varying = variability != sdf::Variability::Varying;
+    set_or_erase(
+        data,
+        path,
+        sdf::FieldKey::Variability.as_str(),
+        varying.then_some(vt::Value::Variability(variability)),
+    );
+    set_or_erase(
+        data,
+        path,
+        sdf::FieldKey::Custom.as_str(),
+        custom.then_some(vt::Value::Bool(true)),
+    );
+    Ok(())
+}
+
+/// Author `value` at `key`, or erase the field when `value` is `None`.
+fn set_or_erase(data: &mut dyn sdf::AbstractData, path: &sdf::Path, key: &str, value: Option<vt::Value>) {
+    match value {
+        Some(value) => data.set_field(path, key, value),
+        None => data.erase_field(path, key),
+    }
+}
+
+/// Ensure prim specs exist for every ancestor of `target` and for `target`
+/// itself, creating missing ones as `over`. Updates each parent's
+/// `primChildren` to include the next name along the chain. Idempotent.
+/// `target` is an absolute, non-root prim path, or one whose leaf is a
+/// variant selection; the pseudo-root, a property path and a bare variant-set
+/// path (`/Prim{set=}`) are [`sdf::AuthoringError::InvalidPath`].
+///
+/// Errors with [`sdf::AuthoringError::InvalidPath`] if any ancestor or `target`
+/// path already holds a spec of a non-prim type — stamping `primChildren`
+/// onto an Attribute or Relationship spec would corrupt the layer.
+///
+/// Authoring a `target` that carries `{set=sel}` variant selections also
+/// materializes the variant-set / variant scaffolding along the way, which is
+/// how [`copy`](super::copy) creates a copied variant spec. A variant-selection
+/// leaf is created as the variant spec.
+pub(crate) fn ensure_prim_chain(
+    data: &mut dyn sdf::AbstractData,
+    target: &sdf::Path,
+) -> Result<(), sdf::AuthoringError> {
+    let chain = namespace_chain(target)?;
+    let abs_root = sdf::Path::abs_root();
+
+    // The first element's parent is the pseudo-root; if a spec already sits
+    // there it must be a `PseudoRoot`, or `primChildren` would be stamped onto
+    // the wrong spec type below.
+    let root_type = data.spec_type(&abs_root);
+    if matches!(root_type, Some(ty) if ty != sdf::SpecType::PseudoRoot) {
+        return Err(sdf::AuthoringError::InvalidPath {
+            path: abs_root,
+            reason: "root spec exists with a non-PseudoRoot SpecType",
+        });
+    }
+
+    // The parent of each element is positional: the preceding element, or the
+    // pseudo-root for the first.
+    let parent_of = |i: usize| if i == 0 { &abs_root } else { &chain[i - 1].path };
+
+    // First pass: every existing spec along the chain must already hold the
+    // SpecType the chain expects, and every child-list field must be a
+    // `TokenVec` (or absent). Stamping `primChildren` onto an Attribute, or a
+    // variant set onto a non-prim, would corrupt the layer.
+    for (i, elem) in chain.iter().enumerate() {
+        if let Some(existing) = data.spec_type(&elem.path)
+            && existing != elem.spec_type
+        {
+            return Err(sdf::AuthoringError::InvalidPath {
+                path: elem.path.clone(),
+                reason: "spec exists with an incompatible SpecType",
+            });
+        }
+        validate_token_vec(data, parent_of(i), elem.child_key)?;
+    }
+
+    // Materialize the pseudo-root so the first element's parent is present;
+    // every other element's parent is itself an earlier element in the chain.
+    if root_type.is_none() {
+        data.create_spec(abs_root.clone(), sdf::SpecType::PseudoRoot);
+    }
+
+    // Second pass: register each child name on its parent and create the spec.
+    for (i, elem) in chain.iter().enumerate() {
+        add_to_token_vec(data, parent_of(i), elem.child_key, &elem.child_name)?;
+
+        if data.spec_type(&elem.path).is_none() {
+            data.create_spec(elem.path.clone(), elem.spec_type);
+            // Only prim specs carry a specifier; variant set / variant specs
+            // are pure scaffolding.
+            if elem.spec_type == sdf::SpecType::Prim {
+                data.set_field(
+                    &elem.path,
+                    sdf::FieldKey::Specifier.as_str(),
+                    vt::Value::Specifier(sdf::Specifier::Over),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensure the variant-set spec at `vset_path` (a bare `/Prim{set=}` path)
+/// exists, registering the set name on the owning prim's `variantSetChildren`
+/// and creating the scaffolding spec. The owning prim chain is materialized
+/// first (as `over`), so this is correct whether reached top-down through
+/// [`copy`](super::copy) or called standalone on a fresh layer.
+pub(crate) fn ensure_variant_set(
+    data: &mut dyn sdf::AbstractData,
+    vset_path: &sdf::Path,
+) -> Result<(), sdf::AuthoringError> {
+    let invalid = |reason: &'static str| sdf::AuthoringError::InvalidPath {
+        path: vset_path.clone(),
+        reason,
+    };
+    let prim = vset_path
+        .parent()
+        .ok_or_else(|| invalid("variant-set path has no owning prim"))?;
+    let set = vset_path
+        .variant_set_name()
+        .ok_or_else(|| invalid("path is not a variant-set path"))?;
+    ensure_prim_chain(data, &prim)?;
+    add_to_token_vec(data, &prim, sdf::ChildrenKey::VariantSetChildren, set)?;
+    if data.spec_type(vset_path).is_none() {
+        data.create_spec(vset_path.clone(), sdf::SpecType::VariantSet);
+    }
+    Ok(())
+}
+
+/// One spec on the namespace chain from the pseudo-root down to an authoring
+/// target, in root → leaf order. A variant selection `{set=sel}` expands into
+/// two elements: the variant set spec (`/Prim{set=}`) registered under the
+/// owning prim's `variantSetChildren`, then the variant spec (`/Prim{set=sel}`)
+/// registered under the variant set's `variantChildren`.
+///
+/// The parent is positional — every element's parent is the preceding element
+/// (or the pseudo-root for the first), so it isn't stored. `child_name` is kept
+/// because it is not recoverable from `path` for variant elements
+/// (`/Prim{set=}.name()` is `Prim{set=}`, not the set name `set`).
+struct ChainElement {
+    /// Path of the spec to ensure.
+    path: sdf::Path,
+    /// Spec type to create at `path` if absent.
+    spec_type: sdf::SpecType,
+    /// Child-list field on the parent that records `child_name`.
+    child_key: sdf::ChildrenKey,
+    /// Name to register in the parent's child list.
+    child_name: String,
+}
+
+/// Validate that `target` is an authorable prim path and invoke `emit` for
+/// each of its components ([`sdf::Path::components`]) in root → leaf order.
+///
+/// Adds the authoring rules on top of the shared prim-path grammar: `target`
+/// must be absolute, non-root, and non-property, every prim name and variant
+/// set / selection must be a USD identifier, and the whole path must parse (no
+/// malformed tail). Both [`require_prim_path`] (validate only, no allocation)
+/// and [`namespace_chain`] (build the spec chain) drive this, so they cannot
+/// drift apart.
+fn parse_prim_path(
+    target: &sdf::Path,
+    mut emit: impl FnMut(sdf::PathComponent<'_>),
+) -> Result<(), sdf::AuthoringError> {
+    let invalid = |reason: &'static str| sdf::AuthoringError::InvalidPath {
+        path: target.clone(),
+        reason,
+    };
+    if !target.is_abs() || target.is_abs_root() {
+        return Err(invalid("expected absolute non-root prim path"));
+    }
+    if target.is_property() {
+        return Err(invalid("expected prim path, got property path"));
+    }
+
+    let mut components = target.components();
+    for component in components.by_ref() {
+        match component {
+            sdf::PathComponent::Prim(name) => {
+                if !sdf::Path::is_valid_identifier(name) {
+                    return Err(invalid("prim path component is not a USD identifier"));
+                }
+            }
+            sdf::PathComponent::Variant { set, selection } => {
+                if !sdf::Path::is_valid_variant_identifier(set) {
+                    return Err(invalid("variant set name is not a valid variant identifier"));
+                }
+                if selection.is_empty() || !sdf::Path::is_valid_variant_identifier(selection) {
+                    return Err(invalid("variant selection is not a valid variant identifier"));
+                }
+            }
+        }
+        emit(component);
+    }
+    if !components.remainder().is_empty() {
+        return Err(invalid("malformed prim path"));
+    }
+    Ok(())
+}
+
+/// The specs [`ensure_prim_chain`] makes sure of for `target`, root-most
+/// first, each with the spec type it creates where the layer holds none: a
+/// prim, a variant set or a variant. What an authoring plan predicts a prim
+/// write will create, read from the rule that creates it.
+pub(crate) fn prim_chain(
+    target: &sdf::Path,
+) -> Result<impl DoubleEndedIterator<Item = (sdf::Path, sdf::SpecType)>, sdf::AuthoringError> {
+    Ok(namespace_chain(target)?
+        .into_iter()
+        .map(|element| (element.path, element.spec_type)))
+}
+
+/// Decompose `target` — a prim path that may contain `{set=sel}` variant
+/// selections — into the ordered chain of specs that must exist for it to be
+/// authorable. Validation and grammar live in [`parse_prim_path`].
+fn namespace_chain(target: &sdf::Path) -> Result<Vec<ChainElement>, sdf::AuthoringError> {
+    let mut elems = Vec::new();
+    let mut cursor = sdf::Path::abs_root();
+
+    parse_prim_path(target, |component| match component {
+        sdf::PathComponent::Prim(name) => {
+            let path = cursor.append_path(name).expect("name validated as an identifier");
+            elems.push(ChainElement {
+                path: path.clone(),
+                spec_type: sdf::SpecType::Prim,
+                child_key: sdf::ChildrenKey::PrimChildren,
+                child_name: name.to_owned(),
+            });
+            cursor = path;
+        }
+        sdf::PathComponent::Variant { set, selection } => {
+            elems.push(ChainElement {
+                path: cursor
+                    .append_variant_selection(set, "")
+                    .expect("validated by parse_prim_path"),
+                spec_type: sdf::SpecType::VariantSet,
+                child_key: sdf::ChildrenKey::VariantSetChildren,
+                child_name: set.to_owned(),
+            });
+            let variant_path = cursor
+                .append_variant_selection(set, selection)
+                .expect("validated by parse_prim_path");
+            elems.push(ChainElement {
+                path: variant_path.clone(),
+                spec_type: sdf::SpecType::Variant,
+                child_key: sdf::ChildrenKey::VariantChildren,
+                child_name: selection.to_owned(),
+            });
+            cursor = variant_path;
+        }
+    })?;
+    Ok(elems)
+}
+
+/// Insert `name` into the `TokenVec` field at `key` on the spec at `owner_path`,
+/// creating the field if absent. No-op if the name is already present.
+///
+// TODO(perf): this clones the parent's whole child-name `TokenVec` per insert
+// (read-into-owned → push → write back), so registering N siblings is O(N^2).
+// An in-place `AbstractData` append hook (default clone-set, overridden by
+// `Data` to `spec_mut` + `Vec::push`) would make each registration O(1).
+fn add_to_token_vec(
+    data: &mut dyn sdf::AbstractData,
+    owner_path: &sdf::Path,
+    key: sdf::ChildrenKey,
+    name: &str,
+) -> Result<(), sdf::AuthoringError> {
+    // A decode error must surface, not be mistaken for an absent field — the
+    // `None` arm overwrites, which would silently drop an undecodable child
+    // list on a lazy backend.
+    let existing = try_child_field(data, owner_path, key)?.map(Cow::into_owned);
+    match existing {
+        Some(vt::Value::TokenVec(mut v)) => {
+            if !v.iter().any(|n| *n == name) {
+                v.push(name.into());
+                data.set_field(owner_path, key.as_str(), vt::Value::TokenVec(v));
+            }
+        }
+        Some(_) => {
+            return Err(sdf::AuthoringError::InvalidPath {
+                path: owner_path.clone(),
+                reason: "child-list field exists with non-TokenVec value",
+            });
+        }
+        None => {
+            data.set_field(owner_path, key.as_str(), vt::Value::TokenVec(vec![name.into()]));
+        }
+    }
+    Ok(())
+}
+
+/// Remove `name` from the `TokenVec` field at `key` on the spec at `owner_path`,
+/// the inverse of [`add_to_token_vec`]. No-op when the field is absent, holds a
+/// non-`TokenVec` value, or does not contain `name`. Removing the last entry
+/// erases the field, so a spec whose children are all gone round-trips
+/// identically to one that never authored a child list.
+///
+/// A read failure on the child-list field surfaces as an [`sdf::AuthoringError`]
+/// rather than being mistaken for an absent list, matching [`add_to_token_vec`];
+/// otherwise a child whose list could not be decoded would be silently left in
+/// place after its spec is erased.
+fn remove_from_token_vec(
+    data: &mut dyn sdf::AbstractData,
+    owner_path: &sdf::Path,
+    key: sdf::ChildrenKey,
+    name: &str,
+) -> Result<(), sdf::AuthoringError> {
+    let Some(value) = try_child_field(data, owner_path, key)? else {
+        return Ok(());
+    };
+    let vt::Value::TokenVec(mut v) = value.into_owned() else {
+        return Ok(());
+    };
+    let Some(idx) = v.iter().position(|n| *n == name) else {
+        return Ok(());
+    };
+    v.remove(idx);
+    if v.is_empty() {
+        data.erase_field(owner_path, key.as_str());
+    } else {
+        data.set_field(owner_path, key.as_str(), vt::Value::TokenVec(v));
+    }
+    Ok(())
+}
+
+/// Remove the spec at `path` and reconcile the owning prim's child-name list,
+/// the structural inverse of the typed spec constructors. Returns `Ok(true)`
+/// when a spec was present and removed.
+///
+/// [`sdf::AbstractData::erase_spec`] drops a single spec record, so removing a
+/// prim erases every descendant prim and property spec under `path` as well.
+/// Once the spec(s) are erased, the leaf name is dropped from the owning prim's
+/// `primChildren` (for a prim) or `propertyChildren` (for a property) list. The
+/// pseudo-root and variant scaffolding are not removable here and yield
+/// `Ok(false)`; a child-list read failure yields an [`sdf::AuthoringError`].
+///
+/// Staged in the layer's overlay, each erase yields a `REMOVE_*` flag when the
+/// layer derives its change list at flush, so composition invalidates.
+pub(crate) fn remove_spec(data: &mut dyn sdf::AbstractData, path: &sdf::Path) -> Result<bool, sdf::AuthoringError> {
+    let (owner, name, child_key) = match data.spec_type(path) {
+        Some(sdf::SpecType::Prim) => {
+            // `erase_spec` removes only `path`, so erase the subtree's descendant
+            // prim and property specs explicitly before erasing `path` itself.
+            //
+            // TODO(perf): `spec_paths()` clones and sorts every path in the layer,
+            // so each prim removal scans the whole layer (O(n log n)); the sort is
+            // unused here. A prefix-subtree hook on `AbstractData` (default = this
+            // scan, overridden by `Data` via a `PathTable`-style child walk) would
+            // make this O(subtree size).
+            for descendant in data.spec_paths() {
+                if descendant != *path && descendant.has_prefix(path) {
+                    data.erase_spec(&descendant);
+                }
+            }
+            let Some(name) = path.name() else {
+                return Ok(false);
+            };
+            (
+                path.parent().unwrap_or_else(sdf::Path::abs_root),
+                name.to_owned(),
+                sdf::ChildrenKey::PrimChildren,
+            )
+        }
+        Some(sdf::SpecType::Attribute | sdf::SpecType::Relationship) => {
+            let Some((owner, name)) = path.split_property() else {
+                return Ok(false);
+            };
+            (owner, name.to_owned(), sdf::ChildrenKey::PropertyChildren)
+        }
+        _ => return Ok(false),
+    };
+    data.erase_spec(path);
+    remove_from_token_vec(data, &owner, child_key, &name)?;
+    Ok(true)
+}
+
+/// Verify that an authored child-list field is either absent or a `TokenVec`.
+/// Inspects the value in place, without cloning the whole child list.
+fn validate_token_vec(
+    data: &dyn sdf::AbstractData,
+    path: &sdf::Path,
+    key: sdf::ChildrenKey,
+) -> Result<(), sdf::AuthoringError> {
+    match try_child_field(data, path, key)? {
+        Some(value) if !matches!(&*value, vt::Value::TokenVec(_)) => Err(sdf::AuthoringError::InvalidPath {
+            path: path.clone(),
+            reason: "child-list field exists with non-TokenVec value",
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Read a child-list field, surfacing a decode failure as an
+/// [`sdf::AuthoringError`] rather than swallowing it to "absent".
+fn try_child_field<'a>(
+    data: &'a dyn sdf::AbstractData,
+    path: &sdf::Path,
+    key: sdf::ChildrenKey,
+) -> Result<Option<Cow<'a, vt::Value>>, sdf::AuthoringError> {
+    Ok(data.try_field(path, key.as_str())?)
+}
+
+/// Validate that `path` is an absolute, non-root, non-property path suitable
+/// for prim authoring. Each prim component must be a USD identifier, optionally
+/// carrying `{set=sel}` variant selections whose set and selection names are
+/// themselves identifiers. Shares [`parse_prim_path`] with [`namespace_chain`]
+/// so the accepted grammar stays in lock-step, but allocates nothing — it
+/// drives the parser with a no-op rather than building the spec chain.
+fn require_prim_path(path: &sdf::Path) -> Result<(), sdf::AuthoringError> {
+    parse_prim_path(path, |_| {})
+}
+
+/// Whether the spec at `path` is a prim spec or a variant spec, which is viewed
+/// as one.
+fn holds_prim(data: &dyn sdf::AbstractData, path: &sdf::Path) -> bool {
+    data.spec_type(path).is_some_and(sdf::SpecType::is_prim_or_variant)
+}
+
+/// Reject a target whose leaf is a variant selection (e.g. `/Prim{set=sel}`).
+///
+/// Such a path identifies a variant spec, which carries no specifier, so
+/// [`PrimSpec::new`] cannot author a `def` or `class` there. (Properties and
+/// children *inside* a variant — `/Prim{set=sel}.attr`, `/Prim{set=sel}child` —
+/// remain valid; only the bare variant selection as the leaf is rejected.)
+fn require_prim_leaf(path: &sdf::Path) -> Result<(), sdf::AuthoringError> {
+    if path.is_variant_selection() {
+        return Err(sdf::AuthoringError::InvalidPath {
+            path: path.clone(),
+            reason: "expected a prim path, but the leaf is a variant selection",
+        });
+    }
+    Ok(())
+}
+
+/// Split a property path like `/World/Mesh.points` into `(/World/Mesh,
+/// "points")`. Returns an error if `path` is not an absolute property path
+/// whose owning prim portion is itself a valid prim path.
+fn split_property_path(path: &sdf::Path) -> Result<(sdf::Path, String), sdf::AuthoringError> {
+    let (prim_path, suffix) = path.split_property().ok_or(sdf::AuthoringError::InvalidPath {
+        path: path.clone(),
+        reason: "expected property path",
+    })?;
+    // Owning prim must be an absolute, non-root, non-property path — guards
+    // against relative roots ("A.foo"), root-level properties ("/.foo"), and
+    // paths whose `prim_path()` returned a structurally invalid string.
+    require_prim_path(&prim_path)?;
+    // Property names are colon-separated identifiers — reject target/connection
+    // brackets, embedded dots, and other syntax that would round-trip as garbage.
+    if !suffix.split(':').all(sdf::Path::is_valid_identifier) {
+        return Err(sdf::AuthoringError::InvalidPath {
+            path: path.clone(),
+            reason: "property name must be a colon-separated identifier",
+        });
+    }
+    Ok((prim_path, suffix.to_owned()))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+    use crate::sdf::{AbstractData, Data};
+
+    /// Builds a [`Data`] with an empty spec of `ty` at `path` and returns both
+    /// so tests can construct a typed view over the abstract data.
+    pub(crate) fn data_with_spec(path: &str, ty: sdf::SpecType) -> (Data, sdf::Path) {
+        let path = sdf::path(path).expect("valid path");
+        let mut data = Data::new();
+        data.create_spec(path.clone(), ty);
+        (data, path)
+    }
+
+    /// `colorSpace` is set, reported and cleared on the attribute spec.
+    #[test]
+    fn color_space_set_clear() {
+        let (mut data, path) = data_with_spec("/p.a", sdf::SpecType::Attribute);
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        assert!(!attr.has_color_space());
+        attr.set_color_space("srgb_rec709_scene");
+        assert!(attr.has_color_space());
+        assert_eq!(attr.color_space(), Some(tf::Token::new("srgb_rec709_scene")));
+        attr.clear_color_space();
+        assert!(!attr.has_color_space());
+        assert_eq!(attr.color_space(), None);
+    }
+
+    /// An authored `displayUnit` wins; without one the declared type
+    /// answers, and anything the field cannot mean falls back the same way.
+    #[test]
+    fn display_unit_falls_back() {
+        let (mut data, path) = data_with_spec("/p.a", sdf::SpecType::Attribute);
+        data.set_field(&path, sdf::FieldKey::TypeName.as_str(), vt::Value::token("point3f"));
+
+        let unit = |data: &Data| {
+            AttributeSpecRef::get(data as &dyn AbstractData, path.clone())
+                .expect("attribute spec")
+                .display_unit()
+        };
+
+        assert_eq!(unit(&data), sdf::Unit::Meter);
+
+        data.set_field(&path, sdf::FieldKey::DisplayUnit.as_str(), vt::Value::token("mm"));
+        assert_eq!(unit(&data), sdf::Unit::Millimeter);
+
+        // A name no category uses, and a value that is not a name at all.
+        data.set_field(&path, sdf::FieldKey::DisplayUnit.as_str(), vt::Value::token("furlong"));
+        assert_eq!(unit(&data), sdf::Unit::Meter);
+        data.set_field(&path, sdf::FieldKey::DisplayUnit.as_str(), vt::Value::Int(3));
+        assert_eq!(unit(&data), sdf::Unit::Meter);
+
+        // A type that measures nothing, and no type at all.
+        data.set_field(&path, sdf::FieldKey::TypeName.as_str(), vt::Value::token("float"));
+        data.erase_field(&path, sdf::FieldKey::DisplayUnit.as_str());
+        assert_eq!(unit(&data), sdf::Unit::Default);
+        data.erase_field(&path, sdf::FieldKey::TypeName.as_str());
+        assert_eq!(unit(&data), sdf::Unit::Default);
+    }
+
+    #[test]
+    fn prim_mut_reads() {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        let mut prim = PrimSpecMut::get(&mut data, path.clone()).expect("prim spec");
+
+        prim.set_type_name("Xform");
+        prim.set_specifier(sdf::Specifier::Def);
+
+        assert_eq!(prim.type_name(), Some(tf::Token::from("Xform")));
+        assert_eq!(prim.specifier(), Some(sdf::Specifier::Def));
+    }
+
+    #[test]
+    fn add_api_schema_prepends() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(prim.add_applied_schema("MaterialBindingAPI")?);
+        assert!(prim.add_applied_schema("SkelBindingAPI")?);
+        assert!(!prim.add_applied_schema("MaterialBindingAPI")?);
+
+        let op = prim.api_schemas().expect("apiSchemas");
+        assert!(!op.is_explicit());
+        assert_eq!(
+            op.prepended_items(),
+            [tf::Token::from("MaterialBindingAPI"), tf::Token::from("SkelBindingAPI")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema_explicit() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        data.set_field(
+            &path,
+            sdf::FieldKey::ApiSchemas.as_str(),
+            vt::Value::TokenListOp(sdf::TokenListOp::explicit([tf::Token::from("ExistingAPI")])),
+        );
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(prim.add_applied_schema("NewAPI")?);
+
+        let op = prim.api_schemas().expect("apiSchemas");
+        assert!(op.is_explicit());
+        assert_eq!(
+            op.explicit_items(),
+            [tf::Token::from("ExistingAPI"), tf::Token::from("NewAPI")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema_keeps_add() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        data.set_field(
+            &path,
+            sdf::FieldKey::ApiSchemas.as_str(),
+            vt::Value::TokenListOp(sdf::TokenListOp::added(vec![tf::Token::from("ExistingAPI")])),
+        );
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(!prim.add_applied_schema("ExistingAPI")?);
+
+        let op = prim.api_schemas().expect("apiSchemas");
+        assert_eq!(op.added_items(), [tf::Token::from("ExistingAPI")]);
+        assert!(op.prepended_items().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema_clears_delete() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        data.set_field(
+            &path,
+            sdf::FieldKey::ApiSchemas.as_str(),
+            vt::Value::TokenListOp(sdf::TokenListOp::deleted(vec![tf::Token::from("RemovedAPI")])),
+        );
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(prim.add_applied_schema("RemovedAPI")?);
+
+        let op = prim.api_schemas().expect("apiSchemas");
+        assert_eq!(op.prepended_items(), [tf::Token::from("RemovedAPI")]);
+        assert!(op.deleted_items().is_empty());
+        Ok(())
+    }
+
+    /// Explicit op with the name lingering in (irrelevant) `added_items`:
+    /// `already_applied` stays false, so the schema lands in `explicit_items`.
+    #[test]
+    fn add_api_schema_stale_added() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        data.set_field(
+            &path,
+            sdf::FieldKey::ApiSchemas.as_str(),
+            vt::Value::TokenListOp(
+                sdf::TokenListOp::explicit([]).with(sdf::ListOpType::Added, [tf::Token::from("StaleAPI")]),
+            ),
+        );
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(prim.add_applied_schema("StaleAPI")?);
+
+        let op = prim.api_schemas().expect("apiSchemas");
+        assert!(op.is_explicit());
+        assert_eq!(op.explicit_items(), [tf::Token::from("StaleAPI")]);
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema_rejects_wrong_type() {
+        let (mut data, path) = data_with_spec("/p", sdf::SpecType::Prim);
+        data.set_field(
+            &path,
+            sdf::FieldKey::ApiSchemas.as_str(),
+            vt::Value::token_vec(["ExistingAPI"]),
+        );
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+
+        assert!(matches!(
+            prim.add_applied_schema("NewAPI"),
+            Err(sdf::AuthoringError::Spec(SpecError::FieldType {
+                field: "apiSchemas",
+                expected: "list op"
+            }))
+        ));
+    }
+
+    #[test]
+    fn attribute_mut_reads() {
+        let (mut data, path) = data_with_spec("/A.x", sdf::SpecType::Attribute);
+        let mut attr = AttributeSpecMut::get(&mut data, path).expect("attribute spec");
+        attr.set(sdf::FieldKey::TypeName.as_str(), vt::Value::token("int"));
+
+        attr.set_default(vt::Value::Int(42)).expect("an int fits");
+        attr.set_custom(true);
+
+        assert_eq!(attr.default(), Some(vt::Value::Int(42)));
+        assert!(attr.is_custom());
+    }
+
+    #[test]
+    fn relationship_mut_reads() {
+        let (mut data, path) = data_with_spec("/A.rel", sdf::SpecType::Relationship);
+        let mut rel = RelationshipSpecMut::get(&mut data, path).expect("relationship spec");
+        let target = sdf::Path::new("/Target").expect("valid path");
+
+        rel.edit_targets().set([target.clone()]).unwrap();
+
+        assert_eq!(
+            rel.target_path_list().and_then(|op| op.iter().next().cloned()),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn pseudo_root_mut_reads() {
+        let mut data = Data::new();
+        data.create_spec(sdf::Path::abs_root(), sdf::SpecType::PseudoRoot);
+        let mut root = PseudoRootSpecMut::get(&mut data).expect("pseudo-root spec");
+
+        root.set_default_prim("World");
+
+        assert_eq!(root.default_prim(), Some(tf::Token::from("World")));
+    }
+
+    #[test]
+    fn insert_sublayer_aligns_offsets() {
+        let mut data = Data::new();
+        data.create_spec(sdf::Path::abs_root(), sdf::SpecType::PseudoRoot);
+        let mut root = PseudoRootSpecMut::get(&mut data).expect("pseudo-root spec");
+
+        // Seed an existing sublayer with no authored offset, then insert ahead
+        // of it: the prior entry must be padded to identity so offsets stay
+        // index-aligned with paths.
+        root.set_sublayers(["b.usda"]);
+        root.insert_sublayer(0, "a.usda", sdf::LayerOffset::new(10.0, 1.0));
+
+        assert_eq!(root.sublayers(), Some(vec!["a.usda".to_string(), "b.usda".to_string()]));
+        let offsets = root
+            .field(sdf::FieldKey::SubLayerOffsets.as_str())
+            .ok()
+            .flatten()
+            .expect("offsets authored")
+            .try_as_layer_offset_vec()
+            .expect("layer-offset vec");
+        assert_eq!(
+            offsets,
+            vec![sdf::LayerOffset::new(10.0, 1.0), sdf::LayerOffset::IDENTITY]
+        );
+    }
+
+    #[test]
+    fn remove_sublayer_drops_aligned() {
+        let mut data = Data::new();
+        data.create_spec(sdf::Path::abs_root(), sdf::SpecType::PseudoRoot);
+        let mut root = PseudoRootSpecMut::get(&mut data).expect("pseudo-root spec");
+        root.insert_sublayer(0, "a.usda", sdf::LayerOffset::new(10.0, 1.0));
+        root.insert_sublayer(1, "b.usda", sdf::LayerOffset::IDENTITY);
+
+        assert!(root.remove_sublayer("a.usda"));
+        assert!(!root.remove_sublayer("missing.usda"));
+
+        assert_eq!(root.sublayers(), Some(vec!["b.usda".to_string()]));
+        let offsets = root
+            .field(sdf::FieldKey::SubLayerOffsets.as_str())
+            .ok()
+            .flatten()
+            .expect("offsets authored")
+            .try_as_layer_offset_vec()
+            .expect("layer-offset vec");
+        assert_eq!(offsets, vec![sdf::LayerOffset::IDENTITY]);
+    }
+
+    /// A [`Data`] holding an attribute spec at `/A.x` declared as `type_name`.
+    fn typed_attr(type_name: &str) -> (Data, sdf::Path) {
+        let path = sdf::path("/A.x").expect("valid path");
+        let mut data = Data::new();
+        AttributeSpec::new(&mut data, path.clone(), type_name, sdf::Variability::Varying, false)
+            .expect("attribute spec");
+        (data, path)
+    }
+
+    fn field_of(data: &Data, path: &sdf::Path, key: sdf::FieldKey) -> Option<vt::Value> {
+        data.try_field(path, key.as_str())
+            .expect("readable")
+            .map(Cow::into_owned)
+    }
+
+    #[test]
+    fn default_numeric_cast() {
+        let (mut data, path) = typed_attr("float");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default(vt::Value::Int(4)).expect("int casts to float");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::Float(4.0))
+        );
+    }
+
+    #[test]
+    fn default_mismatch_rejected() {
+        let (mut data, path) = typed_attr("float");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        let error = attr
+            .set_default(vt::Value::Token(tf::Token::from("x")))
+            .expect_err("a token is no float");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::ValueType(sdf::ValueTypeError::Mismatch { .. })
+        ));
+        assert_eq!(field_of(&data, &path, sdf::FieldKey::Default), None);
+    }
+
+    #[test]
+    fn unknown_block_only() {
+        let (mut data, path) = typed_attr("double3d[]");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default(vt::Value::ValueBlock)
+            .expect("a block fits any declaration");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::ValueBlock)
+        );
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        let error = attr
+            .set_default(vt::Value::Double(1.0))
+            .expect_err("no value fits an unknown type");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::ValueType(sdf::ValueTypeError::Unregistered { .. })
+        ));
+    }
+
+    #[test]
+    fn opaque_rejects_default() {
+        let (mut data, path) = typed_attr("opaque");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        let error = attr.set_default(vt::Value::Opaque).expect_err("opaque holds no value");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::ValueType(sdf::ValueTypeError::Opaque)
+        ));
+        attr.set_default(vt::Value::ValueBlock)
+            .expect("a block is the one value opaque takes");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::ValueBlock)
+        );
+    }
+
+    #[test]
+    fn empty_type_rejected() {
+        let path = sdf::path("/A.x").expect("valid path");
+        let mut data = Data::new();
+        let error = AttributeSpec::new(&mut data, path.clone(), "", sdf::Variability::Varying, false)
+            .expect_err("an attribute needs a type");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::ValueType(sdf::ValueTypeError::Empty)
+        ));
+        assert!(!data.has_spec(&path));
+    }
+
+    #[test]
+    fn path_expression_anchored() {
+        let (mut data, path) = typed_attr("pathExpression");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default(vt::Value::PathExpression(sdf::PathExpression::parse("Child")))
+            .expect("a path expression fits");
+        let default = field_of(&data, &path, sdf::FieldKey::Default).expect("default authored");
+        let expr = default.try_as_path_expression().expect("a path expression");
+        assert_eq!(expr.to_string(), "/A/Child");
+    }
+
+    /// A default authored on an attribute in a variant anchors at the prim
+    /// past the selection, as OpenUSD 26.11 anchors `.//` set as the
+    /// default of `/P{v=one}.m`: `/P//`.
+    #[test]
+    fn variant_expression_anchored() {
+        let path = sdf::path("/P{v=one}.m").expect("valid path");
+        let mut data = Data::new();
+        AttributeSpec::new(
+            &mut data,
+            path.clone(),
+            "pathExpression",
+            sdf::Variability::Varying,
+            false,
+        )
+        .expect("attribute spec");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default(vt::Value::PathExpression(sdf::PathExpression::parse(".//")))
+            .expect("a path expression fits");
+        let default = field_of(&data, &path, sdf::FieldKey::Default).expect("default authored");
+        assert_eq!(
+            default.try_as_path_expression().expect("a path expression").to_string(),
+            "/P//"
+        );
+    }
+
+    #[test]
+    fn time_samples_replaced() {
+        let (mut data, path) = typed_attr("float");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_time_sample(9.0, vt::Value::Float(9.0)).expect("fits");
+        attr.set_time_samples([
+            (2.0, vt::Value::Double(2.0)),
+            (1.0, vt::Value::Float(1.0)),
+            (2.0, vt::Value::Float(3.0)),
+        ])
+        .expect("each fits");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::TimeSamples),
+            Some(vt::Value::TimeSamples(vec![
+                (1.0, vt::Value::Float(1.0)),
+                (2.0, vt::Value::Float(3.0)),
+            ]))
+        );
+
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_time_samples([(4.0, vt::Value::Float(4.0)), (5.0, vt::Value::String("no".into()))])
+            .expect_err("a string is no float");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::TimeSamples),
+            Some(vt::Value::TimeSamples(vec![
+                (1.0, vt::Value::Float(1.0)),
+                (2.0, vt::Value::Float(3.0)),
+            ])),
+            "nothing is written"
+        );
+    }
+
+    #[test]
+    fn bad_time_samples_kept() {
+        let (mut data, path) = typed_attr("float");
+        let junk = vt::Value::String("not a sample map".into());
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set(sdf::FieldKey::TimeSamples.as_str(), junk.clone());
+        let error = attr
+            .set_time_sample(1.0, vt::Value::Float(1.0))
+            .expect_err("a malformed field is reported");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::Spec(SpecError::FieldType {
+                field: "timeSamples",
+                ..
+            })
+        ));
+        assert!(matches!(
+            attr.time_samples_field(),
+            Err(sdf::AuthoringError::Spec(SpecError::FieldType { .. }))
+        ));
+        assert_eq!(field_of(&data, &path, sdf::FieldKey::TimeSamples), Some(junk));
+    }
+
+    #[test]
+    fn declared_type_missing() {
+        let (mut data, path) = data_with_spec("/A.x", sdf::SpecType::Attribute);
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        assert_eq!(attr.declared_type().expect("readable"), None);
+        let error = attr
+            .set_default(vt::Value::Float(1.0))
+            .expect_err("no declaration to check against");
+        assert!(matches!(
+            error,
+            sdf::AuthoringError::ValueType(sdf::ValueTypeError::Empty)
+        ));
+        assert_eq!(field_of(&data, &path, sdf::FieldKey::Default), None);
+    }
+
+    #[test]
+    fn declared_type_not_token() {
+        let (mut data, path) = data_with_spec("/A.x", sdf::SpecType::Attribute);
+        let mut attr = AttributeSpecMut::get(&mut data, path).expect("attr spec");
+        attr.set(sdf::FieldKey::TypeName.as_str(), vt::Value::Int(3));
+        assert!(matches!(
+            attr.declared_type(),
+            Err(sdf::AuthoringError::Spec(SpecError::FieldType {
+                field: "typeName",
+                expected: "token",
+            }))
+        ));
+        assert_eq!(attr.type_name(), None, "the lenient accessor reads nothing");
+    }
+
+    #[test]
+    fn spec_new_exists() {
+        let (mut data, path) = typed_attr("float");
+        AttributeSpecMut::get(&mut data, path.clone())
+            .expect("attr spec")
+            .set_default(vt::Value::Float(1.0))
+            .expect("float fits");
+        let error = AttributeSpec::new(&mut data, path.clone(), "double", sdf::Variability::Varying, false)
+            .expect_err("creation never rewrites a declaration");
+        assert!(matches!(error, sdf::AuthoringError::InvalidPath { .. }));
+        let attr = AttributeSpecRef::get(&data, path.clone()).expect("attr spec");
+        assert_eq!(attr.type_name(), Some(sdf::ValueTypeName::FLOAT));
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::Float(1.0))
+        );
+    }
+
+    #[test]
+    fn raw_skips_coercion() {
+        let (mut data, path) = typed_attr("double");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default_raw(vt::Value::Float(1.0));
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::Float(1.0))
+        );
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_default(vt::Value::Float(2.0)).expect("float casts to double");
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::Default),
+            Some(vt::Value::Double(2.0))
+        );
+    }
+
+    #[test]
+    fn sample_signed_zero() {
+        let (mut data, path) = typed_attr("int");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_time_sample(0.0, vt::Value::Int(1)).expect("int fits");
+        attr.set_time_sample(-0.0, vt::Value::Int(2)).expect("int fits");
+        let samples = field_of(&data, &path, sdf::FieldKey::TimeSamples)
+            .expect("samples")
+            .try_as_time_samples()
+            .expect("a sample map");
+        assert_eq!(samples.len(), 1, "the two zeros are one time");
+        // Compared by bits: `-0.0 == 0.0` would accept a rewritten time.
+        assert_eq!(
+            samples[0].0.to_bits(),
+            0.0_f64.to_bits(),
+            "the time keeps its first spelling"
+        );
+        assert_eq!(samples[0].1, vt::Value::Int(2), "the later sample wins");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        assert!(attr.erase_time_sample(-0.0).expect("readable"));
+        assert_eq!(field_of(&data, &path, sdf::FieldKey::TimeSamples), None);
+    }
+
+    #[test]
+    fn sample_field_states() {
+        let (mut data, path) = typed_attr("float");
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        assert!(matches!(attr.time_samples_field(), Ok(TimeSamplesField::Absent)));
+        assert!(!attr.erase_time_sample(1.0).expect("nothing to erase"));
+
+        attr.set(sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock);
+        assert!(matches!(attr.time_samples_field(), Ok(TimeSamplesField::Blocked)));
+        assert!(!attr.erase_time_sample(1.0).expect("a block holds no sample"));
+        assert_eq!(
+            field_of(&data, &path, sdf::FieldKey::TimeSamples),
+            Some(vt::Value::ValueBlock),
+            "the block stays"
+        );
+
+        let mut attr = AttributeSpecMut::get(&mut data, path.clone()).expect("attr spec");
+        attr.set_time_sample(1.0, vt::Value::Int(3))
+            .expect("int casts to float");
+        match attr.time_samples_field().expect("readable") {
+            TimeSamplesField::Samples(samples) => assert_eq!(samples, vec![(1.0, vt::Value::Float(3.0))]),
+            other => panic!("expected samples, got {other:?}"),
+        }
+        assert!(attr.erase_time_sample(1.0).expect("the sample goes"));
+    }
+
+    /// A prim spec at `/Mat` in fresh data.
+    fn mat() -> (Data, sdf::Path) {
+        let mut data = Data::new();
+        let path = sdf::path("/Mat").expect("valid path");
+        PrimSpecMut::new(&mut data, path.clone(), sdf::Specifier::Def, "").expect("a prim spec");
+        (data, path)
+    }
+
+    #[test]
+    fn variant_selection_roundtrip() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = mat();
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+        prim.set_variant_selection("look", "wet")?;
+        prim.set_variant_selection("shape", "round")?;
+        assert_eq!(
+            prim.variant_selections(),
+            HashMap::from([
+                ("look".to_string(), "wet".to_string()),
+                ("shape".to_string(), "round".to_string()),
+            ])
+        );
+        assert!(matches!(
+            prim.set_variant_selection("look", ""),
+            Err(sdf::AuthoringError::EmptyVariantSelection { .. })
+        ));
+        // Names no variant path could hold are refused, and nothing changes.
+        assert!(prim.set_variant_selection("bad set", "x").is_err());
+        assert!(prim.block_variant_selection("").is_err());
+        assert_eq!(prim.variant_selections().len(), 2);
+        Ok(())
+    }
+
+    /// No entry, a selection and a blocked selection are three states.
+    #[test]
+    fn variant_selection_states() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = mat();
+        let mut prim = PrimSpecMut::get(&mut data, path).expect("prim spec");
+        assert!(prim.variant_selections().is_empty());
+        prim.set_variant_selection("look", "wet")?;
+        prim.block_variant_selection("look")?;
+        assert_eq!(prim.variant_selections().get("look").map(String::as_str), Some(""));
+        prim.clear_variant_selection("look")?;
+        assert!(prim.variant_selections().is_empty());
+        assert!(!prim.has_field(sdf::FieldKey::VariantSelection.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn variant_set_names_listop() {
+        let (mut data, path) = mat();
+        let names = sdf::StringListOp::prepended(["look".to_string()]);
+        data.set_field(
+            &path,
+            sdf::FieldKey::VariantSetNames.as_str(),
+            vt::Value::StringListOp(names.clone()),
+        );
+        let prim = PrimSpecRef::get(&data as &dyn AbstractData, path).expect("prim spec");
+        assert_eq!(prim.variant_set_names(), Some(names));
+    }
+
+    /// Each add answers whether it created the spec.
+    #[test]
+    fn add_variant_idempotent() -> Result<(), sdf::AuthoringError> {
+        let (mut data, path) = mat();
+        let mut prim = PrimSpecMut::get(&mut data, path.clone()).expect("prim spec");
+        assert!(prim.add_variant_set("look")?);
+        assert!(!prim.add_variant_set("look")?);
+        assert!(prim.add_variant("look", "wet")?);
+        assert!(!prim.add_variant("look", "wet")?);
+        assert!(prim.add_variant("shape", "round")?);
+        let variant = path.append_variant_selection("look", "wet")?;
+        assert_eq!(data.spec_type(&variant), Some(sdf::SpecType::Variant));
+        let set = path.append_variant_selection("shape", "")?;
+        assert_eq!(data.spec_type(&set), Some(sdf::SpecType::VariantSet));
+        Ok(())
+    }
+
+    /// A variant-selection leaf is authored as the variant spec, which takes
+    /// fields but no specifier.
+    #[test]
+    fn over_variant_leaf() -> Result<(), sdf::AuthoringError> {
+        let mut data = Data::new();
+        let variant = sdf::path("/Mat{look=wet}")?;
+        let mut spec = PrimSpecMut::over(&mut data, variant.clone())?;
+        spec.set_kind("component");
+        assert_eq!(data.spec_type(&variant), Some(sdf::SpecType::Variant));
+        assert!(!data.has_field(&variant, sdf::FieldKey::Specifier.as_str()));
+        let spec = PrimSpecRef::get(&data as &dyn AbstractData, variant).expect("a variant spec");
+        assert_eq!(spec.kind().as_deref(), Some("component"));
+        Ok(())
+    }
+
+    #[test]
+    fn over_variant_existing() -> Result<(), sdf::AuthoringError> {
+        let mut data = Data::new();
+        let variant = sdf::path("/Mat{look=wet}")?;
+        PrimSpecMut::over(&mut data, variant.clone())?.set_kind("component");
+        PrimSpecMut::new(&mut data, "/Mat{look=wet}Child", sdf::Specifier::Def, "")?;
+        let spec = PrimSpecMut::over(&mut data, variant)?;
+        assert_eq!(spec.kind().as_deref(), Some("component"));
+        assert_eq!(spec.prim_children(), Some(vec![tf::Token::new("Child")]));
+        Ok(())
+    }
+
+    #[test]
+    fn over_variant_set_refused() {
+        let mut data = Data::new();
+        assert!(PrimSpecMut::over(&mut data, "/Mat{look=}").is_err());
+    }
+}

@@ -1,0 +1,3396 @@
+//! Per-prim composition index (`PcpPrimIndex` equivalent).
+//!
+//! A [`PrimIndex`] records the strength-ordered list of layer specs that
+//! contribute opinions to a single composed prim. See the
+//! [module-level docs](super) for the full composition overview.
+
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Deref;
+use std::{iter, mem};
+
+use super::asset_resolve::AssetMode;
+use super::compose_site::{compose_arc_list_in, compose_token_children};
+use crate::sdf::schema::{ChildrenKey, FieldKey};
+use crate::sdf::{self, LayerOffset, Path};
+use crate::vt::Value;
+
+use super::diagnostics::Diagnostics;
+use super::index_store::PrimRevision;
+use super::layer_stack::LayerStackId;
+use super::mapping::MapFunction;
+use super::prim_graph::{ArcType, Node, NodeFlags, NodeId, PrimIndexGraph, RelocateKind, SpecSite, extend_reversed};
+use super::prim_indexer::{BuildResult, ExprVarDeps};
+use super::{LayerGraph, LayerId, LayerView, QueryError, VariantFallbackMap};
+
+/// How much of the composition graph a value-resolution walk visits
+/// ([`PrimIndex::live_sites`]) — C++ `Usd_Resolver`'s `skipEmptyNodes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiteScope {
+    /// Only the layers authoring a spec for this prim. Every opinion a walk can
+    /// answer from lives at one of these, so this is what a walk that reads
+    /// nothing but authored opinions visits.
+    SpecStack,
+    /// Every layer of every contributing node. A value-clip set is introduced by
+    /// `clips` metadata on an *ancestor* prim, so it can apply at a node whose
+    /// layers author no spec for this prim at all — a walk that consults clips
+    /// has to reach those sites too.
+    EveryLayer,
+}
+
+/// Composition index for a single prim.
+///
+/// Holds the composition tree as a node arena plus a strength-order
+/// projection. Value resolution walks [`nodes`](Self::nodes) (strongest first)
+/// and takes the first opinion found; tree structure is reached through
+/// [`root`](Self::root) / [`children`](Self::children).
+#[derive(Debug, Clone, Default)]
+pub struct PrimIndex {
+    /// Composition graph: node arena plus strength-order projection.
+    graph: PrimIndexGraph,
+    /// Strength-ordered prim spec stack: one [`SpecSite`] per `(node, layer)`
+    /// that authors a spec at its node's path, strongest first, so value
+    /// resolution and the `prim_stack` / `property_stack` introspection read this
+    /// precomputed list. Built by [`finalize_spec_stack`](Self::finalize_spec_stack)
+    /// and kept current by the spec-tier change refresh, which splices in the runs
+    /// of the nodes a changed site touched ([`respec_nodes`](Self::respec_nodes))
+    /// rather than rebuilding the whole thing; read through the filtered
+    /// [`live_spec_sites`](Self::live_spec_sites) view. It is a resolution-time
+    /// artifact, kept off [`PrimIndexGraph`], which a child's build seeds from.
+    spec_stack: Vec<SpecSite>,
+    /// Whether any contributing node authors `clips` or `clipSets` at its own
+    /// path. Computed alongside [`spec_stack`](Self::spec_stack), whose walk
+    /// visits exactly the sites a clip opinion can live at.
+    authors_clips: bool,
+    /// Whether a node of the build authors a payload, included or not
+    /// ([`has_payloads`](Self::has_payloads)).
+    has_payloads: bool,
+    /// The sites of the culled nodes [`cull`](Self::cull) erased from the
+    /// graph (C++ `PcpCulledDependency`). A spec authored at one of them can
+    /// bring the node back, so change processing still reaches this prim
+    /// through them.
+    culled: Vec<CulledDependency>,
+}
+
+/// A culled node erased from its [`PrimIndex`]: the site it read and what a
+/// change there translates through (C++ `PcpCulledDependency`).
+#[derive(Debug, Clone)]
+pub(crate) struct CulledDependency {
+    /// The node's arc.
+    pub(crate) arc: ArcType,
+    /// The layer stack the node composed against.
+    pub(crate) layer_stack: LayerStackId,
+    /// The node's path in that stack.
+    pub(crate) site: Path,
+    /// The path a change at [`site`](Self::site) is re-anchored on before it
+    /// maps to the root: the site itself, or for a
+    /// [`Propagated`](RelocateKind::Propagated) relocate, the path of the
+    /// first ancestor that is not one (C++ `unrelocatedSitePath`).
+    anchor: Path,
+    /// The `map_to_root` of the node the [`anchor`](Self::anchor) belongs to.
+    map_to_root: MapFunction,
+    /// How many of the kept nodes were stronger than this one: its place in
+    /// the strength order, for a query about its site.
+    pub(crate) rank: usize,
+}
+
+impl CulledDependency {
+    /// The composed path a change at `changed`, at or below
+    /// [`site`](Self::site), lands on; `None` when the node's namespace cannot
+    /// carry it.
+    pub(crate) fn translate(&self, changed: &Path) -> Option<Path> {
+        let path = if self.anchor == self.site {
+            Cow::Borrowed(changed)
+        } else {
+            Cow::Owned(changed.replace_prefix(&self.site, &self.anchor)?)
+        };
+        self.map_to_root.translate_to_target(&path)
+    }
+
+    /// The map a change at [`site`](Self::site) reaches the root through,
+    /// once re-anchored.
+    pub(crate) fn map_to_root(&self) -> &MapFunction {
+        &self.map_to_root
+    }
+}
+
+/// The cache's per-prim composition record: the composed [`PrimIndex`], the
+/// [`CompositionContext`] its children inherit, and the recoverable diagnostics
+/// its composition produced.
+///
+/// [`IndexCache`](super::index_cache::IndexCache) stores one of these per
+/// composed prim in a single [`sdf::PathTable`], so a prim's index, its child
+/// context, and its errors are inserted and dropped together as one unit. The
+/// builder and relocate evaluation receive the table to read already-composed
+/// indices; they touch only [`index`](Self::index).
+pub(crate) struct PrimEntry {
+    /// The composed prim index.
+    pub index: PrimIndex,
+    /// The context propagated from this prim to its children.
+    pub context: CompositionContext,
+    /// Recoverable composition errors recorded while building [`index`](Self::index),
+    /// replaced wholesale on each rebuild so they always reflect the current
+    /// composition.
+    pub errors: Diagnostics,
+    /// Diagnostics derived from this prim's composed *property set* rather than
+    /// from its graph — the inconsistent-property-type conflicts.
+    ///
+    /// Separate from [`errors`](Self::errors) because the two are refreshed by
+    /// different edits. A property spec appearing or vanishing changes the
+    /// composed property set while leaving the graph — and so the index —
+    /// standing, and these are replaced wholesale at that point; a rebuild
+    /// replaces both.
+    pub property_errors: Diagnostics,
+    /// Lazily-memoized resolved property targets — cached composed query output,
+    /// not authored data — keyed by property kind and suffix. Filled on the first
+    /// [`relationship_targets`] / [`connection_paths`] query for a property whose
+    /// prim composes in place and whose resolution is a pure function of this
+    /// prim's own opinions, and dropped with the entry; a `targetPaths` /
+    /// `connectionPaths` edit clears the affected keys through the value tier
+    /// ([`ScopedInvalidation`](super::index_store::ScopedInvalidation), which carries
+    /// them alongside the restale). Instance proxies, the
+    /// deleted-paths walk, and a resolution that consults cross-prim instance
+    /// state resolve live and are never cached.
+    ///
+    /// [`relationship_targets`]: super::index_cache::IndexCache::relationship_targets
+    /// [`connection_paths`]: super::index_cache::IndexCache::connection_paths
+    pub resolved_targets: HashMap<TargetMemoKey, TargetMemo>,
+    /// [`PrimIndex::is_instanceable`] for [`index`](Self::index), memoized
+    /// with the [`revision`](Self::revision) it was answered at, as C++
+    /// computes `PcpPrimIndex::IsInstanceable` once per index. It is read only
+    /// while the revision matches: after a rebuild, a restale or a spec
+    /// refresh, the next query answers afresh.
+    pub(super) instanceable: Option<(PrimRevision, bool)>,
+    /// Validity token for answers resolved from this prim's composed state.
+    ///
+    /// Written only by [`IndexStore`](super::index_store::IndexStore), which
+    /// mints every value and stamps a fresh one wherever it inserts an entry or
+    /// mutates one in place. See [`PrimRevision`].
+    pub(super) revision: PrimRevision,
+    /// The [`revision`](Self::revision) the index was built at, which a
+    /// restale of its answers keeps.
+    pub(super) built: PrimRevision,
+}
+
+/// Which path-list-op field a [`TargetMemo`] resolved. Narrower than
+/// [`FieldKey`] so the memo map admits only the two fields that carry targets,
+/// not arbitrary fields like `timeSamples`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum PropertyTargetKind {
+    /// A relationship's `targetPaths`.
+    Relationship,
+    /// An attribute's `connectionPaths`.
+    Connection,
+}
+
+/// Key into a prim's [`resolved_targets`](PrimEntry::resolved_targets) memo: the
+/// property kind plus its suffix within the prim (e.g. `.binding`), so a
+/// relationship and a same-named connection never share an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct TargetMemoKey {
+    pub kind: PropertyTargetKind,
+    pub property_suffix: String,
+}
+
+/// One property's memoized resolved-target list plus the recoverable errors its
+/// resolution surfaced, re-surfaced on a cache hit. See
+/// [`resolved_targets`](PrimEntry::resolved_targets).
+#[derive(Clone)]
+pub(crate) struct TargetMemo {
+    pub targets: Vec<Path>,
+    pub errors: Diagnostics,
+}
+
+/// Outcome of [`PrimIndex::refresh_has_specs_at`]: what the spec-tier rescan
+/// must do with the index after refreshing the affected nodes' `has_specs`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SpecRefresh {
+    /// A contributing (non-culled) node at the site was refreshed in place.
+    pub contributing: bool,
+    /// The index must be rebuilt rather than refreshed in place: a culled node at
+    /// the site gained a spec (un-cull and graft the target's subtree), or a
+    /// contributing arc target lost its last spec (cull it like an always-empty
+    /// target).
+    pub needs_rebuild: bool,
+    /// A node an arc introduced gained its first spec or lost its last. Such a
+    /// node enters or leaves an instance's key (C++
+    /// `Pcp_ChildNodeInstanceableChanged`).
+    pub arc_specs_changed: bool,
+}
+
+/// The spec runs a change round refreshed on one index: one entry per node the
+/// round scanned, holding the run of spec-stack entries that node now
+/// contributes (empty for a node that lost its last spec).
+///
+/// Keyed by node and free of repeats, so both readers find a node by binary
+/// search: [`PrimIndex::refresh_has_specs_at`] to record a scan, skipping one an
+/// earlier site in the round already made, and [`PrimIndex::respec_nodes`] to
+/// claim a node's run as the strength-order walk reaches it.
+#[derive(Debug, Default)]
+pub(crate) struct NodeRuns(Vec<(NodeId, Vec<SpecSite>)>);
+
+impl NodeRuns {
+    /// Records the run `node` contributes, in node order, and borrows it back.
+    /// `run` is called only when the round has not scanned `node` yet; a node it
+    /// already holds answers `None`, since that run is the same run either way —
+    /// every edit in the round is committed before any of it is scanned.
+    fn record_with(&mut self, node: NodeId, run: impl FnOnce() -> Vec<SpecSite>) -> Option<&[SpecSite]> {
+        let at = self.0.binary_search_by_key(&node.idx(), |(id, _)| id.idx()).err()?;
+        self.0.insert(at, (node, run()));
+        Some(&self.0[at].1)
+    }
+
+    /// Takes the run recorded for `node`, or `None` when the round left that
+    /// node alone. Runs are keyed by arena handle, which the strength order
+    /// permutes, so the walk claims each one by lookup.
+    fn take(&mut self, node: NodeId) -> Option<Vec<SpecSite>> {
+        let at = self.0.binary_search_by_key(&node.idx(), |(id, _)| id.idx()).ok()?;
+        Some(self.0.remove(at).1)
+    }
+
+    /// Whether no run is left to place — the round touched no node of this
+    /// index, or the walk has claimed every one it recorded.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A reference/payload arc's demand for a not-yet-loaded target layer or
+/// not-yet-interned target stack, carried out of the indexer (in
+/// [`BuildOutput`](super::prim_indexer::BuildOutput)) to the stage's load
+/// barrier. The bare asset path alone loses the authoring context the barrier
+/// needs: the arc-carrying stack's composed expression variables must overlay
+/// the target's own when the target's `subLayers` paths are evaluated, so the
+/// right sublayer loads (a `${VAR}` inherited across the arc resolves against
+/// the referrer's value, not only the target's local one). The demanding node's
+/// stack handle carries that context completely — the barrier reads the
+/// composed map and its variable source off the instance.
+#[derive(Debug, Clone)]
+pub(crate) struct Demand {
+    /// Anchored asset path of the demanded reference/payload target.
+    pub asset_path: String,
+    /// The demanding node's layer stack, whose composed expression variables are
+    /// the arc's full inherited context.
+    pub context: LayerStackId,
+    /// Whether the build composed without waiting for the target: a target
+    /// that failed to resolve before is reported unresolved, and this asks
+    /// the barrier to look for it once more. The index such a build produced
+    /// is complete as it stands; one from a build that waits is not.
+    pub recheck: bool,
+}
+
+impl PrimIndex {
+    /// Returns `true` if no layers contribute opinions for this prim.
+    ///
+    /// A prim with no opinions still owns the synthetic, inert tree root, and
+    /// may own culled nodes kept for structure, so emptiness is the
+    /// absence of any node that contributes to value resolution. A node carrying
+    /// its full site stack but authoring no spec at its path (an ancestral site
+    /// cloned to a child with no local opinion) likewise contributes nothing.
+    pub fn is_empty(&self) -> bool {
+        !self
+            .graph
+            .nodes()
+            .any(|node| !node.is_inert() && !node.is_culled() && node.has_specs())
+    }
+
+    /// Returns `true` if any node that contributes opinions was introduced by a
+    /// composition arc. Inert placeholders (the synthetic root, class
+    /// placeholders, and the inert relocation-source / implied-relocate nodes),
+    /// culled arc nodes (empty targets), and spec-less full-stack nodes do not
+    /// count: they add no shared content, so a prim that only references an empty
+    /// target — or only carries an inert relocate placeholder — is not treated as
+    /// composed for instancing.
+    pub(crate) fn has_composition_arc(&self) -> bool {
+        self.arena()
+            .any(|node| node.arc() != ArcType::Root && !node.is_inert() && !node.is_culled() && node.has_specs())
+    }
+
+    /// Iterates the nodes in strength order (strongest first).
+    ///
+    /// This is the order value resolution uses: it walks the strength-order
+    /// projection, so specializes appear last (spec 10.4.1) regardless of where
+    /// they sit in the arena. Inert and culled nodes are skipped — they
+    /// contribute no opinions. The iterator is cheap and re-creatable; call it
+    /// again for another pass rather than collecting.
+    pub fn nodes(&self) -> impl DoubleEndedIterator<Item = Node<'_>> + Clone {
+        self.all_nodes().filter(|node| !node.is_culled())
+    }
+
+    /// The node providing the spec `layer` holds at `path`: the strongest,
+    /// among those that contribute opinions, at `path` whose layer stack
+    /// holds `layer` (C++ `PcpPrimIndex::GetNodeProvidingSpec`); `graph`
+    /// holds the stacks. `None` where no node does.
+    pub(crate) fn node_providing_spec(&self, graph: &LayerGraph, layer: LayerId, path: &Path) -> Option<Node<'_>> {
+        self.nodes()
+            .find(|node| node.path() == path && graph.stack_contains(node.layer_stack_id(), layer))
+    }
+
+    /// Iterates every retained node in strength order, including the culled
+    /// nodes the index keeps. Skips inert nodes — the
+    /// synthetic root and the non-contributing class placeholders implied-class
+    /// propagation adds. Used for composition introspection and change tracking,
+    /// where the full arc structure matters even where it contributes no
+    /// opinions; value resolution uses [`nodes`](Self::nodes) instead.
+    pub fn all_nodes(&self) -> impl DoubleEndedIterator<Item = Node<'_>> + Clone {
+        self.ordered_nodes().filter(|node| !node.is_inert())
+    }
+
+    /// Culls the subtrees that contribute no opinion and erases them from the
+    /// graph, recording the site of each erased node a change must still reach
+    /// in [`culled`](Self::culled_dependencies) (C++
+    /// `_CullSubtreesWithNoOpinions`, `Pcp_AddCulledDependencies` and the
+    /// erasure in `PcpPrimIndex_Graph::Finalize`).
+    ///
+    /// Runs before the spec stack is built, which names nodes by handle.
+    /// Returns how many nodes of shared data the erasure copied
+    /// ([`PrimIndexGraph::erase`]).
+    fn cull(&mut self) -> usize {
+        self.graph.cull_subtrees_without_opinions();
+        let erasable = self.graph.erasable();
+        if !erasable.contains(&true) {
+            return 0;
+        }
+        let mut rank = vec![0; erasable.len()];
+        let mut kept = 0;
+        for &id in self.graph.strength_order() {
+            rank[id.idx()] = kept;
+            kept += usize::from(!erasable[id.idx()]);
+        }
+        for node in self.graph.nodes() {
+            if !erasable[node.id().idx()] || !tracks_dependency(node) {
+                continue;
+            }
+            // A propagated relocate holds the identity map: a change steps out
+            // to the first ancestor that is not one and maps through it, as
+            // `translate_dependency_path` does for a live node.
+            let mut anchor = node;
+            while anchor.relocate_kind() == Some(RelocateKind::Propagated) {
+                let Some(parent) = anchor.parent() else {
+                    break;
+                };
+                anchor = self.graph.node(parent);
+            }
+            self.culled.push(CulledDependency {
+                arc: node.arc(),
+                layer_stack: node.layer_stack_id(),
+                site: node.path().clone(),
+                anchor: anchor.path().clone(),
+                map_to_root: anchor.map_to_root().clone(),
+                rank: rank[node.id().idx()],
+            });
+        }
+        self.graph.erase(&erasable)
+    }
+
+    /// Each node's place in the strength order, by [`NodeId`]; `usize::MAX`
+    /// for a node the order omits.
+    pub(crate) fn strength_ranks(&self) -> Vec<usize> {
+        let mut rank = vec![usize::MAX; self.graph.len()];
+        for (at, &id) in self.graph.strength_order().iter().enumerate() {
+            rank[id.idx()] = at;
+        }
+        rank
+    }
+
+    /// The sites of the culled nodes erased from this index, which change
+    /// processing reaches the prim through alongside its
+    /// [`dependency_nodes`](Self::dependency_nodes).
+    pub(crate) fn culled_dependencies(&self) -> &[CulledDependency] {
+        &self.culled
+    }
+
+    /// Iterates the nodes whose sites must be tracked as dependencies of this
+    /// prim. Like [`all_nodes`](Self::all_nodes) but also surfaces inert
+    /// relocation-source nodes: their source site contributes no opinions yet an
+    /// edit there must recompose the relocated prim, so change tracking needs the
+    /// reverse-map entry.
+    pub(crate) fn dependency_nodes(&self) -> impl Iterator<Item = Node<'_>> {
+        self.ordered_nodes().filter(|&node| tracks_dependency(node))
+    }
+
+    /// Handles of the nodes at site `(layer, path)` whose dependency
+    /// registration this index would have made — the lookup counterpart of
+    /// [`Dependencies::add`](super::dependencies::Dependencies)'s registration
+    /// walk, and the set a change at that site must translate through.
+    ///
+    /// Appends handles rather than nodes so a caller can hand each straight to
+    /// [`translate_dependency_path`](Self::translate_dependency_path), which
+    /// borrows the whole index to climb parents, and so one scratch vector
+    /// serves a whole change round.
+    ///
+    /// Ordered strongest-first, matching the node range C++ rescans
+    /// (`PcpPrimIndex::GetNodeRange`). The candidates come in arena order, a
+    /// different permutation.
+    pub(crate) fn dependency_nodes_at(
+        &self,
+        prim_path: &Path,
+        layer: LayerId,
+        path: &Path,
+        graph: &LayerGraph,
+        out: &mut Vec<NodeId>,
+    ) {
+        out.clear();
+        // The strength rank doubles as the membership test: the registration
+        // walk iterates the strength projection, so a node the projection omits
+        // was never registered and must not be re-found here.
+        //
+        // TODO(perf): scans the strength order per candidate. A site carrying
+        // several nodes is rare and each run is short, so a rank table on the
+        // graph would cost more than it saves here.
+        let rank = |id: NodeId| self.graph.strength_order().iter().position(|&s| s == id);
+        out.extend(self.nodes_at(path).filter(|&id| {
+            let node = self.graph.node(id);
+            registers_site(node, prim_path) && graph.stack_contains(node.layer_stack_id(), layer) && rank(id).is_some()
+        }));
+        out.sort_by_cached_key(|&id| rank(id).expect("filtered to ranked nodes"));
+    }
+
+    /// The composed path a change at `changed` lands on for the node `node` —
+    /// this index's answer to C++ `_ProcessDependentNode`'s path translation.
+    /// `None` when the node's namespace cannot carry the path at all, which is
+    /// that function's `pathWasTranslated` gate: an unmappable path has no image
+    /// here, so there is nothing to invalidate.
+    ///
+    /// A [`Propagated`](RelocateKind::Propagated) relocate holds the identity
+    /// map, so the path first steps out into the parent's namespace and keeps
+    /// climbing while the parents are placeholders too; every other node —
+    /// a [`Direct`](RelocateKind::Direct) relocate included, whose own map
+    /// carries the rename — maps through `map_to_root` directly.
+    pub(crate) fn translate_dependency_path(&self, node: NodeId, changed: &Path) -> Option<Path> {
+        let mut id = node;
+        let mut path = Cow::Borrowed(changed);
+        while self.node(id).relocate_kind() == Some(RelocateKind::Propagated) {
+            let placeholder = self.node(id);
+            let parent = placeholder.parent()?;
+            path = Cow::Owned(path.replace_prefix(placeholder.path(), self.node(parent).path())?);
+            id = parent;
+        }
+        self.node(id).map_to_root().translate_to_target(&path)
+    }
+
+    /// Layer ids of reference/payload target roots this prim's composition
+    /// resolved to but skipped because they were muted. Their arcs grafted no
+    /// node, so these are the dependency on a muted target that toggling the mute
+    /// must fan out to (see
+    /// [`NonSiteDeps::muted_external`](super::prim_graph::NonSiteDeps)).
+    pub(crate) fn muted_external_targets(&self) -> &[LayerId] {
+        self.graph.non_site_deps().map_or(&[][..], |d| &d.muted_external)
+    }
+
+    /// Canonical identifiers of reference/payload targets this prim's composition
+    /// resolved to but skipped because they were muted before ever loading. Their
+    /// targets never interned, so — unlike
+    /// [`muted_external_targets`](Self::muted_external_targets) — there is no
+    /// [`LayerId`] to fan an unmute out by; the change machinery keys the fanout on
+    /// these identifiers instead (see
+    /// [`NonSiteDeps::muted_unloaded`](super::prim_graph::NonSiteDeps)).
+    pub(crate) fn muted_unloaded_targets(&self) -> &[String] {
+        self.graph.non_site_deps().map_or(&[][..], |d| &d.muted_unloaded)
+    }
+
+    /// Layers whose `defaultPrim` this prim's composition consulted, because a
+    /// reference or payload named no target prim. Editing that field on one of
+    /// them must recompose this prim, and when the layer had no default the arc
+    /// grafted no node, so this is the dependency's only trace (see
+    /// [`NonSiteDeps::default_prim`](super::prim_graph::NonSiteDeps)).
+    pub(crate) fn default_prim_layers(&self) -> &[LayerId] {
+        self.graph.non_site_deps().map_or(&[][..], |d| &d.default_prim)
+    }
+
+    /// Iterates the spec stack's live contributing sites — those whose node is
+    /// neither inert nor culled, the same structural filter
+    /// [`nodes`](Self::nodes) applies — each paired with its resolved node. The
+    /// single home for that filter, shared by every spec-stack consumer.
+    pub(crate) fn live_spec_sites(&self) -> impl Iterator<Item = (&SpecSite, Node<'_>)> {
+        self.spec_stack.iter().filter_map(|site| {
+            let node = self.node(site.node);
+            (!node.is_inert() && !node.is_culled()).then_some((site, node))
+        })
+    }
+
+    /// Iterates every node weakest first, each with the run of spec sites it
+    /// contributes, which is empty for a node that authors no spec. A run
+    /// lists its layers strongest first, as the spec stack does. The caller
+    /// applies whatever node filter its walk needs.
+    pub(crate) fn spec_runs_weakest_first(&self) -> impl Iterator<Item = (Node<'_>, &[SpecSite])> {
+        let mut end = self.spec_stack.len();
+        self.ordered_nodes().rev().map(move |node| {
+            let start = self.spec_stack[..end]
+                .iter()
+                .rposition(|site| site.node != node.id())
+                .map_or(0, |other| other + 1);
+            let run = &self.spec_stack[start..end];
+            end = start;
+            (node, run)
+        })
+    }
+
+    /// Iterates the `(node, layer, offset)` sites value resolution walks, in
+    /// strength order, at the breadth `scope` asks for.
+    ///
+    /// [`EveryLayer`](SiteScope::EveryLayer) yields a superset of
+    /// [`SpecStack`](SiteScope::SpecStack) in the same relative order, adding
+    /// the layers that author no spec for this prim.
+    ///
+    /// The two read different sources for that: `SpecStack` replays the
+    /// memoized [`spec_stack`](Self::spec_stack) while `EveryLayer` walks the
+    /// nodes live, so they agree only while the memo is current — which
+    /// [`rescan_specs`](super::IndexCache::rescan_specs) keeps it after a
+    /// spec-tier edit.
+    pub(crate) fn live_sites<'a>(
+        &'a self,
+        graph: &'a LayerGraph,
+        scope: SiteScope,
+    ) -> impl Iterator<Item = (Node<'a>, LayerId, LayerOffset)> {
+        let specs = (scope == SiteScope::SpecStack).then(|| {
+            self.live_spec_sites()
+                .map(|(site, node)| (node, site.layer, site.offset))
+        });
+        let every = (scope == SiteScope::EveryLayer).then(|| {
+            self.nodes().flat_map(|node| {
+                let arc_offset = node.map_to_root().time_offset();
+                graph
+                    .layer_stack(node.layer_stack_id())
+                    .iter()
+                    .map(move |&(layer, sub)| (node, layer, arc_offset.concatenate(&sub)))
+            })
+        });
+        specs.into_iter().flatten().chain(every.into_iter().flatten())
+    }
+
+    /// Iterates every node in strength order, unfiltered — the shared projection
+    /// the filtered public node iterators build on.
+    fn ordered_nodes(&self) -> impl DoubleEndedIterator<Item = Node<'_>> + Clone {
+        self.graph.strength_order().iter().map(|&id| self.graph.node(id))
+    }
+
+    /// Iterates the node arena in insertion (structural) order, the order of
+    /// [`NodeId`]. Use [`nodes`](Self::nodes) for strength-ordered resolution.
+    pub(crate) fn arena(&self) -> impl DoubleEndedIterator<Item = Node<'_>> + ExactSizeIterator + Clone {
+        self.graph.nodes()
+    }
+
+    /// Returns the underlying composition graph. The task-queue indexer seeds a
+    /// child's index from its parent prim's graph (C++
+    /// `_BuildInitialPrimIndexFromAncestor`), sharing the node data the child
+    /// leaves unchanged.
+    pub(crate) fn graph(&self) -> &PrimIndexGraph {
+        &self.graph
+    }
+
+    /// Returns the root of the composition tree, or `None` when empty.
+    ///
+    /// The root is the synthetic, inert node created first during the build;
+    /// every contributing node descends from it.
+    pub fn root(&self) -> Option<NodeId> {
+        self.graph.root().is_valid().then_some(self.graph.root())
+    }
+
+    /// The node of the prim's own site in the root layer stack, which its
+    /// direct arcs and the classes implied up to it hang off (C++
+    /// `GetRootNode`, the parentless root there); `None` for an empty index.
+    /// [`root`](Self::root) is the synthetic node above it.
+    pub fn local_root(&self) -> Option<NodeId> {
+        self.graph.local_root().valid()
+    }
+
+    /// Recomputes `has_specs` from live layer data for every node sitting at
+    /// site `(layer, path)`, reporting what the caller must do next and keeping
+    /// each refreshed node's spec-stack run in `runs`.
+    ///
+    /// The spec-tier change rescan (C++ `Pcp_RescanForSpecs`) calls this after
+    /// an inert spec add or remove, which flips only whether a site contributes
+    /// an opinion — never the graph structure — so a contributing node's flag is
+    /// refreshed in place without rebuilding or re-finalizing strength order. A
+    /// node matches when its site path is `path` and `layer` is one of its
+    /// contributing layers; its refreshed flag is whether any layer in its stack
+    /// still authors a spec there, read off the run rather than asked separately.
+    ///
+    /// The runs are the point: recomputing the flag scans the node's layer stack
+    /// for the members authoring a spec, which is what the memoized spec stack
+    /// holds for that node, so the matches are kept for
+    /// [`respec_nodes`](Self::respec_nodes). That scan is complete where the flag
+    /// alone stops at the first member answering yes; the splice pays it back,
+    /// except on the branch that ends in `needs_rebuild`, where the index is
+    /// dropped and its runs go with it — a cost that grows with the stack's
+    /// depth. `runs` accumulates across a change round's sites for one index, and
+    /// a node already in it is left alone — its run is final, since every edit in
+    /// the round is committed before classification runs.
+    ///
+    /// Two transitions are the exception, both handled by rebuilding rather than
+    /// flipping in place ([`SpecRefresh::needs_rebuild`]): a *culled* node that
+    /// gains a spec (un-culling it must graft the target's subtree), and a
+    /// contributing arc target that loses its last spec (it must cull to match an
+    /// always-empty target, so a later re-add takes the un-cull path).
+    //
+    // Each node's `layer_stack` handle is resolved against the live `graph`,
+    // which is sound because this rescan runs only on the spec-tier
+    // (non-significant) change path: an inert spec add/remove never edits
+    // `subLayers`, so the resolved members equal the node's composition-time
+    // stack. A path that rebuilds sublayer stacks goes through the significant
+    // branch, which drops the cached index instead of refreshing it.
+    pub(crate) fn refresh_has_specs_at(
+        &mut self,
+        layer: LayerId,
+        path: &Path,
+        graph: &LayerView<'_>,
+        runs: &mut NodeRuns,
+    ) -> SpecRefresh {
+        let mut refresh = SpecRefresh::default();
+        // Collected first, releasing the graph borrow so the loop can write
+        // it in place.
+        for id in self.nodes_at(path).collect::<Vec<_>>() {
+            let node = self.graph.node(id);
+            let stack = node.layer_stack_id();
+            if !graph.layer_stack(stack).iter().any(|&(li, _)| li == layer) {
+                continue;
+            }
+            refresh.contributing |= !node.is_culled();
+            // A node an earlier site in this round already refreshed keeps that
+            // answer: every edit is committed before classification runs, so the
+            // first scan saw the finished state. Several edited members of one
+            // stack are the common shape, and each is a site of its own.
+            let Some(run) = runs.record_with(id, || {
+                let mut run = Vec::new();
+                push_node_run(graph, node, id, 0, &mut run, None);
+                run
+            }) else {
+                continue;
+            };
+            let has_specs = !run.is_empty();
+            if node.is_culled() {
+                // An empty arc target the spec just filled in: rebuild so the
+                // arc un-culls and grafts the target's subtree.
+                refresh.needs_rebuild |= has_specs && !node.has_specs();
+            } else {
+                // An arc target that just lost its last spec must re-cull to
+                // match an always-empty target, so a later re-add takes the
+                // un-cull rebuild path. The local root and inert placeholders
+                // never cull.
+                let lost_last_spec = node.has_specs() && !has_specs;
+                let cullable = node.arc() != ArcType::Root && !node.is_inert();
+                refresh.needs_rebuild |= lost_last_spec && cullable;
+            }
+            refresh.arc_specs_changed |= node.arc() != ArcType::Root && node.has_specs() != has_specs;
+            self.graph.set_has_specs(id, has_specs);
+        }
+        // A culled node the graph erased that the spec fills in composes again
+        // only through a rebuild (C++ `PcpChanges::DidChangeSpecs` marking the
+        // prim in `didChangePrims`).
+        refresh.needs_rebuild |= self.culled.iter().any(|culled| {
+            culled.site == *path
+                && graph.stack_contains(culled.layer_stack, layer)
+                && stack_has_spec(graph, culled.layer_stack, path)
+        });
+        refresh
+    }
+
+    /// Arena handles of every node sitting at `path`, in arena order — the
+    /// candidate set of a change at that site. Lists every arena node there:
+    /// inert, culled, and the synthetic root.
+    fn nodes_at<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = NodeId> + 'a {
+        self.graph.nodes().filter(move |node| node.path() == path).map(Node::id)
+    }
+
+    /// Installs the spec stack and clip flag this index composes, replacing
+    /// whatever it held. Run by the index builder, the single composition seam.
+    fn finalize_spec_stack(&mut self, graph: &LayerView<'_>) {
+        let (stack, authors_clips) = self.build_spec_stack(graph);
+        self.spec_stack = stack;
+        self.authors_clips = authors_clips;
+    }
+
+    /// Replaces the spec-stack entries of the nodes a spec-tier refresh touched,
+    /// keeping every other node's entries as they stand.
+    ///
+    /// `runs` is what [`refresh_has_specs_at`](Self::refresh_has_specs_at)
+    /// collected for this index across the change round: the run each refreshed
+    /// node now contributes, empty for one that lost its last spec. A single pass
+    /// over the strength order takes each node's contiguous run from whichever
+    /// side owns it — the walk [`build_spec_stack`](Self::build_spec_stack)
+    /// makes, differing only in where each run comes from — so the result lands
+    /// ordered. The old stack is consumed as a prefix per node, since it was
+    /// built by that same walk; `runs` is keyed by arena handle, which the
+    /// strength order permutes, so a refreshed node's run is claimed by lookup
+    /// rather than in sequence. Nothing here reads a layer, there being no
+    /// [`LayerGraph`] to read one from, so the spec tier re-probes only the
+    /// layers a change named.
+    ///
+    /// `authors_clips` is carried across untouched. A clip field appearing or
+    /// disappearing is a *presence* change, which the classifier calls
+    /// significant and answers by dropping the index, so it never reaches this
+    /// path; and a node cannot gain or lose its last spec through a clip-bearing
+    /// layer without that same presence change.
+    /// [`spec_stack_matches_rebuild`](Self::spec_stack_matches_rebuild) holds the
+    /// carried flag against a freshly computed one, so the reasoning is checked
+    /// rather than trusted.
+    pub(crate) fn respec_nodes(&mut self, mut runs: NodeRuns) {
+        if runs.is_empty() {
+            return;
+        }
+        let old_len = self.spec_stack.len();
+        let mut old = mem::take(&mut self.spec_stack).into_iter().peekable();
+        let mut stack = Vec::with_capacity(old_len);
+        for &id in self.graph.strength_order() {
+            let old_run = iter::from_fn(|| old.next_if(|site| site.node == id));
+            match runs.take(id) {
+                // The refresh rescanned this node, so what it found stands in
+                // for every entry the node held.
+                Some(run) => {
+                    old_run.for_each(drop);
+                    stack.extend(run);
+                }
+                None => stack.extend(old_run),
+            }
+        }
+        let stranded_old = old.count();
+        debug_assert_eq!(stranded_old, 0, "spec stack held entries for an unordered node");
+        debug_assert!(runs.is_empty(), "a refreshed node is missing from the strength order");
+        self.spec_stack = stack;
+    }
+
+    /// The [`spec stack`](SpecSite) and clip flag this index composes from live
+    /// layer data: the strength-ordered list of `(node, layer)` sites that author
+    /// a spec at their node's path, each with the layer's time offset folded to
+    /// root (the C++ `PcpPrimIndex` spec stack). Value resolution
+    /// ([`opinions`](Self::opinions)) and the `prim_stack` / `property_stack`
+    /// introspection read the memo as their precomputed candidate sites.
+    ///
+    /// A site is recorded where the layer authors the prim spec at the node's
+    /// path (`has_spec`). A property spec requires its owning prim spec, so this
+    /// is also the candidate set for property reads; an orphan property spec (one
+    /// whose owning prim spec is absent, reachable only through malformed backend
+    /// data) is not represented.
+    ///
+    /// The walk visits every strength-ordered node, gated on
+    /// [`has_specs`](super::prim_graph::Node::has_specs) — a node with no spec on
+    /// any member contributes nothing — and leaves the stack *unfiltered* by the
+    /// inert / culled flags: those are flipped after the graph is finalized (an
+    /// instance-local inerting, often on a clone), so a pre-filtered stack would
+    /// go stale. Consumers apply the live flag filter through
+    /// [`live_spec_sites`](Self::live_spec_sites). The clip probes run only while
+    /// `authors_clips` is still false: one site answering yes settles the prim,
+    /// and the rest of the walk asks no more.
+    ///
+    /// The folded offset is stable across the spec-tier refresh and across
+    /// [`rebase_root`](Self::rebase_root): the spec tier never edits
+    /// subLayers/offsets (those drop the index), and a rebase re-anchors only the
+    /// path side of each map, leaving `map_to_root().time_offset()` intact.
+    ///
+    /// A node's members are probed from its [`spec_from`](Node::spec_from):
+    /// the indexer already found the stronger ones to author no spec.
+    fn build_spec_stack(&self, graph: &LayerView<'_>) -> (Vec<SpecSite>, bool) {
+        let mut stack = Vec::new();
+        let mut authors_clips = false;
+        for &id in self.graph.strength_order() {
+            let node = self.graph.node(id);
+            if !node.has_specs() {
+                continue;
+            }
+            push_node_run(
+                graph,
+                node,
+                id,
+                usize::from(node.spec_from()),
+                &mut stack,
+                Some(&mut authors_clips),
+            );
+        }
+        (stack, authors_clips)
+    }
+
+    /// Whether the memoized spec stack and clip flag are what a from-scratch
+    /// build composes — the spec-tier splice's self-check, asserted in debug
+    /// builds by `IndexStore::splice_spec_stacks`, the seam that holds both
+    /// halves of the contract. Every spec-tier edit in the test suite validates
+    /// the splice there, not only the shapes a test thought to construct.
+    ///
+    /// Offsets compare by bit pattern: the entries the splice keeps carry the
+    /// offset an earlier build folded, so agreement with a fresh fold is the
+    /// property under test, and an authored NaN reproduced exactly is agreement
+    /// rather than the divergence float equality would report.
+    ///
+    /// What it proves is bounded by what the rebuild reads: both sides gate on
+    /// the `has_specs` flags the refresh just wrote, so this settles where each
+    /// node's entries landed and whether the clip flag survived, not whether a
+    /// flag is itself current. The flag transitions are covered by
+    /// [`refresh_has_specs_at`](Self::refresh_has_specs_at)'s rebuild rules.
+    pub(super) fn spec_stack_matches_rebuild(&self, graph: &LayerView<'_>) -> bool {
+        let (rebuilt, authors_clips) = self.build_spec_stack(graph);
+        self.authors_clips == authors_clips
+            && self.spec_stack.len() == rebuilt.len()
+            && self
+                .spec_stack
+                .iter()
+                .zip(&rebuilt)
+                .all(|(a, b)| a.node == b.node && a.layer == b.layer && a.offset.to_bits() == b.offset.to_bits())
+    }
+
+    /// Whether this prim authors clip metadata, so a value-clip set can be
+    /// anchored here.
+    ///
+    /// Only the local half of the question value resolution asks — a set on an
+    /// ancestor sources this prim's attributes too, which
+    /// [`CompositionContext::may_have_clips`] answers.
+    pub(crate) fn authors_clips(&self) -> bool {
+        self.authors_clips
+    }
+
+    /// Whether a node of the index authors a payload, included or not: only
+    /// then does the prim's load rule decide what it composes. C++
+    /// `PcpPrimIndex::HasAnyPayloads` counts the payload arcs a node
+    /// composes; an authored field that composes none (`delete payload`)
+    /// counts here too, so such a prim is composed again as if it read the
+    /// rule.
+    pub(crate) fn has_payloads(&self) -> bool {
+        self.has_payloads
+    }
+
+    /// Classifies each node as instance-local (`true`) or shared (`false`) for an
+    /// enclosing instance at `instance_depth` (spec 11.3.3), indexed by
+    /// [`NodeId`] arena position. The shared nodes are the prototype subtree; the
+    /// instance-local nodes are the opinions authored at the instance's own
+    /// namespace, which an instance's child names, descendants, and instance key
+    /// must drop.
+    ///
+    /// `prim_depth` is the namespace depth of the prim this index composes, which
+    /// is `instance_depth` for the instance prim's own index and deeper for a
+    /// descendant composed inside the instance. Both are needed because a node
+    /// records how far below its arc's introduction its site sits, not the
+    /// absolute level the arc was introduced at; the level follows from the two.
+    ///
+    /// This is the C++ `!PcpNodeRef::HasTransitiveDirectDependency` partition.
+    /// Instance-local = the local root plus every node whose arc was introduced
+    /// strictly above the instance and whose parent is instance-local too: the
+    /// ancestral arcs of every kind (references, payloads, inherits,
+    /// specializes, variants) the instance prim is nested under. A node whose arc
+    /// was introduced at the instance's own depth or below is shared, and so is
+    /// its whole subtree, ancestral opinions it pulled in included — as C++ marks
+    /// a node added while indexing the prim as a direct dependency and
+    /// propagates the mark down its subtree, while every node the prim index
+    /// inherits from its parent's starts out as not direct.
+    ///
+    /// The parent check is what keeps a direct arc's subtree shared. An implied
+    /// class an ancestral arc derived is instance-local like that arc: its path
+    /// is the instance's own namespace under the class, so it names the instance
+    /// and contributes nothing the prototype can share.
+    ///
+    /// The arena is append-only with each node's parent preceding it, so one
+    /// forward pass propagates locality parent→child.
+    pub(crate) fn instance_local_nodes(&self, prim_depth: u16, instance_depth: u16) -> Vec<bool> {
+        // An arc introduced at the instance or below leaves this many namespace
+        // levels between its introduction and the prim being composed; anything
+        // deeper below its introduction was introduced above the instance.
+        let below_instance = prim_depth.saturating_sub(instance_depth);
+        let mut local = vec![false; self.graph.len()];
+        for (i, node) in self.graph.nodes().enumerate() {
+            // The single forward pass only reads an already-computed parent
+            // entry; a parent inserted after its child would be read as a stale
+            // `false`, silently leaking an instance-local arc into the prototype.
+            debug_assert!(
+                node.parent().is_none_or(|p| p.idx() < i),
+                "instance partition requires every node's parent to precede it in the arena"
+            );
+            local[i] = match node.arc() {
+                // The local site (and the synthetic root) is always instance-local.
+                ArcType::Root => true,
+                _ => {
+                    node.parent().is_some_and(|p| local[p.idx()])
+                        && self.graph.depth_below_introduction(NodeId(i as u32)) > below_instance
+                }
+            };
+        }
+        local
+    }
+
+    /// Classifies each node as instanceable (`true`) or not for an instance prim
+    /// at `instance_depth` whose index this is (C++
+    /// `Pcp_ChildNodeIsInstanceable`), indexed by [`NodeId`] arena position. An
+    /// instanceable node is shared
+    /// ([`instance_local_nodes`](Self::instance_local_nodes)), able to
+    /// contribute opinions, and authors a spec at its site: the nodes that bring
+    /// a prototype its content.
+    pub(crate) fn instanceable_nodes(&self, instance_depth: u16) -> Vec<bool> {
+        self.instanceable_flags(instance_depth).collect()
+    }
+
+    /// The [`instanceable_nodes`](Self::instanceable_nodes) classification,
+    /// one node at a time in arena order.
+    fn instanceable_flags(&self, instance_depth: u16) -> impl Iterator<Item = bool> + '_ {
+        let local = self.instance_local_nodes(instance_depth, instance_depth);
+        self.graph
+            .nodes()
+            .zip(local)
+            .map(|(node, local)| !local && !node.is_inert() && !node.is_culled() && node.has_specs())
+    }
+
+    /// Whether this index, composing a prim at `depth`, has any instanceable
+    /// node ([`instanceable_nodes`](Self::instanceable_nodes)). The structural
+    /// half of C++ `Pcp_PrimIndexIsInstanceable`: a prim whose only arcs are
+    /// ancestral, or bring no opinions, has nothing a prototype could share.
+    pub(crate) fn has_instanceable_node(&self, depth: u16) -> bool {
+        self.instanceable_flags(depth).any(|instanceable| instanceable)
+    }
+
+    /// Whether this index, composing a prim at `depth`, makes the prim an
+    /// instance (C++ `Pcp_PrimIndexIsInstanceable`): it has an instanceable
+    /// node ([`has_instanceable_node`](Self::has_instanceable_node)), and its
+    /// composed `instanceable` metadata is `true`.
+    ///
+    /// The metadata is read first: few prims author it, and the node test
+    /// partitions the whole graph. A failed read counts only for an index
+    /// that has an instanceable node.
+    pub(crate) fn is_instanceable(&self, graph: &LayerView<'_>, depth: u16) -> Result<bool, QueryError> {
+        match self.resolve_field(
+            FieldKey::Instanceable.as_str(),
+            graph,
+            None,
+            AssetMode::Resolve,
+            &mut Diagnostics::default(),
+        ) {
+            Ok(Some(Value::Bool(true))) => Ok(self.has_instanceable_node(depth)),
+            Err(error) if self.has_instanceable_node(depth) => Err(error),
+            Ok(_) | Err(_) => Ok(false),
+        }
+    }
+
+    /// Inerts the instance-namespace opinions on a prim composed inside an
+    /// instance (spec 11.3.3), so value resolution sees only the shared subtree
+    /// the instance brings in. `prim_depth` is the namespace depth of the prim
+    /// this index composes and `instance_depth` the nearest enclosing instance
+    /// prim's; the partition is
+    /// [`instance_local_nodes`](Self::instance_local_nodes).
+    ///
+    /// Each node is inerted individually, not its subtree: a direct arc nested
+    /// under a dropped ancestral one is a child in the graph yet stays shared.
+    /// (The local root is also inerted earlier by the indexer via
+    /// [`CompositionContext::within_instance`](super::prim_index::CompositionContext::within_instance).)
+    pub(crate) fn mark_instance_local_inert(&mut self, prim_depth: u16, instance_depth: u16) {
+        let local = self.instance_local_nodes(prim_depth, instance_depth);
+        for (i, is_local) in local.into_iter().enumerate() {
+            if is_local {
+                self.graph.mark(NodeId(i as u32), NodeFlags::INERT);
+            }
+        }
+    }
+
+    /// Re-anchors this index's composed (root) namespace from `from` to `to`,
+    /// used when a prototype is materialized from a canonical instance's subtree
+    /// onto its `/__Prototype_N` root (spec 11.3.3): every node's `map_to_root` /
+    /// `map_to_parent` has its composed-namespace target side moved from `from`
+    /// to `to`, so target translation lands in the prototype namespace rather
+    /// than the seeding instance's. Each
+    /// [`culled_dependencies`](Self::culled_dependencies) entry's map moves
+    /// with them.
+    ///
+    /// `node.path` is deliberately left untouched — it is the site path in the
+    /// node's own *layer* namespace, where value resolution reads specs (see
+    /// [`PrimIndex::opinions`]). A contributing node whose spec lives beneath the
+    /// instance's path (e.g. a selected variant at `/A{v=x}`) must keep that path
+    /// so the lookup hits the real spec; rewriting it to `/__Prototype_N{v=x}`
+    /// would query a layer location that does not exist.
+    ///
+    /// Only map targets change; node paths, arc types, namespace depths, origins,
+    /// and sibling numbers are untouched, so the strength-order projection stays
+    /// valid without re-finalizing.
+    ///
+    /// Returns how many nodes of shared data the rewrite copied
+    /// ([`PrimIndexGraph::rebase_maps`]).
+    pub(crate) fn rebase_root(&mut self, from: &Path, to: &Path) -> usize {
+        for culled in &mut self.culled {
+            culled.map_to_root = culled.map_to_root.rebase_target(from, to);
+        }
+        self.graph.rebase_maps(|map| map.rebase_target(from, to))
+    }
+
+    /// Returns the node behind a handle.
+    pub fn node(&self, id: NodeId) -> Node<'_> {
+        self.graph.node(id)
+    }
+
+    /// Returns the structural parent of a node, or `None` for a root.
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).parent()
+    }
+
+    /// Returns the structural children of a node, in strength order.
+    pub fn children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.graph.children(id)
+    }
+
+    /// Renders the composition tree for debugging (C++ `PcpPrimIndex::DumpToString`).
+    ///
+    /// Walks depth-first from the synthetic root, four spaces of indent per
+    /// depth, with children in strength order. Each line carries the arc type,
+    /// layer index, node path, strength rank, and any non-identity time offset,
+    /// origin, or flags. Layers are shown by index (the index owns no layer
+    /// identifiers); the output is deterministic, which makes it a useful
+    /// structural harness. The graph is a single rooted tree: the inert
+    /// synthetic root is the sole parent-less node, and every contributing node
+    /// descends from it.
+    pub fn dump(&self) -> String {
+        use std::fmt::Write as _;
+
+        let rank = self.strength_ranks();
+
+        let mut out = String::new();
+        let mut stack: Vec<(NodeId, usize)> = self
+            .graph
+            .strength_order()
+            .iter()
+            .rev()
+            .filter(|id| self.node(**id).parent().is_none())
+            .map(|&id| (id, 0))
+            .collect();
+
+        while let Some((id, depth)) = stack.pop() {
+            let node = self.node(id);
+            let _ = write!(
+                out,
+                "{:indent$}{:?} [{:?}] {} #{}",
+                "",
+                node.arc(),
+                node.layer_id(),
+                node.path(),
+                rank[id.idx()],
+                indent = depth * 4
+            );
+            let offset = node.map_to_root().time_offset();
+            if !offset.is_identity() {
+                let _ = write!(out, " offset=({},{})", offset.offset, offset.scale);
+            }
+            // Show origin only when it differs from the structural parent —
+            // i.e. for implied classes and grafts. A direct arc always origins
+            // on its parent, so printing it there is redundant noise.
+            if let Some(origin) = node.origin()
+                && Some(origin) != node.parent()
+            {
+                let _ = write!(out, " origin={}", origin.0);
+            }
+            if !node.flags().is_empty() {
+                let _ = write!(out, " {:?}", node.flags());
+            }
+            out.push('\n');
+
+            // Push children in reverse so the strongest sibling pops first.
+            extend_reversed(&mut stack, node.children().map(|child| (child, depth + 1)));
+        }
+        out
+    }
+
+    /// Like [`build_with_context`](Self::build_with_context) but with access to
+    /// previously-composed prim indices. Cached indices are checked before
+    /// building from scratch, ensuring inherit/specialize targets use the
+    /// fully-composed result (including ancestor-propagated specs).
+    ///
+    /// `load_payloads` is the per-path payload-inclusion decision for `path`
+    /// itself (`IndexCache::is_loaded`) — a pure function of `path`
+    /// and the stage's `pcp::LoadRules`, not something `ctx` carries, since a
+    /// sibling prim can resolve differently.
+    ///
+    /// The third tuple element is the [`Demand`]s a reference/payload arc raised
+    /// for a target that is not yet loaded; non-empty means the returned index
+    /// is incomplete and must not be cached, so the caller loads those layers
+    /// and recomposes. The fourth is the per-stack expression-variable names the
+    /// build's `${VAR}` evaluations read
+    /// ([`BuildOutput::expr_var_deps`](super::prim_indexer::BuildOutput::expr_var_deps)),
+    /// which the caller registers with the cached prim's dependencies.
+    pub(crate) fn build_with_cache(
+        path: &Path,
+        stack: &LayerView<'_>,
+        ctx: &CompositionContext,
+        fallbacks: &VariantFallbackMap,
+        cached_indices: &sdf::PathTable<PrimEntry>,
+        load_payloads: bool,
+    ) -> BuildResult<(Self, Diagnostics, Vec<Demand>, ExprVarDeps, usize)> {
+        Self::build_with_cache_in(
+            path,
+            stack,
+            ctx,
+            fallbacks,
+            cached_indices,
+            LayerStackId::ROOT,
+            load_payloads,
+            true,
+        )
+    }
+
+    /// Builds a prim index whose root `L` site scans the given `ambient` layer
+    /// stack rather than the stage's root layer stack.
+    ///
+    /// `ambient` is the layer stack the prim is composed in: the root layer
+    /// stack for a stage prim, or a referenced asset's sublayer stack for an
+    /// arc target reached within that reference. When `ambient` is the stage
+    /// root layer stack ([`LayerStackId::ROOT`]) the shared `cached_indices`
+    /// (keyed by stage path) apply; an arc-target sublayer stack is composed
+    /// fresh.
+    ///
+    /// `cull` lets a stage prim drop the subtrees that contribute nothing
+    /// ([`cull`](Self::cull)); a query that needs every node a site could
+    /// compose through passes `false`.
+    #[allow(clippy::too_many_arguments)] // each input is a distinct composition parameter
+    pub(crate) fn build_with_cache_in(
+        path: &Path,
+        stack: &LayerView<'_>,
+        ctx: &CompositionContext,
+        fallbacks: &VariantFallbackMap,
+        cached_indices: &sdf::PathTable<PrimEntry>,
+        ambient: LayerStackId,
+        load_payloads: bool,
+        cull: bool,
+    ) -> BuildResult<(Self, Diagnostics, Vec<Demand>, ExprVarDeps, usize)> {
+        if ambient == LayerStackId::ROOT
+            && let Some(cached) = cached_indices.get(path)
+        {
+            // A cache hit reports no variable dependencies: the cached
+            // entry's own registration already carries them, and stays
+            // authoritative because `IndexCache::build_index` never reaches
+            // this hit (`ensure_index` checks `is_indexed` first, and
+            // `build_index` debug-asserts it), so the empty map is never
+            // re-registered over it.
+            return Ok((
+                cached.index.clone(),
+                Diagnostics::default(),
+                Vec::new(),
+                ExprVarDeps::default(),
+                0,
+            ));
+        }
+        // The task-queue indexer is the sole composition path. A genuine cycle
+        // surfaces as `CompositionDiagnostic::ArcCycle`; an unresolvable arc is recorded in the
+        // returned errors and skipped. A `None` graph means an unestablished seed
+        // or the runaway nesting backstop, which composes to an empty prim index.
+        let indexer = super::prim_indexer::Indexer::new(stack, ctx, fallbacks, cached_indices, ambient, load_payloads);
+        let super::prim_indexer::BuildOutput {
+            graph,
+            errors,
+            pending_loads,
+            expr_var_deps,
+            nodes_copied,
+            // A cycle only steers the sub-build that hit it; at the top level
+            // the dropped arc is already recorded in `errors`.
+            hit_cycle: _,
+            has_payloads,
+        } = indexer.build(path)?;
+        let mut graph = graph.unwrap_or_default();
+        graph.shrink_to_fit();
+        let mut index = PrimIndex {
+            graph,
+            spec_stack: Vec::new(),
+            authors_clips: false,
+            has_payloads,
+            culled: Vec::new(),
+        };
+        // A stage prim drops the subtrees that contribute nothing, as C++
+        // `PcpComputePrimIndex` does; its children seed from what remains.
+        // A value clip on the prim or an ancestor can hold opinions for a site
+        // with no spec, so such a prim keeps every node.
+        let mut nodes_copied = nodes_copied;
+        if cull && ambient == LayerStackId::ROOT && !ctx.may_have_clips {
+            nodes_copied += index.cull();
+        }
+        // Build the memoized spec stack here, the single seam every freshly
+        // composed index passes through, so value resolution and the spec-tier
+        // refresh read it without a separate finalize step. The later permission
+        // / instance-local inerting only flips flags (which consumers filter
+        // live) and `rebase_root` retargets maps without moving node paths, so
+        // the stack stays valid; a materialized prototype clones an index that
+        // already carries it.
+        index.finalize_spec_stack(stack);
+        Ok((index, errors, pending_loads, expr_var_deps, nodes_copied))
+    }
+
+    /// The composition context this prim hands its children, given the one its
+    /// parent handed it.
+    pub(crate) fn context_for_children(&self, parent_ctx: &CompositionContext) -> CompositionContext {
+        CompositionContext {
+            may_have_clips: parent_ctx.may_have_clips || self.authors_clips,
+            // The cache sets this when the prim itself resolves as an instance.
+            instance_depth: parent_ctx.instance_depth,
+        }
+    }
+
+    /// The variant selections composed onto this prim, as `(set, selection)`
+    /// pairs sorted by set name. Collected from every node whose site path is a
+    /// variant selection path (`/Prim{set=sel}`), strongest first, mirroring the
+    /// C++ `testPcpCompositionResults` dump (which walks the node graph and
+    /// records `node.path.GetVariantSelection()` for each
+    /// `IsPrimVariantSelectionPath` node). This is purely structural — whatever
+    /// variant branches the build grafted in, regardless of whether the
+    /// selection was authored, a fallback, or a default — so it stays consistent
+    /// with the variant sites shown in the prim stack.
+    pub(crate) fn variant_selections(&self) -> Vec<(String, String)> {
+        let mut selections: HashMap<String, String> = HashMap::new();
+        for node in self.all_nodes() {
+            if !node.path().is_variant_selection() {
+                continue;
+            }
+            if let Some(sdf::PathElement::Variant { set, selection }) = node.path().last_element() {
+                selections
+                    .entry(set.to_string())
+                    .or_insert_with(|| selection.to_string());
+            }
+        }
+        let mut out: Vec<(String, String)> = selections.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// The variant sets the index's nodes declare in `variantSetNames`, each
+    /// where the strongest node declaring it lists it (C++
+    /// `UsdVariantSets::GetNames` over `PcpComposeSiteVariantSets`). Every
+    /// node is read, inert ones included, as C++ reads its whole node range.
+    pub(crate) fn variant_set_names(&self, graph: &LayerView<'_>) -> Result<Vec<String>, QueryError> {
+        let mut names: Vec<String> = Vec::new();
+        for node in self.ordered_nodes() {
+            for name in compose_arc_list_in::<String>(&[node], FieldKey::VariantSetNames, graph)? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// The variants variant set `set` holds across the index, sorted (C++
+    /// `UsdVariantSet::GetVariantNames`): each node at a prim or
+    /// variant-selection site reads `variantChildren` at its own site's set
+    /// across its layer stack (C++ `PcpComposeSiteVariantSetOptions`).
+    pub(crate) fn variant_names(&self, graph: &LayerView<'_>, set: &str) -> Result<Vec<String>, QueryError> {
+        let mut names = BTreeSet::new();
+        for node in self.ordered_nodes() {
+            let path = node.path();
+            if !path.is_prim() && !path.is_variant_selection() {
+                continue;
+            }
+            let Ok(set_path) = path.append_variant_selection(set, "") else {
+                continue;
+            };
+            let variants =
+                compose_token_children(graph, node.layer_stack_id(), &set_path, ChildrenKey::VariantChildren, 0)?;
+            names.extend(variants.into_iter().map(String::from));
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// The variant of `set` the strongest variant arc selects, the selection
+    /// composition made, authored or fallback (C++
+    /// `UsdVariantSet::GetVariantSelection`).
+    pub(crate) fn variant_selection(&self, set: &str) -> Option<String> {
+        self.ordered_nodes()
+            .filter(|node| node.arc() == ArcType::Variant)
+            .find_map(|node| match node.path().last_element()? {
+                sdf::PathElement::Variant {
+                    set: node_set,
+                    selection,
+                } if node_set == set => Some(selection.to_string()),
+                _ => None,
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composition context: flows from parent to child prim
+// ---------------------------------------------------------------------------
+
+/// Composition context carried from parent prims to children: what a prim's
+/// place in the namespace decides for it before its own index is built.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CompositionContext {
+    /// Whether this prim or an ancestor authors clip metadata, so value
+    /// resolution has to consult value clips here (C++
+    /// `Usd_PrimData::MayHaveOpinionsInClips`, which likewise combines a prim's
+    /// own clips with its parent's answer).
+    ///
+    /// Accumulated down the namespace, so the context composed *at* a prim is
+    /// already the answer *for* it. False lets a read skip the clip tier
+    /// outright, along with the wider site walk ([`SiteScope::EveryLayer`])
+    /// consulting it needs.
+    pub may_have_clips: bool,
+    /// Namespace depth of the nearest enclosing instance prim (spec 11.3.3),
+    /// or `None` when this prim is not inside an instance. Set by the cache once
+    /// an ancestor resolves as an instance and inherited by every deeper prim; a
+    /// nested instance re-arms it to its own (deeper) depth. Opinions authored at
+    /// the instance's own namespace — its local root and the ancestral
+    /// references introduced above it (at a shallower namespace depth) — are
+    /// discarded, so the subtree composes only from the arcs the instance brings
+    /// in (the instanceable arc and below, plus its implied classes).
+    pub instance_depth: Option<u16>,
+}
+
+impl CompositionContext {
+    /// `true` when this prim is composed inside an instance (spec 11.3.3), so
+    /// its local opinions are discarded. Equivalent to `instance_depth.is_some()`.
+    pub fn within_instance(&self) -> bool {
+        self.instance_depth.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers (used by the `Indexer` and Stage)
+// ---------------------------------------------------------------------------
+
+/// A prim index with the layer graph it composes over, as a borrow of the
+/// cache hands one out: the index through `Deref`, and the queries that read
+/// a node's layer stack as well, which a C++ `PcpNodeRef` reaches on its own.
+pub struct PrimIndexView<'a> {
+    index: &'a PrimIndex,
+    graph: &'a LayerGraph,
+}
+
+impl<'a> PrimIndexView<'a> {
+    pub(crate) fn new(index: &'a PrimIndex, graph: &'a LayerGraph) -> Self {
+        Self { index, graph }
+    }
+
+    /// The node providing the spec `layer` holds at `path`, among those that
+    /// contribute opinions (C++ `PcpPrimIndex::GetNodeProvidingSpec`). `None`
+    /// where no node does, or where the stage does not hold the layer.
+    pub fn node_providing_spec(&self, layer: &sdf::LayerHandle, path: &Path) -> Option<Node<'a>> {
+        let layer = self.graph.id_of_handle(layer)?;
+        self.index.node_providing_spec(self.graph, layer, path)
+    }
+}
+
+impl Deref for PrimIndexView<'_> {
+    type Target = PrimIndex;
+
+    fn deref(&self) -> &PrimIndex {
+        self.index
+    }
+}
+
+/// Appends the spec-stack entries `node` contributes: one per layer of its
+/// stack that authors a spec at the node's path, in the stack's order, each
+/// carrying the member's sublayer offset folded onto the node's arc offset.
+/// Where `clips` is given, raises it for the first of those layers that also
+/// authors clip metadata at the path, reading each layer once for both
+/// questions.
+///
+/// The single definition of a node's run, shared by the from-scratch build and
+/// by the spec-tier refresh, so the two cannot drift on ordering or on the fold.
+///
+/// Blind to [`Node::has_specs`](super::prim_graph::Node): the refresh calls it
+/// to *compute* that flag, and a gate here would hand back an empty run for a
+/// node whose flag has yet to be raised — leaving it false forever. Callers that
+/// already know the flag apply the gate themselves, to skip probes a node with
+/// no spec anywhere cannot need.
+///
+/// This is [`stack_has_spec`] unrolled: `out` grows iff that predicate holds,
+/// so the flag the refresh derives from it agrees with the one the indexer
+/// computes by asking directly.
+fn push_node_run(
+    graph: &LayerView<'_>,
+    node: Node<'_>,
+    id: NodeId,
+    from: usize,
+    out: &mut Vec<SpecSite>,
+    mut clips: Option<&mut bool>,
+) {
+    let arc_offset = node.map_to_root().time_offset();
+    for &(layer, sub) in graph.layer_stack(node.layer_stack_id()).iter().skip(from) {
+        let data = graph.layer(layer).data();
+        if !data.has_spec(node.path()) {
+            continue;
+        }
+        out.push(SpecSite {
+            node: id,
+            layer,
+            offset: arc_offset.concatenate(&sub),
+        });
+        if let Some(authors_clips) = clips.as_deref_mut()
+            && !*authors_clips
+        {
+            *authors_clips = super::clip::CLIP_FIELDS
+                .iter()
+                .any(|key| data.has_field(node.path(), key.as_str()));
+        }
+    }
+}
+
+/// Whether `node`'s site belongs to its prim's dependency set: it contributes
+/// opinions, or it is an inert relocation source whose site an edit must still
+/// recompose the relocated prim through.
+fn tracks_dependency(node: Node<'_>) -> bool {
+    !node.is_inert() || node.is_relocate_source()
+}
+
+/// Whether `node` is one the reverse dependency map records a *site* for.
+///
+/// [`tracks_dependency`] minus the self-Root edge — the node whose site is the
+/// prim's own path, which the site map skips to stay compact (C++
+/// `PcpDependencyTypeRoot`) while the root stack's users still count it.
+/// Shared by the registration walk and the lookup, so a site can never be
+/// re-found that was never registered. A spec change at an unregistered inert
+/// node's site therefore never refreshes that node's `has_specs`, which a child
+/// index seeded from the cached graph inherits.
+pub(super) fn registers_site(node: Node<'_>, prim_path: &Path) -> bool {
+    tracks_dependency(node) && !(node.arc() == ArcType::Root && node.path() == prim_path)
+}
+
+/// Whether any layer in `stack` authors a spec at `path` (C++
+/// `PcpNode::HasSpecs`). The canonical definition of a node's `has_specs`, which
+/// the indexer asks directly while building a node.
+///
+/// Short-circuits on the first member that answers yes, which is all its callers
+/// want.
+pub(super) fn stack_has_spec(graph: &LayerView<'_>, stack: LayerStackId, path: &Path) -> bool {
+    first_spec_layer(graph, stack, path).is_some()
+}
+
+/// The position in `stack` of the strongest layer that authors a spec at
+/// `path`, the probe behind [`stack_has_spec`] for a caller that records
+/// where it stopped ([`Node::spec_from`]).
+pub(super) fn first_spec_layer(graph: &LayerView<'_>, stack: LayerStackId, path: &Path) -> Option<u16> {
+    let position = graph
+        .layer_stack(stack)
+        .iter()
+        .position(|&(li, _)| graph.layer(li).data().has_spec(path))?;
+    // A stack too deep to record the position probes from its strongest
+    // layer, which is always correct.
+    Some(u16::try_from(position).unwrap_or(0))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cmp::Ordering;
+
+    use super::*;
+    use crate::pcp::CompositionDiagnostic;
+    use crate::pcp::mapping::MapFunction;
+    use crate::pcp::prim_graph::NodeDesc;
+
+    use crate::Result;
+
+    use crate::sdf::LayerOffset;
+
+    impl PrimIndex {
+        /// Appends a parentless node to a synthetic index, weakest in strength,
+        /// or strongest when `strongest` so that the strength order disagrees
+        /// with the arena order. Production composition appends through
+        /// [`PrimIndexGraph::add_child`], which links the node to a parent.
+        fn push(&mut self, node: NodeDesc, strongest: bool) {
+            self.graph.push_detached(node, strongest);
+        }
+
+        /// Appends a node to the end of the composition graph, weakest in
+        /// strength.
+        pub(crate) fn push_node(&mut self, node: NodeDesc) {
+            self.push(node, false);
+        }
+
+        /// [`push_node`](Self::push_node) but strongest rather than weakest.
+        pub(crate) fn push_node_strongest(&mut self, node: NodeDesc) {
+            self.push(node, true);
+        }
+
+        /// Records `layer` as one whose `defaultPrim` this index's composition
+        /// consulted, so a test can set the dependency up without a real build.
+        pub(crate) fn record_default_prim(&mut self, layer: LayerId) {
+            self.graph.non_site_deps_mut().default_prim.push(layer);
+        }
+
+        /// Builds a prim index for a root prim with no cached ancestors (a
+        /// convenience over [`build_with_cache`](Self::build_with_cache)). A
+        /// child prim must instead be built through a cache holding its
+        /// ancestors, since the indexer seeds a child from its cached parent.
+        pub(crate) fn build_with_context(
+            path: &Path,
+            stack: &LayerView<'_>,
+            ctx: &CompositionContext,
+        ) -> BuildResult<Self> {
+            Self::build_with_cache(
+                path,
+                stack,
+                ctx,
+                &VariantFallbackMap::new(),
+                &sdf::PathTable::new(),
+                true,
+            )
+            .map(|(index, _errors, _pending, _deps, _copied)| index)
+        }
+    }
+
+    const VENDOR_COMPOSITION: &str = concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "vendor/usd-wg-assets/test_assets/foundation/stage_composition"
+    );
+
+    fn manifest_dir() -> String {
+        std::env::var("CARGO_MANIFEST_DIR").unwrap()
+    }
+
+    fn composition_path(relative: &str) -> String {
+        format!("{VENDOR_COMPOSITION}/{relative}")
+    }
+
+    fn fixture_path(relative: &str) -> String {
+        format!("{}/fixtures/{relative}", manifest_dir())
+    }
+
+    /// Loads a root layer and the full transitive closure of its sublayers,
+    /// references, and payloads into a `Vec<sdf::Layer>` for `PrimIndex::build` —
+    /// the layer set composition would have loaded on demand had it been driven
+    /// through a stage.
+    fn load_layers(path: &str) -> Result<Vec<sdf::Layer>> {
+        Ok(sdf::layer_registry::tests::collect_with_arcs(
+            &sdf::LayerRegistry::default(),
+            path,
+        )?)
+    }
+
+    /// Builds a prim index for a given path string.
+    fn build(stack: &mut LayerGraph, prim: &str) -> PrimIndex {
+        build_with_fallbacks(stack, prim, VariantFallbackMap::new())
+    }
+
+    /// Composes `prim` and every namespace ancestor top-down into a cache,
+    /// applying `fallbacks`, and returns the target prim's fully-composed index.
+    /// The task-queue indexer seeds a child prim from its cached parent, so the
+    /// ancestors are composed first (mirroring the cache's `ensure_index`),
+    /// threading each prim's child context to the next. Shared with the
+    /// `prim_indexer` test suite.
+    ///
+    /// Takes `&mut LayerGraph` to mirror the stage's load barrier: a build that
+    /// reaches an external arc whose layer stack is not yet interned records a
+    /// [`Demand`], which this mints through [`LayerGraph::intern_external`] before
+    /// re-running (the test fixtures load every layer up front, so a demand only
+    /// ever needs interning, never loading).
+    pub(crate) fn build_with_fallbacks(stack: &mut LayerGraph, prim: &str, fallbacks: VariantFallbackMap) -> PrimIndex {
+        let path = Path::new(prim).unwrap();
+
+        // Namespace chain from the topmost prim down to `path`.
+        let mut chain: Vec<Path> = path.ancestors_below_root().collect();
+        chain.reverse();
+
+        loop {
+            let mut cache: sdf::PathTable<PrimEntry> = sdf::PathTable::new();
+            let mut parent_ctx = CompositionContext::default();
+            let mut last = None;
+            let mut pending: Vec<Demand> = Vec::new();
+            for ancestor in &chain {
+                let (index, _errors, demands, _deps, _copied) =
+                    PrimIndex::build_with_cache(ancestor, &stack.read_view(), &parent_ctx, &fallbacks, &cache, true)
+                        .expect("index build failed");
+                pending.extend(demands);
+                parent_ctx = index.context_for_children(&parent_ctx);
+                cache.insert(
+                    ancestor.clone(),
+                    PrimEntry {
+                        index: index.clone(),
+                        context: CompositionContext::default(),
+                        errors: Diagnostics::default(),
+                        property_errors: Diagnostics::default(),
+                        resolved_targets: HashMap::new(),
+                        instanceable: None,
+                        revision: PrimRevision::placeholder(),
+                        built: PrimRevision::placeholder(),
+                    },
+                );
+                last = Some(index);
+            }
+            // Mint the layer stacks the demands resolved against and re-run, the way
+            // the stage's load barrier does. The progress guard terminates if a
+            // demand cannot be satisfied (e.g. an unresolvable target).
+            if !stack.intern_demanded(&pending) {
+                return last.expect("a non-empty namespace chain");
+            }
+        }
+    }
+
+    /// Helper: loads layers and builds a [`LayerGraph`].
+    fn load_stack(path: &str) -> Result<LayerGraph> {
+        let layers = load_layers(path)?;
+        Ok(LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default()))
+    }
+
+    /// Builds a single-layer stack from in-memory `root.usd` data.
+    fn one_layer_stack(root: Box<dyn sdf::AbstractData>) -> LayerGraph {
+        let layers = vec![sdf::Layer::new("root.usd", root)];
+        LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default())
+    }
+
+    /// Builds a two-layer stack from in-memory `root.usd` + `ref.usd` data.
+    fn two_layer_stack(root: Box<dyn sdf::AbstractData>, refl: Box<dyn sdf::AbstractData>) -> LayerGraph {
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("ref.usd", refl)];
+        LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default())
+    }
+
+    /// The arc and target path of each unresolved-prim-path diagnostic that
+    /// composing `prim` in `stack` reports.
+    fn unresolved_targets(stack: &LayerView<'_>, prim: &str) -> Result<Vec<(ArcType, String)>> {
+        let (_, errors, _, _, _) = PrimIndex::build_with_cache(
+            &Path::new(prim)?,
+            stack,
+            &CompositionContext::default(),
+            &VariantFallbackMap::new(),
+            &sdf::PathTable::new(),
+            true,
+        )?;
+        Ok(errors
+            .iter()
+            .filter_map(|error| match error {
+                CompositionDiagnostic::UnresolvedPrimPath { arc, prim_path, .. } => {
+                    Some((*arc, prim_path.as_str().to_string()))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn single_layer_root_node() -> Result<()> {
+        let mut stack = load_stack(&composition_path("active.usda"))?;
+        let index = build(&mut stack, "/World");
+
+        assert_eq!(index.nodes().count(), 1);
+        assert_eq!(index.nodes().next().unwrap().layer_id(), stack.all_ids()[0]);
+        assert_eq!(index.nodes().next().unwrap().arc(), ArcType::Root);
+        Ok(())
+    }
+
+    #[test]
+    fn sublayer_site_layer_order() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("sublayer_override.usda"))?;
+        let index = build(&mut stack, "/World");
+
+        let ns: Vec<_> = index.nodes().collect();
+        assert_eq!(ns.len(), 1, "one per-site node spans both sublayers");
+        assert_eq!(ns[0].arc(), ArcType::Root);
+        let layers: Vec<LayerId> = stack
+            .layer_stack(ns[0].layer_stack_id())
+            .iter()
+            .map(|&(li, _)| li)
+            .collect();
+        let expected: Vec<LayerId> = stack.root_layer_stack().iter().map(|&(id, _)| id).collect();
+        assert_eq!(layers, expected, "stronger sublayer first");
+        Ok(())
+    }
+
+    #[test]
+    fn prim_only_in_stronger_layer() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("sublayer_override.usda"))?;
+        let index = build(&mut stack, "/World/Sphere");
+
+        assert_eq!(index.nodes().count(), 1);
+        assert_eq!(index.nodes().next().unwrap().layer_id(), stack.all_ids()[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn nonexistent_prim_empty_index() -> Result<()> {
+        let mut stack = load_stack(&composition_path("active.usda"))?;
+        let index = build(&mut stack, "/DoesNotExist");
+
+        assert!(index.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reference_arc_present() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("ref_external.usda"))?;
+        let index = build(&mut stack, "/World/MyPrim");
+
+        assert!(index.nodes().any(|n| n.arc() == ArcType::Reference));
+        Ok(())
+    }
+
+    /// A site resolves to every arena node at its path: several for the prim
+    /// site (the synthetic root and the local root), the reference target at
+    /// its own namespace path, and none for an absent path.
+    #[test]
+    fn nodes_at_resolves_sites() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0
+def \"A\" ( references = @base.usd@</B> ) {
+  custom double x = 1
+}
+",
+        );
+        let base = parse_usda(
+            "#usda 1.0
+def \"B\" { custom double y = 2 }
+",
+        );
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("base.usd", base)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/A");
+
+        let prim = Path::new("/A").unwrap();
+        let at_prim: Vec<NodeId> = index.nodes_at(&prim).collect();
+        assert!(
+            at_prim.len() >= 2,
+            "the prim's own site carries the synthetic root and the local root"
+        );
+        assert!(at_prim.iter().all(|&id| *index.node(id).path() == prim));
+
+        // The reference target keeps its own namespace path /B.
+        assert!(
+            index
+                .nodes_at(&Path::new("/B").unwrap())
+                .any(|id| index.node(id).arc() == ArcType::Reference),
+            "the reference node is indexed at its target path"
+        );
+
+        // An absent path resolves to no nodes.
+        assert_eq!(index.nodes_at(&Path::new("/Nope").unwrap()).count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_reference_target_culled() -> Result<()> {
+        // /A references a prim the target layer never defines.
+        let root = parse_usda("#usda 1.0\ndef \"A\" ( references = @base.usd@</Empty> ) {\n  custom double x = 1\n}\n");
+        let base = parse_usda("#usda 1.0\ndef \"Other\" {}\n");
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("base.usd", base)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/A");
+
+        // The empty target is retained as a culled node so an editor sees the
+        // arc, but value resolution skips it and the prim is not composed.
+        assert!(
+            index
+                .all_nodes()
+                .any(|n| n.arc() == ArcType::Reference && n.is_culled()),
+            "empty reference target kept as a culled node"
+        );
+        assert!(
+            index.nodes().all(|n| n.arc() != ArcType::Reference),
+            "culled reference contributes no opinion to resolution"
+        );
+        assert!(
+            !index.has_composition_arc(),
+            "an empty reference does not compose the prim"
+        );
+        assert!(!index.is_empty(), "the prim's own opinions remain");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_inherit_target_culled() -> Result<()> {
+        // /A inherits a class the layer never defines.
+        let root = parse_usda("#usda 1.0\ndef \"A\" ( inherits = </_class_Missing> ) {\n  custom double x = 1\n}\n");
+        let index = build(&mut one_layer_stack(root), "/A");
+
+        // The empty class is retained as a culled node so an editor sees the arc,
+        // but value resolution skips it and the prim is not composed.
+        assert!(
+            index.all_nodes().any(|n| n.arc() == ArcType::Inherit && n.is_culled()),
+            "empty inherit target kept as a culled node"
+        );
+        assert!(
+            index.nodes().all(|n| n.arc() != ArcType::Inherit),
+            "culled inherit contributes no opinion to resolution"
+        );
+        assert!(
+            !index.has_composition_arc(),
+            "an empty inherit does not compose the prim"
+        );
+        assert!(!index.is_empty(), "the prim's own opinions remain");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_specialize_target_culled() -> Result<()> {
+        // /A specializes a class the layer never defines.
+        let root = parse_usda("#usda 1.0\ndef \"A\" ( specializes = </_class_Missing> ) {\n  custom double x = 1\n}\n");
+        let index = build(&mut one_layer_stack(root), "/A");
+
+        assert!(
+            index
+                .all_nodes()
+                .any(|n| n.arc() == ArcType::Specialize && n.is_culled()),
+            "empty specialize target kept as a culled node"
+        );
+        assert!(
+            index.nodes().all(|n| n.arc() != ArcType::Specialize),
+            "culled specialize contributes no opinion to resolution"
+        );
+        assert!(
+            !index.has_composition_arc(),
+            "an empty specialize does not compose the prim"
+        );
+        assert!(!index.is_empty(), "the prim's own opinions remain");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_variant_target_culled() -> Result<()> {
+        // /A selects a variant its set never authors, so the `{v=missing}` site
+        // has no spec.
+        let root = parse_usda(
+            "#usda 1.0\ndef \"A\" (\n    variantSets = \"v\"\n    variants = { string v = \"missing\" }\n) {\n  custom double own = 1\n  variantSet \"v\" = {\n    \"present\" { custom double x = 1 }\n  }\n}\n",
+        );
+        let index = build(&mut one_layer_stack(root), "/A");
+
+        assert!(
+            index.all_nodes().any(|n| n.arc() == ArcType::Variant && n.is_culled()),
+            "empty variant target kept as a culled node"
+        );
+        assert!(
+            index.nodes().all(|n| n.arc() != ArcType::Variant),
+            "culled variant contributes no opinion to resolution"
+        );
+        assert!(
+            !index.has_composition_arc(),
+            "an empty variant does not compose the prim"
+        );
+        assert!(!index.is_empty(), "the prim's own opinions remain");
+        Ok(())
+    }
+
+    /// An inherit that remaps through a reference ancestor arc into the
+    /// referencing namespace is added as an implied-class node, flagged
+    /// `IMPLIED_CLASS` with the originating inherit node recorded.
+    #[test]
+    fn implied_class_flagged() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Model\" ( references = @ref.usd@</Ref> ) {\n  over \"Class\" { custom string x = \"rootimplied\" }\n}\n",
+        );
+        let refl = parse_usda(
+            "#usda 1.0\ndef \"Ref\" {\n  def \"Sub\" ( inherits = </Ref/Class> ) {}\n  class \"Class\" { custom string x = \"ref\" }\n}\n",
+        );
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("ref.usd", refl)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let index = build(&mut stack, "/Model/Sub");
+        let implied = index
+            .arena()
+            .find(|n| n.path().as_str() == "/Model/Class")
+            .expect("implied class node in the referencing namespace");
+        assert!(
+            implied.flags().contains(NodeFlags::IMPLIED_CLASS),
+            "implied class node is flagged"
+        );
+        assert!(implied.origin().is_some(), "implied class records its origin");
+        Ok(())
+    }
+
+    /// `PrimIndex` must stay `Send + Sync` so per-prim composition can run in
+    /// parallel; the arena-handle representation (no `Rc`/`RefCell`) guarantees
+    /// it. This fails to compile if a non-thread-safe field is ever added.
+    #[test]
+    fn prim_index_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PrimIndex>();
+        assert_send_sync::<Node<'static>>();
+        assert_send_sync::<NodeId>();
+    }
+
+    /// A variant set defined in a referenced layer with the selection authored
+    /// on the referencing prim must still produce the selected variant's node.
+    /// This is exactly the LIVRPS-ordering gap `stabilize` exists to close: the
+    /// variant set only becomes visible after the reference is composed.
+    #[test]
+    fn variant_from_external_reference() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Model\" (\n  references = @ref.usd@</Ref>\n  variants = { string v = \"b\" }\n) {}\n",
+        );
+        let refl = parse_usda(
+            "#usda 1.0\ndef \"Ref\" (\n  add variantSets = \"v\"\n) {\n  variantSet \"v\" = {\n    \"a\" { custom string x = \"a\" }\n    \"b\" { custom string x = \"b\" }\n  }\n}\n",
+        );
+        let mut stack = two_layer_stack(root, refl);
+        let index = build(&mut stack, "/Model");
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.arc() == ArcType::Variant && n.path().as_str().contains("{v=b}")),
+            "selected variant from the referenced layer must be composed"
+        );
+        Ok(())
+    }
+
+    /// Like the above but the variant set arrives through an internal reference
+    /// (same layer stack), which the indexer grafts via `merge_full_index`.
+    #[test]
+    fn variant_from_internal_reference() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Base\" (\n  add variantSets = \"v\"\n) {\n  variantSet \"v\" = {\n    \"a\" { custom string x = \"a\" }\n    \"b\" { custom string x = \"b\" }\n  }\n}\ndef \"Model\" (\n  references = </Base>\n  variants = { string v = \"b\" }\n) {}\n",
+        );
+        let mut stack = one_layer_stack(root);
+        let index = build(&mut stack, "/Model");
+        // The variant arrives grafted through the reference, so its node carries
+        // the Reference arc; what matters is that the selected variant (v=b),
+        // not the fallback (v=a), was composed.
+        assert!(
+            index.nodes().any(|n| n.path().as_str().contains("{v=b}")),
+            "selected variant from the internal-reference target must be composed"
+        );
+        assert!(
+            !index.nodes().any(|n| n.path().as_str().contains("{v=a}")),
+            "fallback variant must not be composed when v=b is selected"
+        );
+        Ok(())
+    }
+
+    /// The selected variant itself contains a reference that brings in content.
+    /// This exercises following arcs out of a late-discovered variant node.
+    #[test]
+    fn variant_contains_reference() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Model\" (\n  references = @ref.usd@</Ref>\n  variants = { string v = \"b\" }\n) {}\n",
+        );
+        let refl = parse_usda(
+            "#usda 1.0\ndef \"Inner\" { custom string y = \"inner\" }\ndef \"Ref\" (\n  add variantSets = \"v\"\n) {\n  variantSet \"v\" = {\n    \"a\" {}\n    \"b\" ( references = </Inner> ) {}\n  }\n}\n",
+        );
+        let mut stack = two_layer_stack(root, refl);
+        let index = build(&mut stack, "/Model");
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.arc() == ArcType::Variant && n.path().as_str().contains("{v=b}")),
+            "selected variant node present"
+        );
+        assert!(
+            index.nodes().any(|n| n.path().as_str() == "/Inner"),
+            "reference inside the selected variant must be followed"
+        );
+        Ok(())
+    }
+
+    /// The indexer records structural parent/child links: a reference node hangs
+    /// under a root node, and every stored parent agrees with its child list.
+    #[test]
+    fn structural_links_consistent() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("ref_external.usda"))?;
+        let index = build(&mut stack, "/World/MyPrim");
+
+        let root = index.root().expect("non-empty index has a root");
+        assert_eq!(index.node(root).arc(), ArcType::Root);
+
+        // The reference is parented under a node, not orphaned. NodeId indexes
+        // the arena (structural order), so enumerate the arena, not the strength
+        // projection.
+        let reference = index
+            .arena()
+            .position(|n| n.arc() == ArcType::Reference)
+            .map(|i| NodeId(i as u32))
+            .expect("reference fixture has a reference node");
+        let parent = index.parent(reference).expect("reference has a parent");
+        assert!(index.children(parent).any(|child| child == reference));
+
+        // Every parent link is mirrored by the parent's children list.
+        for (i, _) in index.arena().enumerate() {
+            let id = NodeId(i as u32);
+            if let Some(parent) = index.parent(id) {
+                assert!(
+                    index.children(parent).any(|child| child == id),
+                    "node {i} parent {parent:?} missing it as a child"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The subtree graft keeps an inherit target's own composition nested: a
+    /// reference brought in by the inherited class hangs under the grafted class
+    /// node, not flattened onto the inheriting prim.
+    #[test]
+    fn graft_preserves_subtree() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Model\" ( inherits = </Class> ) {}\ndef \"Class\" ( references = @base.usd@</Base> ) {}\n",
+        );
+        let base = parse_usda("#usda 1.0\ndef \"Base\" {}\n");
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("base.usd", base)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let index = build(&mut stack, "/Model");
+        let find = |p: &str| {
+            index
+                .arena()
+                .position(|n| n.path().as_str() == p)
+                .map(|i| NodeId(i as u32))
+        };
+        let class = find("/Class").expect("inherited /Class node");
+        let base = find("/Base").expect("grafted /Base node from /Class's reference");
+
+        // /Base entered through /Class's own reference, so it must hang under the
+        // grafted /Class node rather than be flattened onto /Model.
+        assert_eq!(
+            index.parent(base),
+            Some(class),
+            "reference subtree preserved under its inherit root"
+        );
+        // Grafted nodes record the inheriting node as their arc origin.
+        assert!(index.node(base).origin().is_some(), "grafted node carries an origin");
+        Ok(())
+    }
+
+    /// `dump` renders the composition tree depth-first with deeper
+    /// nesting indented further: the grafted reference sits under the inherit,
+    /// which sits under the root.
+    #[test]
+    fn dump_renders_tree() -> Result<()> {
+        let root = parse_usda(
+            "#usda 1.0\ndef \"Model\" ( inherits = </Class> ) {}\ndef \"Class\" ( references = @base.usd@</Base> ) {}\n",
+        );
+        let base = parse_usda("#usda 1.0\ndef \"Base\" {}\n");
+        let layers = vec![sdf::Layer::new("root.usd", root), sdf::Layer::new("base.usd", base)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/Model");
+
+        let dump = index.dump();
+        let line = |needle: &str| {
+            dump.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("dump missing {needle}: {dump}"))
+        };
+        let indent = |l: &str| l.len() - l.trim_start().len();
+
+        // Every line carries a strength rank; nesting deepens with indentation.
+        assert!(dump.lines().all(|l| l.contains('#')), "each line has a strength rank");
+        assert!(line("/Model").starts_with("Root"), "root prim is the tree root");
+        assert!(
+            indent(line("/Class")) > indent(line("/Model")),
+            "inherit nests under the root"
+        );
+        assert!(
+            indent(line("/Base")) > indent(line("/Class")),
+            "grafted reference nests under the inherit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inherit_arc_present() -> Result<()> {
+        let mut stack = load_stack(&composition_path("class_inherit.usda"))?;
+        let index = build(&mut stack, "/World/cubeWithoutSetColor");
+
+        assert!(index.nodes().any(|n| n.arc() == ArcType::Inherit));
+        Ok(())
+    }
+
+    #[test]
+    fn inherit_root_is_strongest() -> Result<()> {
+        let mut stack = load_stack(&composition_path("class_inherit.usda"))?;
+        let index = build(&mut stack, "/World/cubeWithSetColor");
+        let arcs: Vec<_> = index.nodes().map(|n| n.arc()).collect();
+
+        assert_eq!(arcs[0], ArcType::Root);
+        assert!(arcs.contains(&ArcType::Inherit));
+        Ok(())
+    }
+
+    #[test]
+    fn variant_arc_with_selection() -> Result<()> {
+        let path = format!(
+            "{}vendor/usd-wg-assets/docs/CompositionPuzzles/VariantSetAndLocal1/puzzle_1.usda",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let mut stack = load_stack(&path)?;
+        let index = build(&mut stack, "/World/Sphere");
+
+        assert!(index.nodes().any(|n| n.arc() == ArcType::Variant));
+
+        let variant_node = index.nodes().find(|n| n.arc() == ArcType::Variant).unwrap();
+        assert_eq!(variant_node.path().as_str(), "/World/Sphere{size=small}");
+        Ok(())
+    }
+
+    #[test]
+    fn specialize_arc_present() -> Result<()> {
+        let mut stack = load_stack(&composition_path("inherit_and_specialize.usda"))?;
+        let index = build(&mut stack, "/World/cubeScene/specializes");
+
+        assert!(index.nodes().any(|n| n.arc() == ArcType::Specialize));
+        Ok(())
+    }
+
+    /// External references with `./` relative paths and nested references
+    /// should be followed recursively (diamond pattern: Root -> A,B -> C).
+    #[test]
+    fn reference_diamond_recursive() -> Result<()> {
+        let path = format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/BasicReferenceDiamond_root/usda/root.usd",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let mut stack = load_stack(&path)?;
+        let index = build(&mut stack, "/Root");
+
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.arc() == ArcType::Reference && n.path().as_str() == "/A"),
+            "should have node from A.usd"
+        );
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.arc() == ArcType::Reference && n.path().as_str() == "/B"),
+            "should have node from B.usd"
+        );
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.arc() == ArcType::Reference && n.path().as_str() == "/C"),
+            "should have node from C.usd via nested reference"
+        );
+
+        let a_idx = stack.find_by_leaf("A.usd").unwrap();
+        let a_attr_path = Path::new("/A.A_attr").unwrap();
+        assert!(
+            stack.read_view().layer(a_idx).data().has_spec(&a_attr_path),
+            "A.usd should have spec at /A.A_attr"
+        );
+        Ok(())
+    }
+
+    /// Variant that introduces a specializes arc should propagate the
+    /// specialized prim's variant opinions to the composing prim (C++
+    /// `_DetermineInheritPath` strips the parent's variant selections before
+    /// mapping the class arc and re-adds the nearest containing one).
+    #[test]
+    fn specializes_from_variant() -> Result<()> {
+        let path = format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/SpecializesAndVariants_root/usda/root.usd",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let mut stack = load_stack(&path)?;
+        let index = build(&mut stack, "/B");
+
+        assert!(
+            index.nodes().any(|n| n.arc() == ArcType::Specialize),
+            "should have specialize node from variant"
+        );
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.path().as_str().contains("{nestedVariantSet=nestedVariant}")),
+            "should have /A's variant node"
+        );
+        Ok(())
+    }
+
+    /// References inside variant specs should be collected as dependencies
+    /// so the target layers are loaded. Descendant prims should then pick up
+    /// inherit arcs from the referenced layer through ancestral propagation.
+    #[test]
+    fn variant_reference_and_inherit_propagation() -> Result<()> {
+        let path = format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/BasicVariantWithConnections_root/usda/root.usd",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let mut stack = load_stack(&path)?;
+
+        assert!(
+            stack.find_by_leaf("camera_perspective.usd").is_some(),
+            "camera_perspective.usd should be collected from variant reference"
+        );
+
+        let index = build(&mut stack, "/main_cam/Lens");
+        assert!(
+            index.nodes().any(|n| n.path().as_str() == "/camera/_localclass_Lens"),
+            "should have inherit node for _localclass_Lens"
+        );
+        Ok(())
+    }
+
+    /// Variant selections from inherited classes should propagate to
+    /// the inheriting prim, including selections nested inside the
+    /// class's own variant specs.
+    #[test]
+    fn inherited_variant_selection_propagation() -> Result<()> {
+        let path = format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/TrickyVariantWeakerSelection2_root/usda/root.usd",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let mut stack = load_stack(&path)?;
+        let index = build(&mut stack, "/bob");
+
+        assert!(
+            index.nodes().any(|n| n.path().as_str().contains("{geotype=cube}")),
+            "should have geotype=cube variant node from inherited selection"
+        );
+        Ok(())
+    }
+
+    // --- CompositionDiagnostic reporting ---
+
+    fn parse_usda(text: &str) -> Box<dyn sdf::AbstractData> {
+        let data = crate::usda::parser::Parser::new(text).parse().expect("parse usda");
+        Box::new(sdf::Data::from_specs(data))
+    }
+
+    /// The spec runs partition the spec stack: every node gets one, each holds
+    /// that node's sites alone, and read back strongest node first they are the
+    /// stack.
+    #[test]
+    fn spec_runs_cover_stack() {
+        let mut stack = one_layer_stack(parse_usda(
+            r#"#usda 1.0
+def "Ref" {
+}
+def "World" (
+    references = </Ref>
+)
+{
+}
+"#,
+        ));
+        let index = build_with_fallbacks(&mut stack, "/World", VariantFallbackMap::new());
+        let runs: Vec<_> = index.spec_runs_weakest_first().collect();
+        assert_eq!(runs.len(), index.ordered_nodes().count());
+
+        let mut sites = Vec::new();
+        for (node, run) in runs.iter().rev() {
+            assert!(run.iter().all(|site| site.node == node.id()));
+            sites.extend(run.iter().map(|site| (site.node, site.layer)));
+        }
+        let stack_sites: Vec<_> = index.spec_stack.iter().map(|site| (site.node, site.layer)).collect();
+        assert_eq!(sites, stack_sites);
+        assert!(sites.len() >= 2, "the prim and its reference each author a spec");
+    }
+
+    /// An empty selection — here from an expression-language `None` — defers
+    /// to the configured fallback, whose variant the composed index grafts.
+    #[test]
+    fn empty_selection_fallback() {
+        let stack = one_layer_stack(parse_usda(
+            r#"#usda 1.0
+def "World" (
+    variantSets = "v"
+    variants = { string v = "`None`" }
+)
+{
+    variantSet "v" = {
+        "hi" { custom double x = 1 }
+        "lo" { custom double x = 2 }
+    }
+}
+"#,
+        ));
+        let fallbacks = VariantFallbackMap::new().add("v", ["hi"]);
+        let (index, ..) = PrimIndex::build_with_cache(
+            &Path::new("/World").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+            &fallbacks,
+            &sdf::PathTable::new(),
+            true,
+        )
+        .expect("index build");
+        assert!(
+            index.nodes().any(|n| n.path().as_str() == "/World{v=hi}"),
+            "the index composes the fallback, got {:?}",
+            index.nodes().map(|n| n.path().as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A child prim defined inside a parent's expression-selected variant
+    /// branch composes through the cached parent's variant node.
+    #[test]
+    fn variant_child_expr() {
+        let mut stack = one_layer_stack(parse_usda(
+            r#"#usda 1.0
+(
+    expressionVariables = {
+        string SEL = "hi"
+    }
+)
+def "World" (
+    variantSets = "v"
+    variants = { string v = "`${SEL}`" }
+)
+{
+    variantSet "v" = {
+        "hi" {
+            def "Child"
+            {
+                custom double x = 1
+            }
+        }
+    }
+}
+"#,
+        ));
+        let index = build_with_fallbacks(&mut stack, "/World/Child", VariantFallbackMap::new());
+        assert!(
+            index
+                .nodes()
+                .any(|n| n.path().as_str() == "/World{v=hi}Child" && n.has_specs()),
+            "the child under the evaluated selection composes, got {:?}",
+            index.nodes().map(|n| n.path().as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A reference cycle is recorded as a recoverable `CompositionDiagnostic::ArcCycle` and the
+    /// cycle-closing arc is skipped, rather than aborting the whole build (C++
+    /// `_CheckForCycle` drops the arc and continues).
+    #[test]
+    fn arc_cycle_recorded() -> Result<()> {
+        // A.usd references B.usd which references A.usd — cycle.
+        let a = parse_usda(
+            r#"#usda 1.0
+(
+    defaultPrim = "Root"
+)
+def "Root" (
+    references = @b.usd@
+)
+{
+}
+"#,
+        );
+        let b = parse_usda(
+            r#"#usda 1.0
+(
+    defaultPrim = "Root"
+)
+def "Root" (
+    references = @a.usd@
+)
+{
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("a.usd", a), sdf::Layer::new("b.usd", b)];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let (_index, errors, _pending, _deps, _copied) = PrimIndex::build_with_cache(
+            &Path::new("/Root").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+            &VariantFallbackMap::new(),
+            &sdf::PathTable::new(),
+            true,
+        )?;
+        assert!(
+            errors.iter().any(|e| matches!(e, CompositionDiagnostic::ArcCycle(_))),
+            "expected a recorded ArcCycle error, got {errors:?}"
+        );
+        Ok(())
+    }
+
+    /// A reference or payload to a prim an external layer does not have, at
+    /// the root or below a prim it does have, reports an unresolved prim path
+    /// (C++ `PcpErrorUnresolvedPrimPath`).
+    #[test]
+    fn absent_external_target() -> Result<()> {
+        for (field, arc, target) in [
+            ("references", ArcType::Reference, "/Absent"),
+            ("payload", ArcType::Payload, "/Absent"),
+            ("references", ArcType::Reference, "/Present/Absent"),
+            ("payload", ArcType::Payload, "/Present/Absent"),
+        ] {
+            let root = parse_usda(&format!(
+                "#usda 1.0\ndef Scope \"Mounted\" ({field} = @ref.usd@<{target}>) {{}}\n"
+            ));
+            let model = parse_usda("#usda 1.0\ndef Scope \"Present\" {}\n");
+            let stack = two_layer_stack(root, model);
+            assert_eq!(
+                unresolved_targets(&stack.read_view(), "/Mounted")?,
+                [(arc, target.to_string())]
+            );
+        }
+        Ok(())
+    }
+
+    /// A reference or payload to a prim missing from its own layer reports an
+    /// unresolved prim path too, at the root or below a prim, as C++ does. A
+    /// target a variant supplies later is not missing, even when the reference
+    /// to it is composed inside another reference's target.
+    #[test]
+    fn absent_internal_target() -> Result<()> {
+        let layer = parse_usda(
+            r#"#usda 1.0
+def Scope "Present" {
+    def Scope "Child" {}
+}
+def Scope "Varied" (
+    variants = { string v = "on" }
+    prepend variantSets = "v"
+) {
+    variantSet "v" = {
+        "on" {
+            def Scope "FromVariant" {}
+        }
+    }
+}
+def Scope "RootMissing" (references = </Absent>) {}
+def Scope "SubMissing" (references = </Present/Absent>) {}
+def Scope "PayloadMissing" (payload = </Absent>) {}
+def Scope "SubPresent" (references = </Present/Child>) {}
+def Scope "FromVariantRef" (references = </Varied/FromVariant>) {}
+def Scope "Outer" {
+    def Scope "ToVariant" (references = </Varied/FromVariant>) {}
+    def Scope "ToAbsent" (references = </Absent>) {}
+}
+def Scope "NestedVariantRef" (references = </Outer/ToVariant>) {}
+def Scope "NestedMissing" (references = </Outer/ToAbsent>) {}
+"#,
+        );
+        let stack = one_layer_stack(layer);
+        let unresolved = |prim: &str| unresolved_targets(&stack.read_view(), prim);
+        assert_eq!(
+            unresolved("/RootMissing")?,
+            [(ArcType::Reference, "/Absent".to_string())]
+        );
+        assert_eq!(
+            unresolved("/SubMissing")?,
+            [(ArcType::Reference, "/Present/Absent".to_string())]
+        );
+        assert_eq!(
+            unresolved("/PayloadMissing")?,
+            [(ArcType::Payload, "/Absent".to_string())]
+        );
+        assert_eq!(unresolved("/SubPresent")?, []);
+        assert_eq!(unresolved("/FromVariantRef")?, []);
+        assert_eq!(unresolved("/NestedVariantRef")?, []);
+        assert_eq!(
+            unresolved("/NestedMissing")?,
+            [(ArcType::Reference, "/Absent".to_string())]
+        );
+        Ok(())
+    }
+
+    /// A cyclic sub-root reference whose target composes *nothing* is reported
+    /// as `UnresolvedPrimPath` on top of the `ArcCycle` (C++
+    /// `PcpErrorUnresolvedPrimPath`). `/Outer` references back into `a.usd`, so
+    /// composing `/Outer/Inner`'s ancestral chain closes a cycle, and `Inner`
+    /// authors nothing of its own for the graft to keep.
+    ///
+    /// The pair is the point: the second diagnostic is gated on whether *that*
+    /// sub-build hit the cycle, which is why the signal travels with the graft
+    /// result rather than being read back off the accumulated diagnostics.
+    #[test]
+    fn cyclic_subroot_unresolved() -> Result<()> {
+        let a = parse_usda(
+            r#"#usda 1.0
+(
+    defaultPrim = "Root"
+)
+def "Root" (
+    references = @b.usd@</Outer/Inner>
+)
+{
+}
+"#,
+        );
+        let b = parse_usda(
+            r#"#usda 1.0
+def "Outer" (
+    references = @a.usd@
+)
+{
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("a.usd", a), sdf::Layer::new("b.usd", b)];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let (_index, errors, _pending, _deps, _copied) = PrimIndex::build_with_cache(
+            &Path::new("/Root").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+            &VariantFallbackMap::new(),
+            &sdf::PathTable::new(),
+            true,
+        )?;
+        assert!(
+            errors.iter().any(|e| matches!(e, CompositionDiagnostic::ArcCycle(_))),
+            "expected the cycle itself, got {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, CompositionDiagnostic::UnresolvedPrimPath { .. })),
+            "the cyclic target composed nothing, so its prim path is unresolved, got {errors:?}"
+        );
+        Ok(())
+    }
+
+    /// A cycle realized across stack frames — `/Root` references a sub-root prim
+    /// in another layer that references back into `/Root` — is recorded as
+    /// `ArcCycle`, not silently composed away. The sub-root target composes an
+    /// ancestral sub-index in its own frame, so the back-reference is only caught
+    /// by the cross-frame walk in `arc_target_in_bounds`.
+    #[test]
+    fn subroot_arc_cycle_recorded() -> Result<()> {
+        let a = parse_usda(
+            r#"#usda 1.0
+(
+    defaultPrim = "Root"
+)
+def "Root" (
+    references = @b.usd@</Outer/Inner>
+)
+{
+}
+"#,
+        );
+        let b = parse_usda(
+            r#"#usda 1.0
+def "Outer"
+{
+    def "Inner" (
+        references = @a.usd@
+    )
+    {
+    }
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("a.usd", a), sdf::Layer::new("b.usd", b)];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let (_index, errors, _pending, _deps, _copied) = PrimIndex::build_with_cache(
+            &Path::new("/Root").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+            &VariantFallbackMap::new(),
+            &sdf::PathTable::new(),
+            true,
+        )?;
+        assert!(
+            errors.iter().any(|e| matches!(e, CompositionDiagnostic::ArcCycle(_))),
+            "expected a recorded ArcCycle error for a cross-frame cycle, got {errors:?}"
+        );
+        Ok(())
+    }
+
+    /// An unresolvable referenced layer is recorded as a recoverable
+    /// `UnresolvedLayer` error and the arc is skipped, so the prim still composes
+    /// its own local opinions instead of aborting.
+    #[test]
+    fn unresolved_layer_recorded() -> Result<()> {
+        let layer = parse_usda(
+            r#"#usda 1.0
+def "Prim" (
+    references = @nonexistent.usd@
+)
+{
+    custom string marker = "ok"
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("test.usda", layer)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let build = |stack: &LayerGraph| {
+            PrimIndex::build_with_cache(
+                &Path::new("/Prim").unwrap(),
+                &stack.read_view(),
+                &CompositionContext::default(),
+                &VariantFallbackMap::new(),
+                &sdf::PathTable::new(),
+                true,
+            )
+        };
+
+        // The first build demands the target and waits on it. The load
+        // barrier finds no such asset and records that, which the build that
+        // follows reports, asking only that the barrier look again.
+        let (_, errors, pending, _deps, _copied) = build(&stack)?;
+        assert!(errors.is_empty(), "nothing is reported while the target is demanded");
+        assert!(matches!(pending.as_slice(), [demand] if !demand.recheck));
+        assert!(stack.intern_demanded(&pending));
+
+        let (index, errors, pending, _deps, _copied) = build(&stack)?;
+        assert!(matches!(pending.as_slice(), [demand] if demand.recheck));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, CompositionDiagnostic::UnresolvedLayer { .. })),
+            "expected a recorded UnresolvedLayer error, got {errors:?}"
+        );
+        assert!(
+            !index.is_empty(),
+            "the prim's local opinion must survive the skipped arc"
+        );
+        Ok(())
+    }
+
+    /// A reference to a layer without `defaultPrim` (and no explicit prim path)
+    /// is recorded as a recoverable `UnresolvedDefaultPrim` error and skipped.
+    #[test]
+    fn missing_default_prim_recorded() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "Prim" (
+    references = @target.usda@
+)
+{
+    custom string marker = "ok"
+}
+"#,
+        );
+        let target = parse_usda("#usda 1.0\ndef \"Foo\" {}\n");
+        let layers = vec![
+            sdf::Layer::new("root.usda", root),
+            sdf::Layer::new("target.usda", target),
+        ];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+
+        let (index, errors, _pending, _deps, _copied) = PrimIndex::build_with_cache(
+            &Path::new("/Prim").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+            &VariantFallbackMap::new(),
+            &sdf::PathTable::new(),
+            true,
+        )?;
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, CompositionDiagnostic::UnresolvedDefaultPrim { .. })),
+            "expected a recorded UnresolvedDefaultPrim error, got {errors:?}"
+        );
+        assert!(
+            !index.is_empty(),
+            "the prim's local opinion must survive the skipped arc"
+        );
+        Ok(())
+    }
+
+    // --- Variant fallbacks ---
+
+    /// Collects variant-arc paths from a prim index.
+    fn variant_paths(index: &PrimIndex) -> Vec<String> {
+        index
+            .nodes()
+            .filter(|n| n.arc() == ArcType::Variant)
+            .map(|n| n.path().as_str().to_string())
+            .collect()
+    }
+
+    /// With no fallback and no authored selection, the set stays unselected — no
+    /// variant arc is added (C++ `_EvalNodeFallbackVariant`; no implicit
+    /// first-variant default).
+    #[test]
+    fn variant_no_selection_unselected() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("variant_fallback.usda"))?;
+        let index = build(&mut stack, "/NoSelection");
+        let paths = variant_paths(&index);
+        assert!(
+            paths.is_empty(),
+            "no variant should be selected without an authored selection or fallback: got {paths:?}"
+        );
+        Ok(())
+    }
+
+    /// When a fallback map specifies "simple" as the preferred fallback, and no
+    /// authored selection exists, the composition should select "simple".
+    #[test]
+    fn variant_fallback_overrides_default() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("variant_fallback.usda"))?;
+        let fb = VariantFallbackMap::new().add("shadingComplexity", ["simple"]);
+        let index = build_with_fallbacks(&mut stack, "/NoSelection", fb);
+        let paths = variant_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("{shadingComplexity=simple}")),
+            "fallback should select 'simple': got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("{shadingComplexity=full}")),
+            "'full' should NOT be selected when fallback says 'simple'"
+        );
+        Ok(())
+    }
+
+    /// An authored selection should take priority over a variant fallback.
+    #[test]
+    fn variant_authored_selection_beats_fallback() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("variant_fallback.usda"))?;
+        let fb = VariantFallbackMap::new().add("shadingComplexity", ["none"]);
+        let index = build_with_fallbacks(&mut stack, "/Root", fb);
+        let paths = variant_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("{shadingComplexity=full}")),
+            "authored selection 'full' should win over fallback 'none': got {paths:?}"
+        );
+        Ok(())
+    }
+
+    /// When the fallback specifies a variant name that doesn't exist in the set,
+    /// it should be skipped and the next fallback (or default) should be used.
+    #[test]
+    fn variant_fallback_skips_nonexistent() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("variant_fallback.usda"))?;
+        let fb = VariantFallbackMap::new().add("shadingComplexity", ["ultra", "simple"]);
+        let index = build_with_fallbacks(&mut stack, "/NoSelection", fb);
+        let paths = variant_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("{shadingComplexity=simple}")),
+            "should skip 'ultra' and use 'simple': got {paths:?}"
+        );
+        Ok(())
+    }
+
+    /// When every configured fallback names a variant that does not exist in the
+    /// set, the set stays unselected — no variant arc is added.
+    #[test]
+    fn variant_fallback_all_invalid_unselected() -> Result<()> {
+        let mut stack = load_stack(&fixture_path("variant_fallback.usda"))?;
+        let fb = VariantFallbackMap::new().add("shadingComplexity", ["ultra", "mega"]);
+        let index = build_with_fallbacks(&mut stack, "/NoSelection", fb);
+        let paths = variant_paths(&index);
+        assert!(
+            paths.is_empty(),
+            "no variant should be selected when every fallback is invalid: got {paths:?}"
+        );
+        Ok(())
+    }
+
+    /// Exercises the node strength comparators on a hand-built tree, covering
+    /// every key: arc type, namespace depth, and the sibling-number tiebreak,
+    /// plus the ancestor-stronger rule for arbitrary nodes.
+    #[test]
+    fn node_strength_comparator() {
+        let p = |s: &str| Path::new(s).unwrap();
+        let id = MapFunction::identity();
+        let lid = LayerId::from_raw(0);
+        let lsid = LayerStackId::from_raw(1);
+        let mut g = PrimIndexGraph::default();
+        let desc = |path: &str, arc| NodeDesc::new(lsid, lid, p(path), arc, id.clone());
+        let root = g.add_child(NodeId::INVALID, desc("/A", ArcType::Root));
+        let inh = g.add_child(root, desc("/Class", ArcType::Inherit));
+        let r1 = g.add_child(root, desc("/R1", ArcType::Reference));
+        let r2 = g.add_child(root, desc("/R2", ArcType::Reference));
+
+        // Arc type: an inherit outranks a reference.
+        assert_eq!(g.compare_sibling_node_strength(inh, r1), Ordering::Less);
+        // Sibling number breaks ties between same-arc siblings: earlier wins.
+        assert_eq!(g.compare_sibling_node_strength(r1, r2), Ordering::Less);
+        assert_eq!(g.compare_sibling_node_strength(r2, r1), Ordering::Greater);
+
+        // Arbitrary nodes: an ancestor outranks its descendant.
+        assert_eq!(g.compare_node_strength(root, inh), Ordering::Less);
+        assert_eq!(g.compare_node_strength(inh, root), Ordering::Greater);
+        // Cousins resolve through their diverging ancestors.
+        assert_eq!(g.compare_node_strength(inh, r2), Ordering::Less);
+        assert_eq!(g.compare_node_strength(r2, r2), Ordering::Equal);
+
+        // Namespace depth: a deeper arc-introduction site is stronger.
+        let mut deeper = desc("/D", ArcType::Reference);
+        deeper.namespace_depth = Some(5);
+        let deep = g.add_child(root, deeper);
+        assert_eq!(g.compare_sibling_node_strength(deep, r1), Ordering::Less);
+    }
+
+    #[test]
+    fn arc_type_liverps_ordering() {
+        assert!(ArcType::Root < ArcType::Inherit);
+        assert!(ArcType::Inherit < ArcType::Variant);
+        assert!(ArcType::Variant < ArcType::Relocate);
+        assert!(ArcType::Relocate < ArcType::Reference);
+        assert!(ArcType::Reference < ArcType::Payload);
+        assert!(ArcType::Payload < ArcType::Specialize);
+    }
+
+    /// Helper: path into the spec supplemental composition test assets.
+    fn spec_composition_path(relative: &str) -> String {
+        format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/{relative}",
+            env!("CARGO_WORKSPACE_DIR")
+        )
+    }
+
+    /// Helper: extracts filename from an identifier (e.g. "/path/to/root.usd" → "root.usd").
+    fn layer_name(identifier: &str) -> &str {
+        std::path::Path::new(identifier)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(identifier)
+    }
+
+    /// Formats a prim stack as a vec of (`layer_name`, path) pairs for assertion.
+    fn prim_stack(index: &PrimIndex, stack: &LayerGraph) -> Vec<(String, String)> {
+        index
+            .nodes()
+            .map(|n| {
+                (
+                    layer_name(stack.identifier(n.layer_id())).to_owned(),
+                    n.path().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Validates that specializes opinions are globally weaker than all other
+    /// opinions. Matches the expected prim stack from the vendor test baseline
+    /// (spec 10.4.1 — specializes global weakness).
+    #[test]
+    fn specialize_global_weakness_basic() -> Result<()> {
+        let mut stack = load_stack(&spec_composition_path("BasicSpecializes_root/usda/root.usd"))?;
+        let index = build(&mut stack, "/Root");
+
+        // Expected from pcp.txt:
+        //   root.usd  /Root          (Root)
+        //   ref.usd   /Ref           (Reference)
+        //   ref2.usd  /Ref           (Reference)
+        //   root.usd  /Specializes   (Specialize — globally weak)
+        //   ref.usd   /Specializes   (Specialize)
+        //   ref2.usd  /Specializes   (Specialize)
+        //   root.usd  /Base          (Specialize)
+        //   ref.usd   /Base          (Specialize)
+        //   ref2.usd  /Base          (Specialize)
+        let ps = prim_stack(&index, &stack);
+        assert_eq!(
+            ps,
+            vec![
+                ("root.usd".into(), "/Root".into()),
+                ("ref.usd".into(), "/Ref".into()),
+                ("ref2.usd".into(), "/Ref".into()),
+                ("root.usd".into(), "/Specializes".into()),
+                ("ref.usd".into(), "/Specializes".into()),
+                ("ref2.usd".into(), "/Specializes".into()),
+                ("root.usd".into(), "/Base".into()),
+                ("ref.usd".into(), "/Base".into()),
+                ("ref2.usd".into(), "/Base".into()),
+            ]
+        );
+
+        // Verify the specialize flag in strength order: first 3 nodes are
+        // non-specialize, remaining 6 are specialize.
+        let ns: Vec<_> = index.nodes().collect();
+        for node in &ns[..3] {
+            assert!(
+                !node.flags().contains(NodeFlags::HAS_SPECIALIZES),
+                "node {:?} should not be specialize",
+                node.path()
+            );
+        }
+        for node in &ns[3..] {
+            assert!(
+                node.flags().contains(NodeFlags::HAS_SPECIALIZES),
+                "node {:?} should be specialize",
+                node.path()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Validates global weakness with multiple specializes arcs. Specializes
+    /// opinions from both targets appear after all reference opinions.
+    #[test]
+    fn specialize_global_weakness_multiple() -> Result<()> {
+        let mut stack = load_stack(&spec_composition_path("BasicSpecializes_root/usda/root.usd"))?;
+        let index = build(&mut stack, "/MultipleSpecializes");
+
+        // Non-specialize opinions must come before all specialize opinions.
+        let first_spec = index
+            .nodes()
+            .position(|n| n.flags().contains(NodeFlags::HAS_SPECIALIZES))
+            .expect("should have specialize nodes");
+        assert!(first_spec >= 2, "at least Root + Reference before specializes");
+
+        // All nodes after the first specialize must also be specialize.
+        for node in index.nodes().skip(first_spec) {
+            assert!(
+                node.flags().contains(NodeFlags::HAS_SPECIALIZES),
+                "node {:?} should be globally weak",
+                node.path()
+            );
+        }
+        Ok(())
+    }
+
+    /// Without references, specializes still appear after local opinions in
+    /// the correct chain order.
+    #[test]
+    fn specialize_chain_ordering() -> Result<()> {
+        let mut stack = load_stack(&spec_composition_path("BasicSpecializes_root/usda/root.usd"))?;
+        let index = build(&mut stack, "/Basic");
+
+        // Expected from pcp.txt:
+        //   root.usd  /Basic               (Root)
+        //   root.usd  /BasicSpecializes1   (Specialize)
+        //   root.usd  /BasicSpecializes2   (Specialize)
+        let ps = prim_stack(&index, &stack);
+        assert_eq!(
+            ps,
+            vec![
+                ("root.usd".into(), "/Basic".into()),
+                ("root.usd".into(), "/BasicSpecializes1".into()),
+                ("root.usd".into(), "/BasicSpecializes2".into()),
+            ]
+        );
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Layer time offsets — spec 10.3.1.1 / 10.3.2.1.2 / 10.3.2.2.2
+    //
+    // Verified against the upstream core-spec vendor golden
+    // (`BasicTimeOffset_root/pcp.txt`). The fixture builds three arc
+    // variants from root.usd:
+    //   - /Root             : reference to A.usd (offset=10) which
+    //                          sublayers B.usd (offset=20).
+    //   - /PayloadRefPayload: payload to ref.usd (offset=10; scale=2) which
+    //                          sublayers ref_sub.usd (offset=20). ref_sub's
+    //                          /Ref has a payload to B.usd/Model.
+    //   - /PayloadMultiRef  : payload to ref.usd (offset=10; scale=2) which
+    //                          sublayers ref_sub.usd (offset=20). ref_sub's
+    //                          /Ref2 has a reference to B.usd/Model.
+    // -------------------------------------------------------------------
+
+    /// Iterates `node`'s layer-stack members strongest first, each paired with
+    /// its effective time offset to the root namespace: the node's arc offset
+    /// (`map_to_root`) folded onto the member's sublayer offset. Unlike the
+    /// memoized spec stack — which keeps only spec-authoring members — this lists
+    /// every member, so [`offset_stack`] can assert the offset folding on layers
+    /// that author no spec at the node's path.
+    fn node_layer_offsets(node: Node<'_>, graph: &LayerGraph) -> Vec<(LayerId, LayerOffset)> {
+        let arc_offset = node.map_to_root().time_offset();
+        graph
+            .layer_stack(node.layer_stack_id())
+            .iter()
+            .map(|&(li, sub)| (li, arc_offset.concatenate(&sub)))
+            .collect()
+    }
+
+    /// Returns `(layer_name, node_path, arc_type, offset, scale)` tuples for
+    /// every node in the prim stack. The offset/scale values are the effective
+    /// [`sdf::LayerOffset`] carried by the node — i.e., the composition of
+    /// every arc offset and sublayer offset from the stage root down to this
+    /// node's layer.
+    fn offset_stack(index: &PrimIndex, stack: &LayerGraph) -> Vec<(String, String, ArcType, f64, f64)> {
+        index
+            .nodes()
+            .flat_map(|n| {
+                let path = n.path().to_string();
+                let arc = n.arc();
+                // One row per contributing sublayer, carrying that layer's
+                // effective offset.
+                node_layer_offsets(n, stack).into_iter().map(move |(li, off)| {
+                    (
+                        layer_name(stack.identifier(li)).to_owned(),
+                        path.clone(),
+                        arc,
+                        off.offset,
+                        off.scale,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn basic_time_offset_stack() -> Result<LayerGraph> {
+        load_stack(&spec_composition_path("BasicTimeOffset_root/usda/root.usd"))
+    }
+
+    #[test]
+    fn time_offset_reference_then_sublayer() -> Result<()> {
+        // /Root references A.usd (offset=10, scale=1).
+        // A.usd sublayers B.usd (offset=20, scale=1).
+        // Expected effective offsets (from pcp.txt):
+        //   root.usd /Root  (0, 1)
+        //   A.usd    /Model (10, 1)    [reference arc]
+        //   B.usd    /Model (30, 1)    [sublayer of A]  = (10,1) ∘ (20,1)
+        let mut stack = basic_time_offset_stack()?;
+        let index = build(&mut stack, "/Root");
+        assert_eq!(
+            offset_stack(&index, &stack),
+            vec![
+                ("root.usd".into(), "/Root".into(), ArcType::Root, 0.0, 1.0),
+                ("A.usd".into(), "/Model".into(), ArcType::Reference, 10.0, 1.0),
+                ("B.usd".into(), "/Model".into(), ArcType::Reference, 30.0, 1.0),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_offset_payload_with_scale_and_sublayer() -> Result<()> {
+        // /PayloadRefPayload payload = ref.usd (offset=10, scale=2).
+        // ref.usd sublayers ref_sub.usd (offset=20, scale=1).
+        // ref_sub's /Ref payload = B.usd/Model (no offset).
+        // Expected from pcp.txt:
+        //   root.usd    /PayloadRefPayload (0, 1)
+        //   ref.usd     /Ref                (10, 2)    [payload arc; ref.usd has no /Ref spec → L empty]
+        //   ref_sub.usd /Ref                (50, 2)    [sublayer of ref.usd: (10,2) ∘ (20,1) = (50, 2)]
+        //   B.usd       /Model              (50, 2)    [payload from ref_sub.usd, default offset]
+        let mut stack = basic_time_offset_stack()?;
+        let index = build(&mut stack, "/PayloadRefPayload");
+        let got = offset_stack(&index, &stack);
+
+        // ref.usd has no /Ref spec (only ref_sub.usd does), so the
+        // effective-offset chain surfaces at ref_sub.usd. Assert the
+        // opinions that *must* be present with their effective offsets.
+        assert!(
+            got.contains(&("root.usd".into(), "/PayloadRefPayload".into(), ArcType::Root, 0.0, 1.0,)),
+            "missing root opinion: got {got:?}"
+        );
+        assert!(
+            got.contains(&("ref_sub.usd".into(), "/Ref".into(), ArcType::Payload, 50.0, 2.0)),
+            "missing ref_sub /Ref payload opinion at (50,2): got {got:?}"
+        );
+        assert!(
+            got.contains(&("B.usd".into(), "/Model".into(), ArcType::Payload, 50.0, 2.0)),
+            "missing B.usd /Model payload opinion at (50,2): got {got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_offset_payload_with_nested_reference() -> Result<()> {
+        // /PayloadMultiRef payload = ref.usd/Ref2 (offset=10, scale=2).
+        // ref.usd sublayers ref_sub.usd (offset=20, scale=1).
+        // ref_sub's /Ref2 references B.usd/Model (no offset).
+        // Expected from pcp.txt:
+        //   root.usd    /PayloadMultiRef (0, 1)
+        //   ref_sub.usd /Ref2             (50, 2)
+        //   B.usd       /Model            (50, 2)    [reference; scale carries through]
+        let mut stack = basic_time_offset_stack()?;
+        let index = build(&mut stack, "/PayloadMultiRef");
+        let got = offset_stack(&index, &stack);
+
+        assert!(
+            got.contains(&("root.usd".into(), "/PayloadMultiRef".into(), ArcType::Root, 0.0, 1.0,)),
+            "missing root opinion: got {got:?}"
+        );
+        assert!(
+            got.contains(&("ref_sub.usd".into(), "/Ref2".into(), ArcType::Payload, 50.0, 2.0)),
+            "missing ref_sub /Ref2 payload opinion: got {got:?}"
+        );
+        assert!(
+            got.contains(&("B.usd".into(), "/Model".into(), ArcType::Reference, 50.0, 2.0)),
+            "missing B.usd /Model ref opinion at (50,2): got {got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn time_offset_descendant_inherits_parents_offset() -> Result<()> {
+        // /Root/Anim is a descendant of /Root, which references A.usd
+        // (offset=10). A.usd sublayers B.usd (offset=20). /Model/Anim lives
+        // in B.usd only.
+        // Per pcp.txt, /Root/Anim should have:
+        //   B.usd /Model/Anim (30, 1)    [effective: ref 10 ∘ sublayer 20]
+        let mut stack = basic_time_offset_stack()?;
+        let index = build(&mut stack, "/Root/Anim");
+        let got = offset_stack(&index, &stack);
+
+        assert!(
+            got.contains(&("B.usd".into(), "/Model/Anim".into(), ArcType::Reference, 30.0, 1.0)),
+            "missing /Model/Anim at effective (30, 1): got {got:?}"
+        );
+        Ok(())
+    }
+
+    /// `resolve_time_samples` must map authored layer times to stage times
+    /// through the node's effective offset (spec 12.3.2.1): /Root references
+    /// model.usd</Model> with offset=10, scale=2, so samples authored at layer
+    /// times 1 and 5 resolve to stage times 12 and 20.
+    #[test]
+    fn time_samples_retimed_across_reference() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "Root" (
+    references = @model.usd@</Model> (offset = 10; scale = 2)
+)
+{
+}
+"#,
+        );
+        let model = parse_usda(
+            r#"#usda 1.0
+def "Model"
+{
+    double radius.timeSamples = {
+        1: 0.0,
+        5: 1.0,
+    }
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("model.usd", model)];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = PrimIndex::build_with_context(
+            &Path::new("/Root").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+        )?;
+
+        let samples = index
+            .resolve_time_samples(&stack.read_view(), Some(".radius"))?
+            .expect("retimed samples");
+        let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![12.0, 20.0]);
+        Ok(())
+    }
+
+    /// `rebase_root` re-anchors only the path side of each map, so the spec
+    /// stack's node ids and folded time offsets survive a prototype
+    /// materialization. Value resolution over a materialized prototype reads
+    /// those offsets, so this locks the invariant the instancing clone relies on.
+    #[test]
+    fn spec_stack_offsets_survive_rebase() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "Root" (
+    references = @model.usd@</Model> (offset = 10; scale = 2)
+)
+{
+}
+"#,
+        );
+        let model = parse_usda("#usda 1.0\ndef \"Model\" { custom double radius = 1.0 }\n");
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("model.usd", model)];
+        let stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = PrimIndex::build_with_context(
+            &Path::new("/Root").unwrap(),
+            &stack.read_view(),
+            &CompositionContext::default(),
+        )?;
+
+        let sites = |index: &PrimIndex| -> Vec<(NodeId, f64, f64)> {
+            index
+                .live_spec_sites()
+                .map(|(s, _)| (s.node, s.offset.offset, s.offset.scale))
+                .collect()
+        };
+        let before = sites(&index);
+        assert!(
+            before.iter().any(|&(_, off, scale)| off == 10.0 && scale == 2.0),
+            "the referenced Model site carries the arc's (offset=10, scale=2): {before:?}"
+        );
+
+        let mut rebased = index.clone();
+        rebased.rebase_root(&Path::new("/Root").unwrap(), &Path::new("/__Prototype_2").unwrap());
+        assert_eq!(
+            before,
+            sites(&rebased),
+            "rebase_root must preserve spec-stack node ids and folded offsets"
+        );
+        Ok(())
+    }
+
+    /// `rebase_root` moves an erased node's recorded map with the graph's, so a
+    /// change at its site lands in the prototype namespace.
+    #[test]
+    fn culled_deps_survive_rebase() {
+        let root = parse_usda(
+            "#usda 1.0
+def \"Ref\" {
+}
+def \"Root\" ( references = </Ref> ) {
+  def \"Child\" {}
+}
+",
+        );
+        let mut index = build(&mut one_layer_stack(root), "/Root/Child");
+        let site = Path::new("/Ref/Child").unwrap();
+        let culled = |index: &PrimIndex| {
+            index
+                .culled_dependencies()
+                .iter()
+                .find(|c| c.site == site)
+                .and_then(|c| c.translate(&site))
+        };
+        assert_eq!(culled(&index), Some(Path::new("/Root/Child").unwrap()));
+        index.rebase_root(&Path::new("/Root").unwrap(), &Path::new("/__Prototype_2").unwrap());
+        assert_eq!(culled(&index), Some(Path::new("/__Prototype_2/Child").unwrap()));
+    }
+
+    // Spec §10.3.2.1.2 / §10.3.2.2.2 / §10.3.1.1: a layer offset with
+    // `scale <= 0` is a composition error; the offset falls back to the
+    // default `(0.0, 1.0)`.
+
+    #[test]
+    fn reference_offset_zero_scale_falls_back_to_identity() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "Root" (
+    references = @model.usd@</Model> (offset = 10; scale = 0)
+)
+{
+}
+"#,
+        );
+        let model = parse_usda(
+            r#"#usda 1.0
+def "Model" {}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("model.usd", model)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/Root");
+        let got = offset_stack(&index, &stack);
+        assert!(
+            got.contains(&("model.usd".into(), "/Model".into(), ArcType::Reference, 0.0, 1.0)),
+            "expected reference offset to fall back to identity for scale=0: got {got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn payload_offset_negative_scale_falls_back_to_identity() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "Root" (
+    payload = @model.usd@</Model> (offset = 5; scale = -2)
+)
+{
+}
+"#,
+        );
+        let model = parse_usda(
+            r#"#usda 1.0
+def "Model" {}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("model.usd", model)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/Root");
+        let got = offset_stack(&index, &stack);
+        assert!(
+            got.contains(&("model.usd".into(), "/Model".into(), ArcType::Payload, 0.0, 1.0)),
+            "expected payload offset to fall back to identity for scale=-2: got {got:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sublayer_offset_zero_scale_falls_back_to_identity() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+(
+    subLayers = [
+        @sub.usda@ (offset = 10; scale = 0)
+    ]
+)
+def "Root" {}
+"#,
+        );
+        let sub = parse_usda(
+            r#"#usda 1.0
+def "Root" {}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("sub.usda", sub)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/Root");
+        let got = offset_stack(&index, &stack);
+        assert!(
+            got.iter().any(|(name, path, _, off, scale)| name == "sub.usda"
+                && path == "/Root"
+                && *off == 0.0
+                && *scale == 1.0),
+            "expected sublayer offset to fall back to identity for scale=0: got {got:?}"
+        );
+        Ok(())
+    }
+
+    /// `clipSets` order folds list-op edits across layers (spec 12.2.6): the
+    /// root's `prepend` and the sublayer's `append` both contribute, rather
+    /// than the strongest opinion alone winning.
+    #[test]
+    fn clip_sets_order_folds_layers() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+(
+    subLayers = [
+        @sub.usda@
+    ]
+)
+def "P" (
+    prepend clipSets = ["a"]
+)
+{
+}
+"#,
+        );
+        let sub = parse_usda(
+            r#"#usda 1.0
+over "P" (
+    append clipSets = ["b"]
+)
+{
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("sub.usda", sub)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/P");
+
+        // Strongest-only resolution would drop the weaker "b"; folding keeps it.
+        assert_eq!(
+            index.clip_sets_order(&stack.read_view())?,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        Ok(())
+    }
+
+    /// `clipSets` is unauthored across the stack: order resolves to `None` so
+    /// clip sets fall back to name order (spec 12.3.4.1).
+    #[test]
+    fn clip_sets_order_unauthored() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "P" {}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/P");
+
+        assert_eq!(index.clip_sets_order(&stack.read_view())?, None);
+        Ok(())
+    }
+
+    /// An authored-but-empty `clipSets` (explicit `[]`) is distinct from an
+    /// unauthored field: it composes to `Some([])`, meaning no clip sets are
+    /// active, rather than `None` (name-order fallback). Matches C++
+    /// `Usd_ClipSetDefinition`, which applies the list op over an empty base.
+    #[test]
+    fn clip_sets_order_authored_empty() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+def "P" (
+    clipSets = []
+)
+{
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/P");
+
+        assert_eq!(index.clip_sets_order(&stack.read_view())?, Some(Vec::new()));
+        Ok(())
+    }
+
+    /// A stronger `add` repeating a name a weaker layer `prepend`s must keep the
+    /// set in the resolved order. Sequential list-op application (`compose_over`)
+    /// keeps one copy; folding into a single list op via `combined_with` would
+    /// leave the name in two buckets and `flatten` would drop it.
+    #[test]
+    fn clip_sets_order_overlapping_add_prepend() -> Result<()> {
+        let root = parse_usda(
+            r#"#usda 1.0
+(
+    subLayers = [
+        @sub.usda@
+    ]
+)
+def "P" (
+    add clipSets = ["a"]
+)
+{
+}
+"#,
+        );
+        let sub = parse_usda(
+            r#"#usda 1.0
+over "P" (
+    prepend clipSets = ["a"]
+)
+{
+}
+"#,
+        );
+        let layers = vec![sdf::Layer::new("root.usda", root), sdf::Layer::new("sub.usda", sub)];
+        let mut stack = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let index = build(&mut stack, "/P");
+
+        assert_eq!(index.clip_sets_order(&stack.read_view())?, Some(vec!["a".to_string()]));
+        // The list-op form (behind `ClipsAPI::clip_sets`) stays canonical, so
+        // flattening it agrees with the resolved order rather than dropping "a".
+        let list_op = index.clip_sets_list_op(&stack.read_view())?.expect("authored");
+        assert_eq!(list_op.flatten(), vec!["a".to_string()]);
+        Ok(())
+    }
+}

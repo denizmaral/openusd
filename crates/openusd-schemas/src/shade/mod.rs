@@ -1,0 +1,483 @@
+//! UsdShade schema views.
+//!
+//! Typed value-views over a composed [`openusd::usd::Stage`], mirroring Pixar's
+//! `UsdShade` family — the material / shading-network schema. Unlike the
+//! geometry / lighting families, its substance is *connection topology* rather
+//! than a flat set of typed attributes: a [`Material`] contains [`Shader`]
+//! prims whose `inputs:` / `outputs:` attributes are wired together by
+//! connections ([`connectionPaths`](openusd::sdf::FieldKey::ConnectionPaths)).
+//!
+//! ```text
+//! SchemaBase
+//!  ├ Connectable (interface; inputs: / outputs:)
+//!  │  ├ Shader             (typed; info:id + NodeDefAPI surface)
+//!  │  └ NodeGraphInterface (interface-input consumer maps)
+//!  │     ├ NodeGraph       (typed; a shading-network container)
+//!  │     └ Material        (typed; surface / displacement / volume terminals)
+//!  ├ MaterialBindingAPI (single-apply; direct + collection bindings)
+//!  └ CoordSysAPI        (multiple-apply; named coordinate systems)
+//! ```
+//!
+//! [`Connectable`] is the shared `inputs:` / `outputs:` surface (C++
+//! `UsdShadeConnectableAPI`). A prim is connectable where it has a
+//! [`Behavior`], which a [`BehaviorRegistry`] finds for its type and API
+//! schemas; [`ConnectableAPI::from_prim`] views any such prim, and every query
+//! that asks whether a prim is a container runs under a
+//! [`ConnectableContext`]. A behavior also decides which connections its
+//! prim's attributes may take, which [`Input::can_connect`] and
+//! [`Output::can_connect`] ask, refusing by a [`Refusal`] of the
+//! [`rules`]. [`Input`] and [`Output`] are typed views over the
+//! underlying [`Attribute`](openusd::usd::Attribute). Connections remain core
+//! attribute `connectionPaths`, available as raw composed paths through
+//! [`Attribute::connections`](openusd::usd::Attribute::connections).
+//! [`ConnectedSources`] interprets those paths as valid or invalid UsdShade
+//! sources, and [`Input::value_producing_attributes`] /
+//! [`Output::value_producing_attributes`] follow container interfaces to the
+//! logical shader outputs or authored interface values behind an attribute,
+//! as far as [`ProducerFilter`] admits. [`NodeGraphInterface`] maps interface
+//! inputs in the reverse direction to their consumers. Specialized consumers
+//! include [`Material::surface_source`] and [`read_preview_surface`].
+//! [`MaterialBindingAPI::resolve_binding`] is material resolution over a prim
+//! and its ancestors, answering the [`ResolvedBinding`] that wins among the
+//! [`DirectBinding`]s and [`CollectionBinding`]s they carry.
+//! [`CoordSysAPI::resolve_bindings`] answers the coordinate systems in force
+//! at a prim, the nearest binding of each name among the prim and its
+//! ancestors, as [`CoordSysBinding`]s over a [`CoordSysCache`]. [`UdimPath`]
+//! reads a texture path standing for a set of UDIM tiles and finds them (C++
+//! `UsdShadeUdimUtils`). [`Material::base_material`] is the material a
+//! specializes arc of the prim's own names.
+//! [`MaterialBindingAPI::create_subset`] and [`MaterialBindingAPI::subsets`]
+//! are the `materialBind` family of [`Subset`](crate::geom::Subset)s a prim's
+//! geometry is bound by.
+//! [`NodeDefAPI::implementation`] and the source queries interpret the
+//! active `NodeDef` implementation family, which the matching setters
+//! ([`NodeDefAPI::set_source_asset`] and friends) select. A shader reaches
+//! them through [`Shader::node_def`]. [`SdrMetadata`] carries
+//! the composed shader-registry metadata on shaders, inputs, and outputs.
+//! To find every shading prim on a stage, traverse it and gate each prim
+//! through the typed `get` (e.g. [`Material::get`]), mirroring C++
+//! `prim.IsA<UsdShadeMaterial>()`.
+//!
+//! # Example
+//!
+//! ```
+//! use openusd_schemas::shade::{self, Connectable};
+//! use openusd::{usd, vt};
+//!
+//! let stage = usd::Stage::builder()
+//!     .schema_registry(openusd_schemas::schema_registry())
+//!     .in_memory("scene.usda").unwrap();
+//!
+//! let surface = shade::Shader::define(&stage, "/Mat/Surface").unwrap();
+//! surface.node_def().create_id_attr().unwrap().set(vt::Value::token("UsdPreviewSurface")).unwrap();
+//! surface.create_input("roughness", "float").unwrap().set(0.4_f32).unwrap();
+//! let terminal = surface.create_output("surface", "token").unwrap();
+//!
+//! shade::Material::define(&stage, "/Mat").unwrap()
+//!     .create_surface_output().unwrap()
+//!     .connect_to(&terminal).unwrap();
+//!
+//! let mat = shade::Material::get(&stage, "/Mat").unwrap().expect("Material");
+//! let terminal = mat.surface_source(&[]).unwrap().expect("surface terminal");
+//! let source = terminal.sources().first().expect("surface source");
+//! let shader = source.shader().expect("shader-typed source");
+//! assert_eq!(shader.node_def().shader_id().unwrap().as_deref(), Some("UsdPreviewSurface"));
+//! ```
+
+openusd::include_schema!("usdShade");
+
+pub mod nodes;
+
+pub(crate) mod behavior;
+mod binding;
+mod connectable;
+mod coord_sys;
+mod input;
+mod interface;
+mod material;
+mod node_def;
+mod output;
+mod preview;
+mod traits;
+mod utils;
+
+pub use behavior::{Behavior, BehaviorRegistry, ConnectableContext, NodeKind, Refusal, rules};
+pub use binding::{
+    BindingCache, CollectionBinding, DirectBinding, MATERIAL_PURPOSES, ResolvedBinding, binding_strength,
+    set_binding_strength,
+};
+pub use connectable::{
+    AttributeType, ConnectedSources, ConnectionModification, ConnectionSource, ConnectionTarget, ShadingAttribute,
+    base_name, base_name_and_type,
+};
+pub use coord_sys::{CoordSysBinding, CoordSysCache};
+pub use input::Input;
+pub use interface::{InterfaceInputConsumersMap, NodeGraphInterface};
+pub use material::{ResolvedTerminal, TerminalKind, TerminalSource};
+pub use node_def::{
+    INFO_NAMESPACE, INFO_SOURCE_ASSET, INFO_SOURCE_ASSET_SUBIDENTIFIER, INFO_SOURCE_CODE, SUBIDENTIFIER_SUFFIX,
+    SdrMetadata,
+};
+pub use output::Output;
+pub use preview::{Channel, ReadPreviewSurface, read_preview_surface};
+pub use traits::Connectable;
+pub use utils::ProducerFilter;
+
+/// The UDIM path utilities (C++ `UsdShadeUdimUtils`), which the core carries
+/// for its dependency walk.
+pub use openusd::ar::{UdimPath, UdimTile};
+
+use tokens::*;
+
+/// Implement the shading-attribute surface shared by [`Input`] and [`Output`]:
+/// the namespace-checked constructors, the fluent authoring setters, the
+/// connection queries, and the [`SdrMetadata`] accessors. `$prefix` is the
+/// namespace prefix every attribute the view wraps carries. All paths are fully
+/// qualified, so the call site only needs the macro in scope.
+macro_rules! impl_shading_attribute {
+    ($ty:ident, $prefix:expr) => {
+        impl $ty {
+            /// Wrap `attribute` when its name carries this view's namespace
+            /// prefix, the name test of C++ `UsdShadeInput::IsInput` /
+            /// `UsdShadeOutput::IsOutput`, which also ask that the attribute
+            /// is defined.
+            pub fn from_attribute(attribute: $crate::openusd::usd::Attribute) -> Option<Self> {
+                let namespaced = attribute.name().starts_with($prefix);
+                namespaced.then_some(Self { attribute })
+            }
+
+            /// The underlying composed USD attribute.
+            pub fn attribute(&self) -> &$crate::openusd::usd::Attribute {
+                &self.attribute
+            }
+
+            /// Consume this view and return its underlying USD attribute.
+            pub fn into_attribute(self) -> $crate::openusd::usd::Attribute {
+                self.attribute
+            }
+
+            /// The full attribute name, namespace prefix included, or `""`
+            /// when the handle addresses no property — what a base name USD
+            /// rejects leaves behind.
+            pub fn full_name(&self) -> &str {
+                self.attribute.name()
+            }
+
+            /// The base name, with this view's namespace prefix stripped
+            /// (C++ `GetBaseName`), or `""` when the handle addresses no
+            /// namespaced property.
+            pub fn base_name(&self) -> &str {
+                self.full_name().strip_prefix($prefix).unwrap_or_default()
+            }
+
+            /// Author this attribute's default value.
+            pub fn set(
+                self,
+                value: impl Into<$crate::openusd::vt::Value>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.set(value).map(Self::new)
+            }
+
+            /// Author this attribute's value at a numeric time code.
+            pub fn set_at(
+                self,
+                value: impl Into<$crate::openusd::vt::Value>,
+                time: impl Into<Option<$crate::openusd::usd::TimeCode>>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.set_at(value, time).map(Self::new)
+            }
+
+            /// Replace this attribute's composed connection source paths.
+            pub fn set_connections(
+                self,
+                targets: impl IntoIterator<Item: $crate::openusd::sdf::IntoPath>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.set_connections(targets).map(Self::new)
+            }
+
+            /// Connect this attribute to `source`, replacing existing
+            /// connections (C++ `UsdShadeConnectableAPI::ConnectToSource`);
+            /// see [`connect_to_with`](Self::connect_to_with).
+            pub fn connect_to(
+                self,
+                source: &impl $crate::shade::ConnectionTarget,
+            ) -> Result<Self, $crate::SchemaError> {
+                self.connect_to_with(source, $crate::shade::ConnectionModification::Replace)
+            }
+
+            /// Connect this attribute to `source`, placed among its
+            /// connections as `modification` says (C++
+            /// `UsdShadeConnectableAPI::ConnectToSource`).
+            ///
+            /// Only a shading attribute can be named as a source, which is
+            /// what [`ConnectionTarget`](crate::shade::ConnectionTarget)
+            /// admits. A source that is not defined is authored first, with
+            /// this attribute's type (C++ `_GetOrCreateSourceAttr`). The
+            /// connection is authored whatever `can_connect` would answer, as
+            /// C++ `ConnectToSource` authors it.
+            pub fn connect_to_with(
+                self,
+                source: &impl $crate::shade::ConnectionTarget,
+                modification: $crate::shade::ConnectionModification,
+            ) -> Result<Self, $crate::SchemaError> {
+                let path = $crate::shade::connectable::define_source(source.attribute(), &self.attribute)?;
+                let attribute = match modification {
+                    $crate::shade::ConnectionModification::Replace => self.attribute.set_connections([path]),
+                    $crate::shade::ConnectionModification::Prepend => self
+                        .attribute
+                        .add_connection_at(path, $crate::openusd::usd::ListPosition::FrontOfPrepend),
+                    $crate::shade::ConnectionModification::Append => self
+                        .attribute
+                        .add_connection_at(path, $crate::openusd::usd::ListPosition::BackOfAppend),
+                }?;
+                Ok(Self::new(attribute))
+            }
+
+            /// Connect this attribute to `sources` alone, in order (C++
+            /// `UsdShadeConnectableAPI::SetConnectedSources`). A source that
+            /// is not defined is authored first, as
+            /// [`connect_to_with`](Self::connect_to_with) authors it.
+            pub fn set_connected_sources(
+                self,
+                sources: impl IntoIterator<Item: $crate::shade::ConnectionTarget>,
+            ) -> Result<Self, $crate::SchemaError> {
+                let paths = sources
+                    .into_iter()
+                    .map(|source| {
+                        let source = $crate::shade::ConnectionTarget::attribute(&source);
+                        $crate::shade::connectable::define_source(source, &self.attribute)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(self.set_connections(paths)?)
+            }
+
+            /// The first valid connection source, the one a single-connection
+            /// attribute has (C++ `GetConnectedSource`). Any further source is
+            /// dropped without diagnostic; a multi-connection reads through
+            /// [`connected_sources`](Self::connected_sources).
+            ///
+            /// TODO(perf): this and
+            /// [`has_connected_source`](Self::has_connected_source) resolve
+            /// every connection; stopping at the first valid source would
+            /// answer both sooner.
+            pub fn connected_source(&self) -> $crate::openusd::Result<Option<$crate::shade::ConnectionSource>> {
+                Ok(self.connected_sources()?.into_sources().into_iter().next())
+            }
+
+            /// Whether a valid connection source is composed (C++
+            /// `HasConnectedSource`).
+            pub fn has_connected_source(&self) -> $crate::openusd::Result<bool> {
+                Ok(!self.connected_sources()?.sources().is_empty())
+            }
+
+            /// Whether the strongest connection opinion on this attribute is
+            /// authored across a specializes arc, as a base material's is
+            /// (C++ `IsSourceConnectionFromBaseMaterial`).
+            pub fn source_from_base_material(&self) -> $crate::openusd::Result<bool> {
+                $crate::shade::connectable::source_from_base_material(&self.attribute)
+            }
+
+            /// Block every connection with an explicit empty connection list
+            /// on the edit target, which hides the sources weaker layers
+            /// author (C++ `DisconnectSource` given no source).
+            pub fn disconnect(self) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.block_connections().map(Self::new)
+            }
+
+            /// Remove the connection to `source` (C++ `DisconnectSource` given
+            /// a source): `true` where an opinion changed. The edit target
+            /// records a delete of the path. That delete also removes a
+            /// connection a weaker layer authors.
+            pub fn disconnect_source(
+                &self,
+                source: &impl $crate::shade::ConnectionTarget,
+            ) -> Result<bool, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.remove_connection(source.attribute().path())
+            }
+
+            /// Drop the edit target's connection opinion (C++ `ClearSources`).
+            /// The sources weaker layers author compose again.
+            pub fn clear_sources(self) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute.clear_connections().map(Self::new)
+            }
+
+            /// The renderer-specific `renderType` hint, when authored.
+            pub fn render_type(&self) -> $crate::openusd::Result<Option<$crate::openusd::tf::Token>> {
+                $crate::shade::AttributeMetadata::render_type(&self.attribute)
+            }
+
+            /// Author this attribute's renderer-specific `renderType` hint.
+            pub fn set_render_type(
+                self,
+                render_type: impl Into<$crate::openusd::tf::Token>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                $crate::shade::AttributeMetadata::set_render_type(self.attribute, render_type.into()).map(Self::new)
+            }
+
+            /// The composed `sdrMetadata` dictionary on this shading attribute.
+            ///
+            /// TODO(perf): each query in this group re-composes and clones the
+            /// whole dictionary, so reading N keys costs N compositions.
+            pub fn sdr_metadata(&self) -> $crate::openusd::Result<$crate::shade::SdrMetadata> {
+                $crate::shade::node_def::attribute_sdr_metadata(&self.attribute)
+            }
+
+            /// The composed `sdrMetadata` value for `key` on this shading
+            /// attribute.
+            pub fn sdr_metadata_by_key(&self, key: impl AsRef<str>) -> $crate::openusd::Result<Option<String>> {
+                $crate::shade::node_def::attribute_sdr_metadata_by_key(&self.attribute, key.as_ref())
+            }
+
+            /// Whether a composed `sdrMetadata` field exists on this shading
+            /// attribute.
+            pub fn has_sdr_metadata(&self) -> $crate::openusd::Result<bool> {
+                $crate::shade::node_def::attribute_has_sdr_metadata(&self.attribute)
+            }
+
+            /// Whether this shading attribute's composed `sdrMetadata`
+            /// dictionary contains `key`, whatever the entry's value type.
+            pub fn has_sdr_metadata_by_key(&self, key: impl AsRef<str>) -> $crate::openusd::Result<bool> {
+                $crate::shade::node_def::attribute_has_sdr_metadata_by_key(&self.attribute, key.as_ref())
+            }
+
+            /// Author `sdrMetadata` entries on this shading attribute
+            /// (C++ `UsdShadeInput` / `UsdShadeOutput::SetSdrMetadata`).
+            ///
+            /// Entries merge into the dictionary the edit target already holds,
+            /// so keys this call does not name keep composing from wherever
+            /// they are authored.
+            pub fn set_sdr_metadata(
+                self,
+                metadata: &$crate::shade::SdrMetadata,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                $crate::shade::node_def::set_attribute_sdr_metadata(self.attribute, metadata).map(Self::new)
+            }
+
+            /// Author one `sdrMetadata` entry on this shading attribute
+            /// (C++ `SetSdrMetadataByKey`).
+            pub fn set_sdr_metadata_by_key(
+                self,
+                key: impl Into<String>,
+                value: impl Into<String>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                $crate::shade::node_def::set_attribute_sdr_metadata_by_key(self.attribute, key.into(), value.into())
+                    .map(Self::new)
+            }
+
+            /// Drop this shading attribute's whole `sdrMetadata` opinion on the
+            /// edit-target layer (C++ `ClearSdrMetadata`).
+            pub fn clear_sdr_metadata(self) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                self.attribute
+                    .clear_metadata($crate::shade::tokens::SDR_METADATA)
+                    .map(Self::new)
+            }
+
+            /// Drop one `sdrMetadata` entry from this shading attribute's
+            /// opinion on the edit-target layer (C++ `ClearSdrMetadataByKey`).
+            pub fn clear_sdr_metadata_by_key(
+                self,
+                key: impl AsRef<str>,
+            ) -> Result<Self, $crate::openusd::usd::StageAuthoringError> {
+                $crate::shade::node_def::clear_attribute_sdr_metadata_by_key(self.attribute, key.as_ref())
+                    .map(Self::new)
+            }
+
+            /// Valid and invalid upstream connection sources, in composed order
+            /// (C++ `UsdShadeConnectableAPI::GetConnectedSources`).
+            pub fn connected_sources(&self) -> $crate::openusd::Result<$crate::shade::ConnectedSources> {
+                $crate::shade::connectable::connected_sources(&self.attribute)
+            }
+
+            /// The logical attributes that produce this attribute's value,
+            /// following connections through the interfaces of the containers
+            /// the default [`ConnectableContext`](crate::shade::ConnectableContext)
+            /// knows (C++ `UsdShadeUtils::GetValueProducingAttributes`).
+            ///
+            /// A connection cycle terminates the walk that entered it, so a
+            /// chain that closes on itself contributes no producer.
+            pub fn value_producing_attributes(
+                &self,
+                filter: $crate::shade::ProducerFilter,
+            ) -> Result<Vec<$crate::shade::ShadingAttribute>, $crate::SchemaError> {
+                $crate::shade::ConnectableContext::default().value_producing_attributes(self.clone(), filter)
+            }
+
+            /// Wrap `attribute` without checking its namespace, for the
+            /// accessors that build the name themselves and the setters that
+            /// hand the same attribute back.
+            pub(super) fn new(attribute: $crate::openusd::usd::Attribute) -> Self {
+                Self { attribute }
+            }
+        }
+
+        impl $crate::shade::ConnectionTarget for $ty {
+            fn attribute(&self) -> &$crate::openusd::usd::Attribute {
+                &self.attribute
+            }
+        }
+    };
+}
+
+pub(crate) use impl_shading_attribute;
+
+/// `connectability` metadata on a UsdShadeInput — restricts what the input may
+/// be connected to. Pixar's fallback is [`Connectability::Full`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Connectability {
+    /// Can connect to any input or output (the default).
+    #[default]
+    Full,
+    /// Can only connect to a NodeGraph interface input (or another
+    /// `interfaceOnly` input) — not a render-time dataflow source.
+    InterfaceOnly,
+}
+
+impl Connectability {
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Connectability::Full => FULL,
+            Connectability::InterfaceOnly => INTERFACE_ONLY,
+        }
+    }
+
+    pub fn from_token(token: impl AsRef<str>) -> Option<Self> {
+        Some(match token.as_ref() {
+            FULL => Connectability::Full,
+            INTERFACE_ONLY => Connectability::InterfaceOnly,
+            _ => return None,
+        })
+    }
+}
+
+/// `bindMaterialAs` strength on a material-binding relationship — whether a
+/// binding overrides ones authored lower in namespace. Pixar's fallback (when
+/// `bindMaterialAs` is unauthored) is [`BindingStrength::WeakerThanDescendants`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindingStrength {
+    /// Bindings on descendant prims win (the spec default).
+    #[default]
+    WeakerThanDescendants,
+    /// This binding wins over any authored on descendant prims.
+    StrongerThanDescendants,
+}
+
+impl BindingStrength {
+    pub fn as_token(self) -> &'static str {
+        match self {
+            BindingStrength::WeakerThanDescendants => WEAKER_THAN_DESCENDANTS,
+            BindingStrength::StrongerThanDescendants => STRONGER_THAN_DESCENDANTS,
+        }
+    }
+
+    pub fn from_token(token: impl AsRef<str>) -> Option<Self> {
+        Some(match token.as_ref() {
+            WEAKER_THAN_DESCENDANTS => BindingStrength::WeakerThanDescendants,
+            STRONGER_THAN_DESCENDANTS => BindingStrength::StrongerThanDescendants,
+            _ => return None,
+        })
+    }
+}
+
+// `From`/`TryFrom<Value>` for the token-valued enums, so they pass straight to
+// `Attribute::set` / `get::<Enum>()`.
+openusd::vt::impl_token_value!(Connectability, BindingStrength);

@@ -1,0 +1,125 @@
+[package]
+name = "openusd-schemas"
+description = "Typed Rust APIs for USD's standard schemas (UsdGeom, UsdShade, UsdSkel, UsdPhysics, and more), built on openusd"
+keywords = ["usd", "usdgeom", "usdphysics", "usdshade", "schemas"]
+readme = "README.md"
+exclude = ["/fixtures"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+categories.workspace = true
+
+# Every schema family is opt-in, so a consumer compiles only the domains it
+# reads. Nothing is enabled by default.
+[features]
+geom = []
+# UsdLux lights are UsdGeom Xformable / Boundable prims, so the lux views
+# build on the geom schema traits; lights and light filters are shading
+# nodes whose inputs connect through the shade views, and a PluginLight
+# builds in the shade NodeDefAPI.
+lux = ["geom", "shade"]
+# UsdMediaSpatialAudio is a UsdGeomXformable-derived prim, so the media views
+# build on the geom schema traits.
+media = ["geom"]
+# UsdPhysicsJoint and the collider prims are UsdGeom Imageable / Xformable
+# prims, so the physics views build on the geom schema traits; a rigid
+# body's mass reads the material bound for the physics purpose, which the
+# shade views resolve.
+physics = ["geom", "shade"]
+# UsdProcGenerativeProcedural is a UsdGeomBoundable-derived prim, so the proc
+# views build on the geom schema traits.
+proc = ["geom"]
+# A render product renders through a UsdGeomCamera, so the render spec reads
+# the camera through the geom views, and an `outputs:` setting reads the
+# shading network it connects to through the shade producer walk.
+render = ["geom", "shade"]
+semantics = []
+# UsdShade binds materials to UsdGeomSubsets of a prim's geometry, so the
+# shade views build on the geom views.
+shade = ["geom"]
+# UsdSkelRoot and UsdSkelSkeleton are UsdGeomBoundable-derived prims, so the
+# skel views build on the geom schema traits.
+skel = ["geom", "dep:bitflags"]
+ui = []
+# UsdVolVolume is a UsdGeomGprim and the field prims are UsdGeomXformable, so
+# the vol views build on the geom schema traits.
+vol = ["geom"]
+
+# Feature-gated surface only renders if docs.rs turns the features on.
+[package.metadata.docs.rs]
+all-features = true
+
+[build-dependencies]
+# The views, the schematics and the manifest are generated from the vendored
+# `schemas/` definitions at build time; see `build.rs`.
+openusd-build.workspace = true
+
+[dependencies]
+openusd.workspace = true
+# The deformations `skel::bake_skinning` bakes.
+bitflags = { workspace = true, optional = true }
+derive_more.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The generator, so a test can read the schemas the compiled tables were
+# generated from and check the tables against them.
+openusd-build.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "geom"
+required-features = ["geom"]
+
+[[test]]
+name = "lux"
+required-features = ["lux"]
+
+[[test]]
+name = "media"
+required-features = ["media"]
+
+[[test]]
+name = "physics"
+required-features = ["physics"]
+
+[[test]]
+name = "physics_parse"
+required-features = ["physics"]
+
+[[test]]
+name = "proc"
+required-features = ["proc"]
+
+[[test]]
+name = "render"
+required-features = ["render"]
+
+[[test]]
+name = "semantics"
+required-features = ["semantics"]
+
+[[test]]
+name = "shade"
+required-features = ["shade"]
+
+[[test]]
+name = "skel"
+required-features = ["skel"]
+
+[[test]]
+name = "skel_bake"
+required-features = ["skel"]
+
+[[test]]
+name = "ui"
+required-features = ["ui"]
+
+[[test]]
+name = "vol"
+required-features = ["vol"]

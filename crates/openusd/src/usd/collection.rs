@@ -1,0 +1,1594 @@
+//! `UsdCollectionAPI` — named working sets over a stage (spec §15).
+//!
+//! A collection is a multiple-apply API schema applied to a prim with an
+//! *instance name*; its properties live under `collection:<name>:`. A
+//! collection names a set of paths via the relationship-linking language —
+//! `includes` / `excludes` relationships, an `expansionRule`, and an
+//! `includeRoot` flag — which a [`MembershipQuery`] resolves into actual
+//! membership.
+//!
+//! Collections are a *core* USD feature (not tied to any one schema
+//! family): UsdShade material binding, UsdRender render passes, UsdPhysics
+//! collision groups, and UsdLux light-linking all consume them. This
+//! module is therefore always compiled, like
+//! [`ConnectionGraph`](super::ConnectionGraph).
+//!
+//! [`CollectionAPI`] is the schema surface, generated from the schema's own
+//! definition; this module attaches what a property declaration cannot
+//! express — locating collections on a prim, reading their authored
+//! opinions as values, and authoring membership. [`MembershipQuery`] is the
+//! resolved path-membership predicate built from those opinions, in either
+//! of the two membership languages: the relationship-linking opinions
+//! resolve into a rule map, and a pattern-based `membershipExpression`
+//! ([`sdf::PathExpression`](crate::sdf::PathExpression)) resolves into a
+//! compiled [`CollectionEvaluator`](super::CollectionEvaluator). The `mode`
+//! attribute picks between them; under the default `automatic` mode a
+//! non-empty rule map wins.
+
+use std::rc::Rc;
+
+use crate::Result;
+use crate::sdf::{self, Path};
+use crate::tf;
+use crate::usd::{Attribute, Prim, PrimPredicate, SchemaBase, Stage};
+use crate::vt::Value;
+
+use super::collection_expr::{CollectionEvaluator, CollectionSearcher, complete_membership_expression};
+use super::{CollectionAPI, CollectionMode, ExpansionRule, tokens};
+
+/// A collection read as values rather than as properties: the membership its
+/// opinions resolve to, and authoring that keeps edits minimal.
+///
+/// The generated accessors hand back each property (`expansion_rule_attr`,
+/// `includes_rel`, …) and read its value (`expansion_rule`, `include_root`,
+/// …); these read the targets and resolve what they all say together.
+impl CollectionAPI {
+    /// The `<prim>.collection:<name>` property path — the collection's
+    /// identity, used as a target when one collection includes another.
+    pub fn collection_path(&self) -> Result<Path> {
+        Ok(self
+            .path()
+            .append_property(format!("{}:{}", tokens::COLLECTION, self.name()))?)
+    }
+
+    /// The authored `includes` relationship targets.
+    pub fn includes(&self) -> Result<Vec<Path>> {
+        self.includes_rel().targets()
+    }
+
+    /// The authored `excludes` relationship targets.
+    pub fn excludes(&self) -> Result<Vec<Path>> {
+        self.excludes_rel().targets()
+    }
+
+    /// Resolve this collection's authored opinions into a
+    /// [`MembershipQuery`] (spec §15.2). Outside [`CollectionMode::Expression`],
+    /// the relationship opinions build the rule map: `includeRoot` and each
+    /// `includes` target take the collection's `expansionRule`, each
+    /// `excludes` target is marked excluded, and an `includes` target that is
+    /// itself another collection is recursively merged in (cycles broken,
+    /// excludes applied last so they always win). Outside
+    /// [`CollectionMode::Relationship`], the resolved membership expression
+    /// compiles into the query's evaluator; at query time a non-empty rule
+    /// map wins.
+    ///
+    /// A value the schema does not recognise, or one of the wrong kind, reads
+    /// as the property's default, and the query still resolves.
+    pub fn membership_query(&self) -> Result<MembershipQuery> {
+        let mode: CollectionMode = composed_or_default(&self.mode_attr())?;
+        let mut query = MembershipQuery {
+            rule_map: PathExpansionRuleMap::default(),
+            expansion_rule: composed_or_default(&self.expansion_rule_attr())?,
+            evaluator: None,
+        };
+        if mode != CollectionMode::Expression {
+            let mut visited = sdf::PathSet::default();
+            visited.insert(self.collection_path()?);
+            self.build_into(&mut query.rule_map, &mut visited)?;
+        }
+        if mode != CollectionMode::Relationship {
+            let expression = complete_membership_expression(self)?;
+            if !expression.is_empty() {
+                // TODO: report an expression that fails to compile (an
+                // unknown predicate, or arguments its binder refuses); the
+                // query falls back to matching nothing, as C++ does after
+                // its warning.
+                if let Ok(evaluator) = CollectionEvaluator::build(self.stage(), expression) {
+                    query.evaluator = Some(Rc::new(evaluator));
+                }
+            }
+        }
+        Ok(query)
+    }
+
+    /// Set `expansionRule` (`uniform token`).
+    pub fn set_expansion_rule(&self, rule: ExpansionRule) -> Result<()> {
+        self.expansion_rule_attr_builder().set(rule).build()?;
+        Ok(())
+    }
+
+    /// Set `includeRoot` (`uniform bool`).
+    pub fn set_include_root(&self, value: bool) -> Result<()> {
+        self.include_root_attr_builder().set(value).build()?;
+        Ok(())
+    }
+
+    /// Set `membershipExpression` (`uniform pathExpression`).
+    pub fn set_membership_expression(&self, expression: sdf::PathExpression) -> Result<()> {
+        self.membership_expression_attr_builder().set(expression).build()?;
+        Ok(())
+    }
+
+    /// Set `mode` (`uniform token`).
+    pub fn set_mode(&self, mode: CollectionMode) -> Result<()> {
+        self.mode_attr_builder().set(mode).build()?;
+        Ok(())
+    }
+
+    /// Make `path` a member, minimizing edits (spec §15, mirroring C++
+    /// `UsdCollectionAPI::IncludePath`): if it is already included (e.g. via
+    /// an ancestor), do nothing; including `</>` sets `includeRoot`; an
+    /// excluded `path` is first un-excluded; and a new `includes` target is
+    /// added only if `path` would still not be a member.
+    ///
+    /// Un-excluding compares `path` against authored targets by exact path
+    /// equality, which holds for the absolute paths authored here; it would
+    /// miss a target that composes to `path` through a different authored form
+    /// (e.g. remapped across a reference).
+    pub fn include_path(&self, path: impl sdf::IntoPath) -> Result<()> {
+        let path = sdf::try_into_path(path)?;
+        if self.membership_query()?.is_included(&path) {
+            return Ok(()); // already included — no edit
+        }
+        if path.is_abs_root() {
+            return self.set_include_root(true);
+        }
+        // Drop a direct exclude of `path`. That can flip membership when an
+        // ancestor includes `path`, so re-resolve only when one was removed;
+        // otherwise membership is unchanged from the check above.
+        if self.excludes()?.contains(&path) {
+            self.create_excludes_rel()?.remove_target(&path)?;
+            if self.membership_query()?.is_included(&path) {
+                return Ok(()); // dropping the exclude was enough
+            }
+        }
+        self.create_includes_rel()?.add_target(path)?;
+        Ok(())
+    }
+
+    /// Remove `path` from membership, minimizing edits (mirroring C++
+    /// `UsdCollectionAPI::ExcludePath`): on a non-empty collection where
+    /// `path` is already a non-member, do nothing; excluding `</>` clears
+    /// `includeRoot`; a directly-included `path` is first un-included; and an
+    /// `excludes` target is added when the collection is empty (recording the
+    /// intent) or `path` would otherwise still be a member.
+    pub fn exclude_path(&self, path: impl sdf::IntoPath) -> Result<()> {
+        let path = sdf::try_into_path(path)?;
+        let query = self.membership_query()?;
+        if !query.is_empty() && !query.is_included(&path) {
+            return Ok(()); // already not a member — no edit
+        }
+        if path.is_abs_root() {
+            return self.set_include_root(false);
+        }
+        // Drop a direct include of `path`. That can flip membership when an
+        // ancestor still includes `path`, so re-resolve only when one was
+        // removed; an explicit exclude is then added when `path` remains a
+        // member (via an ancestor / includeRoot) or the collection is now
+        // empty (recording the intent).
+        if !query.is_empty() && self.includes()?.contains(&path) {
+            self.create_includes_rel()?.remove_target(&path)?;
+            let query = self.membership_query()?;
+            if !query.is_empty() && !query.is_included(&path) {
+                return Ok(()); // dropping the include was enough
+            }
+        }
+        self.create_excludes_rel()?.add_target(path)?;
+        Ok(())
+    }
+
+    /// `true` when the collection includes nothing (mirroring C++
+    /// `UsdCollectionAPI::HasNoIncludedPaths`): no `includes`, `includeRoot`
+    /// off, and either an `excludes` opinion exists or there is no membership
+    /// expression.
+    pub fn has_no_included_paths(&self) -> Result<bool> {
+        Ok(self.includes()?.is_empty()
+            && !composed_or_default::<bool>(&self.include_root_attr())?
+            && (!self.excludes()?.is_empty()
+                || membership_expression(self)?.is_none_or(|expression| expression.is_empty())))
+    }
+
+    fn build_into(&self, map: &mut PathExpansionRuleMap, visited: &mut sdf::PathSet) -> Result<()> {
+        // TODO(perf): each (possibly nested) invocation re-reads expansionRule,
+        // includeRoot, includes and excludes from the stage as separate field
+        // lookups; snapshot a collection's authored opinions once per build.
+        let rule: ExpansionRule = composed_or_default(&self.expansion_rule_attr())?;
+        let path_rule = PathRule::from_expansion(rule);
+
+        // `includeRoot` injects the pseudo-root as a top-level include
+        // (no effect under `explicitOnly`).
+        if composed_or_default::<bool>(&self.include_root_attr())? && rule != ExpansionRule::ExplicitOnly {
+            map.insert(Path::abs_root(), path_rule);
+        }
+
+        for included in self.includes()? {
+            // A target that is itself a collection is merged recursively, on
+            // this collection's stage.
+            if let Some((prim, name)) = Self::instance_at_path(&included) {
+                let nested = CollectionAPI::from_prim_unchecked(Prim::new(self.stage(), prim), name);
+                if visited.insert(nested.collection_path()?) {
+                    nested.build_into(map, visited)?;
+                }
+                // else: cycle / already-merged — skip.
+                continue;
+            }
+            map.insert(included, path_rule);
+        }
+
+        // This collection's own excludes are applied last so they win over
+        // every include — including paths brought in by nested collections.
+        // (Within the includes pass, later opinions overwrite earlier ones,
+        // matching C++ `_ComputeMembershipQueryImpl`'s merge order: a nested
+        // collection's opinion can be overridden by a later sibling include,
+        // and the owning collection's excludes always take final precedence.)
+        for excluded in self.excludes()? {
+            map.insert(excluded, PathRule::Exclude);
+        }
+        Ok(())
+    }
+}
+
+/// Apply `UsdCollectionAPI` to `prim` with instance name `name` (adds
+/// `CollectionAPI:<name>` to `apiSchemas`) and return a handle. Author its
+/// membership via the returned [`CollectionAPI`]'s setters / `include_path` /
+/// `exclude_path`.
+///
+/// Where the generated [`CollectionAPI::apply`] needs a prim the stage already
+/// composes, this one takes a path and creates the prim. It is also stricter:
+/// an instance name the schema does not allow is refused rather than authored,
+/// which is what C++ `UsdCollectionAPI::CanApply` reports.
+pub fn apply_collection(stage: &Stage, prim: impl sdf::IntoPath, name: impl Into<String>) -> Result<CollectionAPI> {
+    let prim = sdf::try_into_path(prim)?;
+    let name = tf::Token::from(name.into());
+    // An instance name becomes a namespace component of every property the
+    // schema instantiates, so a name the registry refuses is rejected before
+    // it authors anything. An unregistered schema declares no properties to
+    // collide with and no names to restrict, so it refuses nothing — the
+    // stance [`Prim::apply_api`](super::Prim::apply_api) takes.
+    let schema = tf::Token::new(tokens::COLLECTION_API);
+    let registry = stage.schema_registry();
+    if registry.schema_info(&schema).is_some() && !registry.is_allowed_instance_name(&schema, &name) {
+        return Err(super::ApplyApiError::InstanceNameNotAllowed { schema, instance: name }.into());
+    }
+    // The prim to apply to, with an `over` authored only where the stage
+    // holds none (C++ `UsdStage::OverridePrim`); applying the schema then
+    // authors the edit-target spec it needs, as C++ `UsdCollectionAPI::Apply`
+    // does.
+    CollectionAPI::apply(&stage.override_prim(prim)?, name)
+}
+
+/// Enumerate the paths that `query` includes on `stage`, restricted to the
+/// prims `predicate` admits (spec §15.2). Returns prim members in traversal
+/// order; under `expandPrimsAndProperties` each included prim's member
+/// properties follow it, and explicitly listed property targets are
+/// included too.
+///
+/// Walks the stage and tests each prim with
+/// [`MembershipQuery::is_included_below`], which answers as
+/// [`MembershipQuery::is_included`] does.
+pub fn included_paths(stage: &Stage, query: &MembershipQuery, predicate: PrimPredicate) -> Result<Vec<Path>> {
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return Ok(out);
+    }
+    if !query.uses_rule_map() {
+        return compute_included_by_expression(stage, query, predicate);
+    }
+    let mut seen = sdf::PathSet::default();
+    let mut err: Result<()> = Ok(());
+    let collect_props = query
+        .rule_map
+        .values()
+        .any(|r| *r == PathRule::ExpandPrimsAndProperties);
+
+    // Top-down traversal: `traverse` is pre-order, so a prim's parent is
+    // resolved just before it, and `is_included_below` decides each prim from
+    // the rule its parent leaves it. A parent the predicate skipped takes its
+    // rule from `inherited`, cached beside the others.
+    let mut effective = sdf::PathMap::default();
+
+    stage.traverse(predicate, |prim| {
+        if err.is_err() {
+            return;
+        }
+        let parent_rule = match prim.parent() {
+            Some(parent) => *effective
+                .entry(parent)
+                .or_insert_with_key(|parent| query.inherited(parent)),
+            None => PathRule::Exclude,
+        };
+        let (included, rule) = query.is_included_below(prim, parent_rule);
+        effective.insert(prim.clone(), rule);
+        if !included {
+            return;
+        }
+        if seen.insert(prim.clone()) {
+            out.push(prim.clone());
+        }
+        if collect_props && let Err(e) = push_member_properties(stage, prim, rule, query, &mut seen, &mut out) {
+            err = Err(e);
+        }
+    })?;
+    err?;
+
+    // Explicitly listed property targets (e.g. an `includes` of `prim.attr`)
+    // aren't reached by the prim walk above. Like C++ `_ComputeIncludedImpl`,
+    // these are emitted when the property exists (C++ checks the same via
+    // `GetPropertyAtPath`), regardless of whether their owning prim satisfies
+    // `predicate` — only properties reached by prim expansion are gated by it.
+    //
+    // Sort first: iterating `rule_map` yields these tail entries in hash
+    // order.
+    let mut props: Vec<&Path> = query.rule_map.keys().filter(|p| p.is_property()).collect();
+    props.sort();
+    for path in props {
+        if query.is_included(path) && stage.has_spec(path)? && seen.insert(path.clone()) {
+            out.push(path.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate an expression-mode query by stage traversal, with subtree
+/// pruning driven by result constancy (C++
+/// `UsdComputeIncludedObjectsFromCollection`'s expression arm).
+fn compute_included_by_expression(
+    stage: &Stage,
+    query: &MembershipQuery,
+    predicate: PrimPredicate,
+) -> Result<Vec<Path>> {
+    let Some(evaluator) = query.evaluator() else {
+        return Ok(Vec::new());
+    };
+    let search_properties = query.expansion_rule() == ExpansionRule::ExpandPrimsAndProperties;
+    // The searcher's depth-first ordering contract tolerates only
+    // whole-subtree skips, so the walk runs under the predicate's inherited
+    // projection; when the projection is the predicate itself the walk is
+    // unchanged, and otherwise the extra prims feed the searcher without
+    // becoming candidates.
+    //
+    // TODO: walk a `PrimRange` here, pruning the subtree under a declined
+    // prim and under one the searcher has answered for good, which collapses
+    // the projected walk and the per-prim `prim_matches` re-test into the
+    // C++ `UsdPrimRange` loop. Today the searcher's memo answers the extra
+    // visits in constant time.
+    let walk = predicate.inherited_projection();
+    let clean = walk == predicate;
+    let mut searcher = evaluator.searcher();
+    let mut out = Vec::new();
+    let mut err: Result<()> = Ok(());
+    stage.traverse(walk, |prim| {
+        if err.is_err() {
+            return;
+        }
+        let result = match searcher.next(prim) {
+            Ok(result) => result,
+            Err(e) => {
+                err = Err(e);
+                return;
+            }
+        };
+        // A false answer leaves nothing to emit: a constant false covers
+        // the properties too, and a varying false leaves only the
+        // property-by-property search.
+        if !result.value && (!search_properties || result.constant) {
+            return;
+        }
+        let admitted = clean
+            || match stage.prim_matches(prim, predicate) {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    err = Err(e);
+                    return;
+                }
+            };
+        if !admitted {
+            return;
+        }
+        if result.value {
+            out.push(prim.clone());
+        }
+        if search_properties {
+            // Mirroring C++: a constant-true prim bulk-includes its
+            // properties, a varying-true prim's properties are not searched,
+            // and a varying-false prim's properties are tested one by one.
+            let push = if result.value && result.constant {
+                Some(push_all_properties(stage, prim, &mut out))
+            } else if !result.value {
+                Some(push_matching_properties(stage, &mut searcher, prim, &mut out))
+            } else {
+                None
+            };
+            if let Some(Err(e)) = push {
+                err = Err(e);
+            }
+        }
+    })?;
+    err?;
+    Ok(out)
+}
+
+fn push_all_properties(stage: &Stage, prim: &Path, out: &mut Vec<Path>) -> Result<()> {
+    for name in stage.prim(prim.clone())?.property_names()? {
+        // A composed property name that is not a valid identifier cannot
+        // address a spec; skip it, as C++ does for unaddressable names in
+        // children lists.
+        let Ok(prop) = prim.append_property(&name) else {
+            continue;
+        };
+        out.push(prop);
+    }
+    Ok(())
+}
+
+/// Tests each of `prim`'s properties one by one through the searcher —
+/// property paths are valid depth-first successors of their prim.
+fn push_matching_properties(
+    stage: &Stage,
+    searcher: &mut CollectionSearcher<'_>,
+    prim: &Path,
+    out: &mut Vec<Path>,
+) -> Result<()> {
+    for name in stage.prim(prim.clone())?.property_names()? {
+        // A composed property name that is not a valid identifier cannot
+        // address a spec; skip it, as C++ does for unaddressable names in
+        // children lists.
+        let Ok(prop) = prim.append_property(&name) else {
+            continue;
+        };
+        if searcher.next(&prop)?.value {
+            out.push(prop);
+        }
+    }
+    Ok(())
+}
+
+fn push_member_properties(
+    stage: &Stage,
+    prim: &Path,
+    prim_rule: PathRule,
+    query: &MembershipQuery,
+    seen: &mut sdf::PathSet,
+    out: &mut Vec<Path>,
+) -> Result<()> {
+    for name in stage.prim(prim.clone())?.property_names()? {
+        // A composed property name that is not a valid identifier cannot
+        // address a spec; skip it, as C++ does for unaddressable names in
+        // children lists.
+        let Ok(prop) = prim.append_property(&name) else {
+            continue;
+        };
+        let (included, _) = query.is_included_below(&prop, prim_rule);
+        if included && seen.insert(prop.clone()) {
+            out.push(prop);
+        }
+    }
+    Ok(())
+}
+
+/// The rule attached to one path in a resolved [`MembershipQuery`] map,
+/// including the `Exclude` sentinel that marks an excluded subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRule {
+    /// Only this exact path is a member (no descendant expansion).
+    ExplicitOnly,
+    /// This path and its prim descendants are members.
+    ExpandPrims,
+    /// This path, its prim descendants, and their properties are members.
+    ExpandPrimsAndProperties,
+    /// This path and its descendants are excluded.
+    Exclude,
+}
+
+impl PathRule {
+    fn from_expansion(rule: ExpansionRule) -> Self {
+        match rule {
+            ExpansionRule::ExplicitOnly => PathRule::ExplicitOnly,
+            ExpansionRule::ExpandPrims => PathRule::ExpandPrims,
+            ExpansionRule::ExpandPrimsAndProperties => PathRule::ExpandPrimsAndProperties,
+        }
+    }
+}
+
+/// Maps each authored/derived path to the rule that governs it (the
+/// `Exclude` sentinel marks excluded subtrees). The resolved form of a
+/// collection's includes/excludes/expansionRule/includeRoot opinions.
+pub type PathExpansionRuleMap = sdf::PathMap<PathRule>;
+
+/// A resolved membership predicate for a collection. Build it once (see
+/// `membership_query`) and query [`is_included`] cheaply; it
+/// clones freely so consumers can cache one per collection path.
+///
+/// The query carries both membership languages: the relationship opinions'
+/// rule map and, for expression-capable modes, the compiled membership
+/// expression. A non-empty rule map answers; otherwise the expression does
+/// (C++ `UsdCollectionMembershipQuery`). Two queries carrying evaluators
+/// never compare equal — evaluators run code — only their absence does.
+///
+/// The two sides snapshot differently (matching C++): the rule map is fixed
+/// at build time, while the evaluator holds a stage handle and answers its
+/// predicates (`isa`, `hasAPI`, `variant`, ...) against the stage's state at
+/// each query, so later edits shift an expression query's answers.
+///
+/// [`is_included`]: MembershipQuery::is_included
+#[derive(Debug, Clone, Default)]
+pub struct MembershipQuery {
+    rule_map: PathExpansionRuleMap,
+    expansion_rule: ExpansionRule,
+    evaluator: Option<Rc<CollectionEvaluator>>,
+}
+
+impl PartialEq for MembershipQuery {
+    /// Deliberately non-reflexive for expression-carrying queries: an
+    /// evaluator runs code, so two are never known equivalent — not even a
+    /// query and its clone (C++ `UsdCollectionMembershipQuery` equality).
+    fn eq(&self, other: &Self) -> bool {
+        self.rule_map == other.rule_map
+            && self.expansion_rule == other.expansion_rule
+            && self.evaluator.is_none()
+            && other.evaluator.is_none()
+    }
+}
+
+impl MembershipQuery {
+    /// Build a relationship-mode query from a resolved rule map.
+    pub fn new(rule_map: PathExpansionRuleMap) -> Self {
+        MembershipQuery {
+            rule_map,
+            expansion_rule: ExpansionRule::default(),
+            evaluator: None,
+        }
+    }
+
+    /// The resolved per-path rule map.
+    pub fn rule_map(&self) -> &PathExpansionRuleMap {
+        &self.rule_map
+    }
+
+    /// The collection's own `expansionRule`, which expression-mode
+    /// enumeration consults for property expansion.
+    pub fn expansion_rule(&self) -> ExpansionRule {
+        self.expansion_rule
+    }
+
+    /// The compiled membership expression, when one governs this query.
+    pub fn evaluator(&self) -> Option<&CollectionEvaluator> {
+        self.evaluator.as_deref()
+    }
+
+    /// Whether membership is answered by the rule map rather than the
+    /// expression — true whenever the map has any opinion (C++
+    /// `UsesPathExpansionRuleMap`).
+    pub fn uses_rule_map(&self) -> bool {
+        !self.rule_map.is_empty()
+    }
+
+    /// `true` when the query has no opinions at all (includes nothing).
+    pub fn is_empty(&self) -> bool {
+        self.rule_map.is_empty() && self.evaluator.is_none()
+    }
+
+    /// Whether `path` is a member (C++
+    /// `UsdCollectionMembershipQuery::IsPathIncluded`). With rule-map
+    /// opinions, the nearest opinion on `path` or an ancestor that decides
+    /// for it answers:
+    ///
+    /// - `Exclude` → not a member;
+    /// - `ExplicitOnly` → a member, deciding only for its own path;
+    /// - `ExpandPrims` → a member, deciding for prims and for a property it
+    ///   names itself;
+    /// - `ExpandPrimsAndProperties` → a member.
+    ///
+    /// A path no opinion decides is not a member, and neither is a path
+    /// other than the absolute root or an absolute prim or property path.
+    /// An opinion that does not decide is passed over, so in a map that
+    /// mixes rules, as nested collections merge into, a narrower rule does
+    /// not hide a broader one above it. C++ never counts the absolute root
+    /// as a member; here an opinion on it decides as it does on a prim, so
+    /// excluding `</>` from a collection that includes it clears
+    /// `includeRoot`. Without rule-map opinions, the membership expression
+    /// answers.
+    pub fn is_included(&self, path: &Path) -> bool {
+        if self.uses_rule_map() {
+            let parent = path
+                .parent()
+                .map_or(PathRule::Exclude, |parent| self.inherited(&parent));
+            return self.is_included_below(path, parent).0;
+        }
+        match &self.evaluator {
+            Some(evaluator) => evaluator.match_path(path).value,
+            None => false,
+        }
+    }
+
+    /// [`is_included`](Self::is_included) for a stage traversal: given the
+    /// rule `path`'s parent leaves its children, decide whether `path` is a
+    /// member and the rule it leaves its own, without re-walking its
+    /// ancestors. That rule is [`PathRule::Exclude`], where a prim with no
+    /// opinion of its own is not a member, [`PathRule::ExpandPrims`], where
+    /// it is, or [`PathRule::ExpandPrimsAndProperties`], where its properties
+    /// are too. An `ExplicitOnly` opinion passes its parent's rule on, and an
+    /// `ExpandPrims` below an `ExpandPrimsAndProperties` keeps the properties.
+    ///
+    /// It answers as `is_included` does. C++ `IsPathIncluded` with the
+    /// parent's expansion rule stops at the closest opinion instead, which
+    /// leaves out members of a mixed map that `IsPathIncluded` without it
+    /// includes. An expression-mode query answers through the expression and
+    /// passes `parent` through.
+    pub fn is_included_below(&self, path: &Path, parent: PathRule) -> (bool, PathRule) {
+        if !self.uses_rule_map() {
+            return (self.is_included(path), parent);
+        }
+        if !is_member_kind(path) {
+            return (false, parent);
+        }
+        let own = self.rule_map.get(path).copied();
+        if path.is_prim_property() {
+            let included = own.map_or(parent == PathRule::ExpandPrimsAndProperties, |rule| {
+                rule != PathRule::Exclude
+            });
+            return (included, parent);
+        }
+        let included = match own {
+            Some(rule) => rule != PathRule::Exclude,
+            None => matches!(parent, PathRule::ExpandPrims | PathRule::ExpandPrimsAndProperties),
+        };
+        let passed = match own {
+            None | Some(PathRule::ExplicitOnly) => parent,
+            Some(PathRule::ExpandPrims) if parent == PathRule::ExpandPrimsAndProperties => parent,
+            Some(rule) => rule,
+        };
+        (included, passed)
+    }
+
+    /// The rule `path` leaves its children in a traversal
+    /// ([`is_included_below`](Self::is_included_below)), from the opinions
+    /// on `path` and its ancestors: the seed for a traversal that starts
+    /// below `path`.
+    pub fn inherited(&self, path: &Path) -> PathRule {
+        // The nearest opinion that decides for prims settles the rule, except
+        // that an `ExpandPrims` still takes properties from an
+        // `ExpandPrimsAndProperties` above it.
+        let mut expand_prims = None;
+        for current in path.ancestors() {
+            match self.rule_map.get(&current) {
+                None | Some(PathRule::ExplicitOnly) => {}
+                Some(PathRule::Exclude) => break,
+                Some(PathRule::ExpandPrims) => {
+                    expand_prims.get_or_insert(PathRule::ExpandPrims);
+                }
+                Some(PathRule::ExpandPrimsAndProperties) => return PathRule::ExpandPrimsAndProperties,
+            }
+        }
+        expand_prims.unwrap_or(PathRule::Exclude)
+    }
+}
+
+/// Whether `path` names something a collection can hold: the absolute root,
+/// or an absolute prim or prim property path outside any variant selection.
+pub(super) fn is_member_kind(path: &Path) -> bool {
+    path.is_abs() && !path.has_variant_selection() && (path.is_abs_root() || path.is_prim_property() || path.is_prim())
+}
+
+/// The composed value of `attr` — the strongest `default` opinion, or the
+/// fallback the prim definition declares behind it. A schema that overrides an
+/// inherited fallback answers with its own: `LightAPI` and `RenderPass`
+/// declare their built-in collections' `includeRoot` as `1`, so those
+/// collections include the pseudo-root until something says otherwise.
+fn composed(attr: &Attribute) -> Result<Option<Value>> {
+    attr.get::<Value>()
+}
+
+/// `collection`'s composed `membershipExpression`, if there is one, as
+/// membership resolution reads it. Composition already substituted `%_`
+/// chains and mapped the expression across arcs; a string- or token-typed
+/// opinion parses leniently, and one of another kind reads as none.
+pub(super) fn membership_expression(collection: &CollectionAPI) -> Result<Option<sdf::PathExpression>> {
+    Ok(composed(&collection.membership_expression_attr())?.and_then(Value::into_path_expression))
+}
+
+/// The composed value of `attr` as a `T`, or `T::default()` where there is
+/// none and where what is there is a value `T` does not accept. A failed read
+/// propagates.
+fn composed_or_default<T: TryFrom<Value> + Default>(attr: &Attribute) -> Result<T> {
+    Ok(composed(attr)?
+        .and_then(|value| T::try_from(value).ok())
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::Result;
+    use crate::sdf;
+    use crate::sdf::Variability;
+    use crate::usd::SchemaRegistry;
+
+    fn query(entries: &[(&str, PathRule)]) -> MembershipQuery {
+        let map = entries.iter().map(|(p, r)| (sdf::path(p).unwrap(), *r)).collect();
+        MembershipQuery::new(map)
+    }
+
+    /// Define `prim` as a `Scope` and apply the collection `name` to it.
+    fn author_collection(stage: &Stage, prim: &str, name: &str) -> Result<CollectionAPI> {
+        CollectionAPI::apply(&stage.define_prim(prim)?.set_type_name("Scope")?, name)
+    }
+
+    #[test]
+    fn expansion_rule_round_trips() {
+        for r in [
+            ExpansionRule::ExplicitOnly,
+            ExpansionRule::ExpandPrims,
+            ExpansionRule::ExpandPrimsAndProperties,
+        ] {
+            assert_eq!(ExpansionRule::from_token(r.as_token()), Some(r));
+        }
+        assert_eq!(ExpansionRule::from_token("nope"), None);
+        assert_eq!(ExpansionRule::default(), ExpansionRule::ExpandPrims);
+    }
+
+    #[test]
+    fn property_ownership() {
+        assert!(CollectionAPI::owns_property("collection:render:includes"));
+        assert!(CollectionAPI::owns_property("collection"));
+        assert!(!CollectionAPI::owns_property("collectionX"));
+        assert!(!CollectionAPI::owns_property("xformOp:translate"));
+    }
+
+    #[test]
+    fn decodes_collection_paths() -> Result<()> {
+        let decode = |path: &str| -> Result<Option<(Path, String)>> {
+            Ok(CollectionAPI::instance_at_path(&sdf::path(path)?).map(|(prim, name)| (prim, name.to_string())))
+        };
+        assert_eq!(
+            decode("/W.collection:render")?,
+            Some((sdf::path("/W")?, "render".to_string()))
+        );
+        // An instance name is namespaced as deeply as it was applied.
+        assert_eq!(
+            decode("/W.collection:lighting:key")?,
+            Some((sdf::path("/W")?, "lighting:key".to_string()))
+        );
+        // A property the schema declares belongs to a collection but names
+        // none, however deep the instance name before it.
+        assert_eq!(decode("/W.collection:render:includes")?, None);
+        assert_eq!(decode("/W.collection:includes")?, None);
+        // A non-collection property, a prim path, and the namespace itself
+        // naming no instance.
+        assert_eq!(decode("/W.foo")?, None);
+        assert_eq!(decode("/W")?, None);
+        assert_eq!(decode("/W.collection")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn enumerates_collections_on_prim() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        stage
+            .define_prim("/W")?
+            .set_type_name("Scope")?
+            .add_applied_schema("CollectionAPI:render")?
+            .add_applied_schema("CollectionAPI:proxy")?
+            .add_applied_schema("MaterialBindingAPI")?; // not a collection — ignored
+
+        let names: Vec<String> = CollectionAPI::all(&stage.prim("/W")?)?
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["render".to_string(), "proxy".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_authored_opinions() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let coll = author_collection(&stage, "/W", "render")?;
+
+        // expansionRule (uniform token), includeRoot (uniform bool), includes rel.
+        stage
+            .attribute_builder(coll.expansion_rule_attr().path().clone(), "token")
+            .variability(Variability::Uniform)
+            .set(Value::Token(ExpansionRule::ExplicitOnly.as_token().into()))
+            .build()?;
+        stage
+            .attribute_builder(coll.include_root_attr().path().clone(), "bool")
+            .variability(Variability::Uniform)
+            .set(Value::Bool(true))
+            .build()?;
+        coll.prim()
+            .author_relationship_targets("collection:render:includes", [sdf::path("/W/A")?])?;
+
+        assert_eq!(coll.expansion_rule()?, Some(ExpansionRule::ExplicitOnly));
+        assert_eq!(coll.include_root()?, Some(true));
+        assert_eq!(coll.includes()?, vec![sdf::path("/W/A")?]);
+        assert!(coll.excludes()?.is_empty());
+
+        // Unauthored collection falls back to spec defaults.
+        let bare = author_collection(&stage, "/X", "c")?;
+        assert_eq!(bare.expansion_rule()?, Some(ExpansionRule::ExpandPrims));
+        assert_eq!(bare.include_root()?, None, "includeRoot declares no fallback");
+        Ok(())
+    }
+
+    /// A collection a schema declares as a built-in reads that schema's
+    /// fallbacks, not the ones the collection schema alone would give: the
+    /// test family's `LightAPI` declares its `lightLink` collection with
+    /// `includeRoot = 1`, so the light illuminates everything until something
+    /// says otherwise (C++ `UsdLuxLightAPI`'s light linking).
+    #[test]
+    fn include_root_from_definition() -> Result<()> {
+        let stage = Stage::builder()
+            .schema_registry(SchemaRegistry::test_registry())
+            .in_memory("anon.usda")?;
+        let prim = stage.define_prim("/Light")?.apply_api("LightAPI")?;
+        let coll = CollectionAPI::from_prim_unchecked(prim, "lightLink");
+
+        assert_eq!(coll.include_root()?, Some(true), "the definition declares includeRoot");
+        assert!(!coll.has_no_included_paths()?);
+        assert!(
+            coll.membership_query()?.is_included(&sdf::path("/World/Geo")?),
+            "including the pseudo-root includes every path"
+        );
+
+        // An authored opinion still wins over the definition.
+        coll.set_include_root(false)?;
+        assert_eq!(coll.include_root()?, Some(false));
+        assert!(coll.has_no_included_paths()?);
+        Ok(())
+    }
+
+    /// A value the schema does not recognise, or one of the wrong kind, reads
+    /// as the property's default when membership is resolved. Each attribute
+    /// is authored properly first, so a spec exists whose `default` is then
+    /// overwritten raw — past the type checks authoring would apply.
+    #[test]
+    fn lenient_reads_fall_back() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let coll = author_collection(&stage, "/W", "c")?;
+        coll.set_expansion_rule(ExpansionRule::ExplicitOnly)?;
+        coll.set_mode(CollectionMode::Relationship)?;
+        coll.set_include_root(true)?;
+        coll.set_membership_expression(sdf::PathExpression::parse("/W//"))?;
+
+        let overwrite = |attr: Attribute, value: Value| -> Result<()> {
+            stage.root_layer().edit(|e| {
+                e.attribute_mut(attr.path())?
+                    .expect("authored above")
+                    .set("default", value);
+                Ok(())
+            })?;
+            Ok(())
+        };
+
+        // A token the schema does not allow.
+        overwrite(coll.expansion_rule_attr(), Value::token("bogus"))?;
+        overwrite(coll.mode_attr(), Value::token("bogus"))?;
+        let query = coll.membership_query()?;
+        assert_eq!(query.expansion_rule, ExpansionRule::ExpandPrims);
+        assert!(
+            query.evaluator.is_some(),
+            "an automatic collection reads its expression"
+        );
+
+        // A value of the wrong kind altogether.
+        overwrite(coll.expansion_rule_attr(), Value::Int(3))?;
+        overwrite(coll.mode_attr(), Value::Int(3))?;
+        overwrite(coll.include_root_attr(), Value::Int(1))?;
+        overwrite(coll.membership_expression_attr(), Value::Int(3))?;
+        let query = coll.membership_query()?;
+        assert_eq!(query.expansion_rule, ExpansionRule::ExpandPrims);
+        assert_eq!(membership_expression(&coll)?, None);
+        assert!(coll.has_no_included_paths()?, "includeRoot reads as off");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_prims_includes_descendant_prims_not_properties() -> Result<()> {
+        let q = query(&[("/W/A", PathRule::ExpandPrims)]);
+        assert!(q.is_included(&sdf::path("/W/A")?)); // the include itself
+        assert!(q.is_included(&sdf::path("/W/A/B")?)); // descendant prim
+        assert!(!q.is_included(&sdf::path("/W")?)); // ancestor, not a member
+        assert!(!q.is_included(&sdf::path("/W/A.x")?)); // property: not under expandPrims
+        assert!(!q.is_included(&sdf::path("/W/Other")?)); // unrelated
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_only_matches_exact_paths() -> Result<()> {
+        let q = query(&[("/W/A", PathRule::ExplicitOnly)]);
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(!q.is_included(&sdf::path("/W/A/B")?)); // no descendant expansion
+        Ok(())
+    }
+
+    #[test]
+    fn expand_prims_and_properties_includes_properties() -> Result<()> {
+        let q = query(&[("/W/A", PathRule::ExpandPrimsAndProperties)]);
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(q.is_included(&sdf::path("/W/A/B")?));
+        assert!(q.is_included(&sdf::path("/W/A.x")?)); // property is a member
+        Ok(())
+    }
+
+    #[test]
+    fn closest_ancestor_excludes_win() -> Result<()> {
+        // Include /W, exclude the /W/A subtree.
+        let q = query(&[("/W", PathRule::ExpandPrims), ("/W/A", PathRule::Exclude)]);
+        assert!(q.is_included(&sdf::path("/W/B")?)); // under the include
+        assert!(!q.is_included(&sdf::path("/W/A")?)); // excluded
+        assert!(!q.is_included(&sdf::path("/W/A/C")?)); // closest ancestor is the exclude
+        Ok(())
+    }
+
+    /// An opinion that does not decide for a path is passed over, as C++
+    /// `IsPathIncluded` passes it, so a narrower rule does not hide a
+    /// broader one above it.
+    #[test]
+    fn undecided_rules_passed() -> Result<()> {
+        let q = query(&[("/", PathRule::ExpandPrims), ("/W/A", PathRule::ExplicitOnly)]);
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(q.is_included(&sdf::path("/W/A/B")?));
+        assert!(q.is_included(&Path::abs_root()));
+
+        let q = query(&[
+            ("/W", PathRule::ExpandPrimsAndProperties),
+            ("/W/A", PathRule::ExpandPrims),
+        ]);
+        assert!(q.is_included(&sdf::path("/W/A.x")?));
+        assert!(q.is_included(&sdf::path("/W/A/B.x")?));
+        Ok(())
+    }
+
+    #[test]
+    fn below_propagates_parent_rule() -> Result<()> {
+        let q = query(&[("/W", PathRule::ExpandPrims)]);
+        let (_, root) = q.is_included_below(&Path::abs_root(), PathRule::Exclude);
+        let (inc, world) = q.is_included_below(&sdf::path("/W")?, root);
+        assert!(inc);
+        // A child with no own opinion inherits the parent's rule and is
+        // included; its properties are not.
+        let (inc, child) = q.is_included_below(&sdf::path("/W/A")?, world);
+        assert!(inc);
+        assert_eq!(child, world);
+        let (inc, _) = q.is_included_below(&sdf::path("/W/A.x")?, child);
+        assert!(!inc);
+        // Below a parent that includes nothing, the child is out.
+        let (inc, _) = q.is_included_below(&sdf::path("/W/A/B")?, PathRule::Exclude);
+        assert!(!inc);
+        Ok(())
+    }
+
+    /// Evaluate membership the way `included_paths` does: fold
+    /// `is_included_below` down the ancestor chain from the pseudo-root,
+    /// whose parent includes nothing. Must agree with the point query
+    /// `is_included`.
+    fn included_top_down(q: &MembershipQuery, path: &Path) -> bool {
+        let mut chain: Vec<Path> = path.ancestors().collect();
+        chain.reverse();
+        let mut parent = PathRule::Exclude;
+        let mut included = false;
+        for current in &chain {
+            (included, parent) = q.is_included_below(current, parent);
+        }
+        included
+    }
+
+    #[test]
+    fn membership_methods_agree() -> Result<()> {
+        // Guards against drift between is_included (point query) and the
+        // top-down fold included_paths runs over is_included_below.
+        let q = query(&[
+            ("/W", PathRule::ExpandPrims),
+            ("/W/A", PathRule::Exclude),
+            ("/W/B", PathRule::ExpandPrimsAndProperties),
+            ("/W/C", PathRule::ExplicitOnly),
+            ("/W/B.size", PathRule::ExpandPrimsAndProperties),
+            ("/W/B/E", PathRule::ExpandPrims),
+        ]);
+        for p in [
+            "/W",
+            "/W/A",
+            "/W/A/C",
+            "/W/B",
+            "/W/B/D",
+            "/W/B.size",
+            "/W/C",
+            "/W/C/D",
+            "/W/B/E",
+            "/W/B/E.x",
+            "/W/D",
+            "/W.x",
+            "/Other",
+        ] {
+            let path = sdf::path(p)?;
+            assert_eq!(
+                q.is_included(&path),
+                included_top_down(&q, &path),
+                "point query and top-down fold disagree on {p}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Author a full collection (apiSchema + expansionRule + includeRoot +
+    /// includes/excludes rels) for the compute tests.
+    #[allow(clippy::too_many_arguments)]
+    fn build_collection(
+        stage: &Stage,
+        prim: &str,
+        name: &str,
+        rule: ExpansionRule,
+        include_root: bool,
+        includes: &[&str],
+        excludes: &[&str],
+    ) -> Result<CollectionAPI> {
+        let coll = author_collection(stage, prim, name)?;
+        coll.set_expansion_rule(rule)?;
+        if include_root {
+            coll.set_include_root(true)?;
+        }
+        if !includes.is_empty() {
+            coll.create_includes_rel()?.set_targets(includes.iter().copied())?;
+        }
+        if !excludes.is_empty() {
+            coll.create_excludes_rel()?.set_targets(excludes.iter().copied())?;
+        }
+        Ok(coll)
+    }
+
+    #[test]
+    fn compute_basic_includes() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let coll = build_collection(&stage, "/W", "c", ExpansionRule::ExpandPrims, false, &["/W/A"], &[])?;
+        let q = coll.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/A/B")?));
+        assert!(!q.is_included(&sdf::path("/W/Other")?));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_include_root_with_excludes() -> Result<()> {
+        // "Everything but /W/A": includeRoot + an exclude.
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let coll = build_collection(&stage, "/W", "c", ExpansionRule::ExpandPrims, true, &[], &["/W/A"])?;
+        let q = coll.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/B")?));
+        assert!(!q.is_included(&sdf::path("/W/A")?));
+        assert!(!q.is_included(&sdf::path("/W/A/C")?));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_merges_nested_collection() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        // inner includes /W/X; outer includes inner's identity path.
+        build_collection(&stage, "/R", "inner", ExpansionRule::ExpandPrims, false, &["/W/X"], &[])?;
+        let outer = build_collection(
+            &stage,
+            "/R",
+            "outer",
+            ExpansionRule::ExpandPrims,
+            false,
+            &["/R.collection:inner"],
+            &[],
+        )?;
+        let q = outer.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/X/Leaf")?));
+        Ok(())
+    }
+
+    #[test]
+    fn compute_breaks_cycle() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        // a includes b, b includes a — must terminate.
+        let a = build_collection(
+            &stage,
+            "/R",
+            "a",
+            ExpansionRule::ExpandPrims,
+            false,
+            &["/R.collection:b"],
+            &[],
+        )?;
+        build_collection(
+            &stage,
+            "/R",
+            "b",
+            ExpansionRule::ExpandPrims,
+            false,
+            &["/R.collection:a"],
+            &[],
+        )?;
+        let q = a.membership_query()?;
+        // No hang; the cyclic includes contribute no concrete paths.
+        assert!(q.is_empty());
+        Ok(())
+    }
+
+    /// A small scene: /W with children A (and A/C) and B.
+    fn scene() -> Result<Stage> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        for p in ["/W", "/W/A", "/W/A/C", "/W/B"] {
+            stage.define_prim(sdf::path(p)?)?.set_type_name("Scope")?;
+        }
+        Ok(stage)
+    }
+
+    #[test]
+    fn included_paths_expand_prims() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_collection(&stage, "/Col", "c", ExpansionRule::ExpandPrims, false, &["/W/A"], &[])?;
+        let q = coll.membership_query()?;
+        let mut paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        paths.sort();
+        assert_eq!(paths, vec![sdf::path("/W/A")?, sdf::path("/W/A/C")?]);
+        Ok(())
+    }
+
+    #[test]
+    fn included_paths_explicit_only() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_collection(&stage, "/Col", "c", ExpansionRule::ExplicitOnly, false, &["/W/A"], &[])?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert_eq!(paths, vec![sdf::path("/W/A")?]); // no descendants
+        Ok(())
+    }
+
+    #[test]
+    fn included_paths_include_root_minus_excludes() -> Result<()> {
+        let stage = scene()?;
+        // Everything under /W except the /W/A subtree.
+        let coll = build_collection(
+            &stage,
+            "/Col",
+            "c",
+            ExpansionRule::ExpandPrims,
+            true,
+            &["/W"],
+            &["/W/A"],
+        )?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert!(paths.contains(&sdf::path("/W/B")?));
+        assert!(!paths.contains(&sdf::path("/W/A")?));
+        assert!(!paths.contains(&sdf::path("/W/A/C")?));
+        Ok(())
+    }
+
+    #[test]
+    fn authoring_include_exclude_roundtrip() -> Result<()> {
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.set_expansion_rule(ExpansionRule::ExpandPrims)?;
+        coll.include_path(sdf::path("/W/A")?)?;
+        coll.exclude_path(sdf::path("/W/A/C")?)?;
+
+        // Read back through the membership query.
+        let q = coll.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(!q.is_included(&sdf::path("/W/A/C")?));
+        // And it's discoverable as an applied collection.
+        assert_eq!(CollectionAPI::all(&stage.prim("/W")?)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn include_path_drops_stale_exclude() -> Result<()> {
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.set_include_root(true)?;
+        coll.exclude_path(sdf::path("/W/A")?)?;
+        assert!(!coll.membership_query()?.is_included(&sdf::path("/W/A")?));
+
+        // Re-including drops the exclude rather than adding a redundant include.
+        coll.include_path(sdf::path("/W/A")?)?;
+        assert!(coll.excludes()?.is_empty());
+        assert!(coll.membership_query()?.is_included(&sdf::path("/W/A")?));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_authors_missing_prim() -> Result<()> {
+        // The prim is never `define`d, so it has no spec on the edit target.
+        // apply_collection must author an `over` rather than fail.
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.include_path(sdf::path("/W/A")?)?;
+        assert_eq!(CollectionAPI::all(&stage.prim("/W")?)?.len(), 1);
+        assert!(coll.membership_query()?.is_included(&sdf::path("/W/A")?));
+        Ok(())
+    }
+
+    /// The rules are the registry's: a name it cannot spell as a namespace,
+    /// or one ending in a property name of the schema itself, is refused —
+    /// and a merely namespaced name is not.
+    #[test]
+    fn apply_rejects_bad_name() -> Result<()> {
+        let stage = scene()?;
+        assert!(apply_collection(&stage, sdf::path("/W")?, "").is_err());
+        assert!(apply_collection(&stage, sdf::path("/W")?, "no space").is_err());
+        assert!(apply_collection(&stage, sdf::path("/W")?, "includes").is_err());
+        assert!(apply_collection(&stage, sdf::path("/W")?, "lighting:key").is_ok());
+        assert!(apply_collection(&stage, sdf::path("/W")?, "render").is_ok());
+        Ok(())
+    }
+
+    /// An entry naming no instance is not one; a namespaced name is, and
+    /// enumerating finds it (C++ `UsdCollectionAPI::GetAll`).
+    #[test]
+    fn enumerates_namespaced_names() -> Result<()> {
+        let stage = Stage::builder().in_memory("anon.usda")?;
+        stage
+            .define_prim("/W")?
+            .set_type_name("Scope")?
+            .add_applied_schema("CollectionAPI:render")?
+            .add_applied_schema("CollectionAPI:")? // no instance name
+            .add_applied_schema("CollectionAPI:lighting:key")?;
+        let names: Vec<String> = CollectionAPI::all(&stage.prim("/W")?)?
+            .into_iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["render".to_string(), "lighting:key".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_props_sorted() -> Result<()> {
+        // Explicit property targets come from a hash map; the result is
+        // sorted by path.
+        let stage = scene()?;
+        for p in ["/W/B.a", "/W/B.c", "/W/B.b"] {
+            stage.create_attribute(sdf::path(p)?, "float")?.set(Value::Float(0.0))?;
+        }
+        let coll = build_collection(
+            &stage,
+            "/Col",
+            "c",
+            ExpansionRule::ExplicitOnly,
+            false,
+            &["/W/B.c", "/W/B.a", "/W/B.b"],
+            &[],
+        )?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert_eq!(
+            paths,
+            vec![sdf::path("/W/B.a")?, sdf::path("/W/B.b")?, sdf::path("/W/B.c")?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authored_relationships_not_custom() -> Result<()> {
+        // includes/excludes are schema relationships, so authoring them via
+        // include_path/exclude_path must leave them non-custom. `custom` is
+        // false by default, and a spec authors no field that says what the
+        // default already says, so the relationship is there saying nothing
+        // about it.
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.include_path(sdf::path("/W")?)?;
+        coll.exclude_path(sdf::path("/W/A")?)?;
+        for relationship in [coll.includes_rel(), coll.excludes_rel()] {
+            let path = relationship.path();
+            assert!(relationship.has_authored_targets()?, "{path} should be authored");
+            assert!(!relationship.is_custom()?, "{path} should not be custom");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn has_no_included_paths_tracks_state() -> Result<()> {
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        assert!(coll.has_no_included_paths()?);
+        coll.include_path(sdf::path("/W/A")?)?;
+        assert!(!coll.has_no_included_paths()?);
+        Ok(())
+    }
+
+    #[test]
+    fn exclude_path_on_empty_collection_records_target() -> Result<()> {
+        // C++ parity: excluding on an empty collection authors the exclude.
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.exclude_path(sdf::path("/W/A")?)?;
+        assert_eq!(coll.excludes()?, vec![sdf::path("/W/A")?]);
+        Ok(())
+    }
+
+    #[test]
+    fn exclude_root_clears_include_root() -> Result<()> {
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.set_include_root(true)?;
+        coll.exclude_path(Path::abs_root())?;
+        assert_ne!(coll.include_root()?, Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn include_path_already_included_is_noop() -> Result<()> {
+        // Including a descendant of an already-included expandPrims path
+        // authors no redundant target.
+        let stage = scene()?;
+        let coll = apply_collection(&stage, sdf::path("/W")?, "c")?;
+        coll.include_path(sdf::path("/W/A")?)?; // /W/A (+ descendants)
+        coll.include_path(sdf::path("/W/A/C")?)?; // already included
+        assert_eq!(coll.includes()?, vec![sdf::path("/W/A")?]); // no /W/A/C added
+        Ok(())
+    }
+
+    #[test]
+    fn included_paths_expand_properties() -> Result<()> {
+        let stage = scene()?;
+        stage.create_attribute("/W/B.size", "float")?.set(Value::Float(1.0))?;
+        let coll = build_collection(
+            &stage,
+            "/Col",
+            "c",
+            ExpansionRule::ExpandPrimsAndProperties,
+            false,
+            &["/W/B"],
+            &[],
+        )?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert!(paths.contains(&sdf::path("/W/B")?));
+        assert!(paths.contains(&sdf::path("/W/B.size")?)); // property is a member
+        Ok(())
+    }
+
+    #[test]
+    fn included_paths_skip_missing_property() -> Result<()> {
+        // An explicit property target is emitted only when the property
+        // exists, matching C++ `_ComputeIncludedImpl` / `GetPropertyAtPath`.
+        let stage = scene()?;
+        stage.create_attribute("/W/B.size", "float")?.set(Value::Float(1.0))?;
+        let coll = build_collection(
+            &stage,
+            "/Col",
+            "c",
+            ExpansionRule::ExpandPrims,
+            false,
+            &["/W/B.size", "/W/B.ghost"],
+            &[],
+        )?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert!(paths.contains(&sdf::path("/W/B.size")?)); // exists → emitted
+        assert!(!paths.contains(&sdf::path("/W/B.ghost")?)); // unauthored → skipped
+        Ok(())
+    }
+
+    /// Authors an expression-mode collection named `name` on `/Col`.
+    fn build_expression(stage: &Stage, name: &str, expression: &str) -> Result<CollectionAPI> {
+        let coll = author_collection(stage, "/Col", name)?;
+        coll.set_membership_expression(sdf::PathExpression::parse(expression))?;
+        Ok(coll)
+    }
+
+    #[test]
+    fn mode_round_trips() {
+        for mode in [
+            CollectionMode::Automatic,
+            CollectionMode::Relationship,
+            CollectionMode::Expression,
+        ] {
+            assert_eq!(CollectionMode::from_token(mode.as_token()), Some(mode));
+        }
+        assert_eq!(CollectionMode::from_token("bogus"), None);
+    }
+
+    #[test]
+    fn expression_membership() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_expression(&stage, "e", "/W/A//")?;
+        let q = coll.membership_query()?;
+        assert!(!q.uses_rule_map());
+        assert!(!q.is_empty());
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(q.is_included(&sdf::path("/W/A/C")?));
+        assert!(!q.is_included(&sdf::path("/W/B")?));
+        // A path with no composed object is a constant non-member.
+        assert!(!q.is_included(&sdf::path("/W/A/ghost")?));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_rule_map_wins() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_collection(&stage, "/Col", "c", ExpansionRule::ExpandPrims, false, &["/W/B"], &[])?;
+        coll.set_membership_expression(sdf::PathExpression::parse("/W/A//"))?;
+
+        // Automatic mode: the non-empty rule map answers, not the expression.
+        let q = coll.membership_query()?;
+        assert!(q.uses_rule_map());
+        assert!(q.is_included(&sdf::path("/W/B")?));
+        assert!(!q.is_included(&sdf::path("/W/A")?));
+
+        // Expression mode ignores the includes outright.
+        coll.set_mode(CollectionMode::Expression)?;
+        let q = coll.membership_query()?;
+        assert!(!q.uses_rule_map());
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(!q.is_included(&sdf::path("/W/B")?));
+        Ok(())
+    }
+
+    #[test]
+    fn mode_relationship_ignores_expr() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_expression(&stage, "e", "/W/A//")?;
+        coll.set_mode(CollectionMode::Relationship)?;
+        let q = coll.membership_query()?;
+        assert!(q.is_empty());
+        assert!(!q.is_included(&sdf::path("/W/A")?));
+        Ok(())
+    }
+
+    #[test]
+    fn expression_included_paths() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_expression(&stage, "e", "/W/A//")?;
+        let q = coll.membership_query()?;
+        let mut paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        paths.sort();
+        assert_eq!(paths, vec![sdf::path("/W/A")?, sdf::path("/W/A/C")?]);
+        Ok(())
+    }
+
+    #[test]
+    fn expression_included_properties() -> Result<()> {
+        let stage = scene()?;
+        stage.create_attribute("/W/A.size", "float")?.set(Value::Float(1.0))?;
+        stage.create_attribute("/W/B.size", "float")?.set(Value::Float(2.0))?;
+
+        // A property pattern matches prims varying-false, so each prim's
+        // properties are tested individually under expandPrimsAndProperties.
+        let coll = build_expression(&stage, "e", "//A.size")?;
+        coll.set_expansion_rule(ExpansionRule::ExpandPrimsAndProperties)?;
+        let q = coll.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert!(paths.contains(&sdf::path("/W/A.size")?));
+        assert!(!paths.contains(&sdf::path("/W/B.size")?));
+
+        // A constant-true prim bulk-includes its properties.
+        let bulk = build_expression(&stage, "b", "/W/B//")?;
+        bulk.set_expansion_rule(ExpansionRule::ExpandPrimsAndProperties)?;
+        let q = bulk.membership_query()?;
+        let paths = included_paths(&stage, &q, PrimPredicate::DEFAULT)?;
+        assert!(paths.contains(&sdf::path("/W/B")?));
+        assert!(paths.contains(&sdf::path("/W/B.size")?));
+        Ok(())
+    }
+
+    #[test]
+    fn expression_resolves_references() -> Result<()> {
+        let stage = scene()?;
+        let big = build_expression(&stage, "big", "/W/A// %:small")?;
+        build_expression(&stage, "small", "/W/B//")?;
+
+        let resolved = complete_membership_expression(&big)?;
+        assert_eq!(resolved.to_string(), "/W/A// /W/B//");
+
+        let q = big.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(q.is_included(&sdf::path("/W/B")?));
+        Ok(())
+    }
+
+    #[test]
+    fn expression_reference_cycle() -> Result<()> {
+        let stage = scene()?;
+        let a = build_expression(&stage, "a", "/W/A// %:b")?;
+        build_expression(&stage, "b", "/W/B// %/Col:a")?;
+
+        // The circular hop contributes nothing; both direct patterns stand.
+        let resolved = complete_membership_expression(&a)?;
+        assert_eq!(resolved.to_string(), "/W/A// /W/B//");
+        Ok(())
+    }
+
+    #[test]
+    fn expression_unknown_reference() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_expression(&stage, "e", "/W/A// %:missing")?;
+        let resolved = complete_membership_expression(&coll)?;
+        assert_eq!(resolved.to_string(), "/W/A//");
+        Ok(())
+    }
+
+    #[test]
+    fn expression_reference_diamond() -> Result<()> {
+        let stage = scene()?;
+        let top = build_expression(&stage, "top", "%:x %:y")?;
+        build_expression(&stage, "x", "%:shared")?;
+        build_expression(&stage, "y", "%:shared /W/A//")?;
+        build_expression(&stage, "shared", "/W/B//")?;
+
+        // `shared` resolves once and replays from the memo on the second
+        // branch.
+        let resolved = complete_membership_expression(&top)?;
+        assert_eq!(resolved.to_string(), "/W/B// (/W/B// /W/A//)");
+        Ok(())
+    }
+
+    #[test]
+    fn expression_cycle_not_memoized() -> Result<()> {
+        let stage = scene()?;
+        let top = build_expression(&stage, "top", "%:a %:b")?;
+        build_expression(&stage, "a", "%:b /W/A//")?;
+        build_expression(&stage, "b", "%:a /W/B//")?;
+
+        // Each branch drops only its own back-edge: the chain-dependent
+        // placeholder must not replay from the memo, so `b` still expands
+        // fully under the second branch.
+        let resolved = complete_membership_expression(&top)?;
+        assert_eq!(resolved.to_string(), "/W/B// /W/A// (/W/A// /W/B//)");
+        Ok(())
+    }
+
+    #[test]
+    fn predicate_unknown_keyword() -> Result<()> {
+        let stage = scene()?;
+        stage
+            .define_prim("/W/M")?
+            .set_type_name("Scope")?
+            .set_kind("component")?;
+
+        // A stray keyword refuses to bind, so the expression fails to
+        // compile and the query matches nothing.
+        let coll = build_expression(&stage, "k", "/W//{kind(component, bogus=true)}")?;
+        let q = coll.membership_query()?;
+        assert!(!q.is_included(&sdf::path("/W/M")?));
+
+        let ok = build_expression(&stage, "k2", "/W//{kind(component, strict=true)}")?;
+        let q = ok.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/M")?));
+        Ok(())
+    }
+
+    #[test]
+    fn expression_predicates() -> Result<()> {
+        let stage = scene()?;
+        stage.override_prim("/W/O")?;
+
+        // Every scene prim is a def; the over is not defined.
+        let defined = build_expression(&stage, "d", "/W//{specifier:def}")?;
+        let q = defined.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/A")?));
+        assert!(!q.is_included(&sdf::path("/W/O")?));
+
+        let overs = build_expression(&stage, "o", "/W//{specifier:over}")?;
+        let q = overs.membership_query()?;
+        assert!(q.is_included(&sdf::path("/W/O")?));
+        assert!(!q.is_included(&sdf::path("/W/A")?));
+        Ok(())
+    }
+
+    #[test]
+    fn expression_query_equality() -> Result<()> {
+        let stage = scene()?;
+        let coll = build_expression(&stage, "e", "/W/A//")?;
+        let a = coll.membership_query()?;
+        let b = coll.membership_query()?;
+        // Expression-carrying queries never compare equal — not even a query
+        // and its own clone; evaluators run code.
+        assert_ne!(a, b);
+        assert_ne!(a.clone(), a.clone());
+        Ok(())
+    }
+}

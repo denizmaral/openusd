@@ -1,0 +1,129 @@
+//! High-level USD composition and authoring APIs.
+//!
+//! This module mirrors OpenUSD's `pxr/usd/usd` layer. The stage implementation
+//! lives in the local `stage` module, while this module re-exports the public
+//! `Usd*` surface under `openusd::usd`.
+
+mod attribute;
+mod authoring;
+mod capture;
+mod clips;
+mod collection;
+mod collection_expr;
+mod color_space;
+mod composition;
+mod connections;
+mod diff;
+mod editor;
+mod flatten;
+mod interp;
+mod list_edit;
+mod model_api;
+mod object;
+mod prim;
+mod prim_definition;
+mod prim_type_info;
+mod relationship;
+mod resolve_info;
+mod schema;
+mod schema_decl;
+mod schema_registry;
+mod sink;
+pub(crate) mod stage;
+mod timecode;
+
+pub use attribute::{Attribute, AttributeBuilder, AttributeQuery};
+pub use authoring::{PrimEdit, StageEdit};
+pub use capture::{ReplayStage, UndoStage};
+pub use collection::{MembershipQuery, PathExpansionRuleMap, PathRule, apply_collection, included_paths};
+pub use collection_expr::{
+    CollectionEvaluator, CollectionSearcher, complete_membership_expression, rule_map_expression,
+};
+pub use color_space::ColorSpaceCache;
+pub use connections::ConnectionGraph;
+pub use core_schemas::{
+    ClipsAPI, ClipsAPISchema, CollectionAPI, CollectionMode, ColorSpaceAPI, ColorSpaceDefinitionAPI, ExpansionRule,
+    ModelAPI, ModelAPISchema, SCHEMAS, tokens,
+};
+pub use diff::{ApplyMode, Diff, Edit, FieldValue, Place};
+pub use editor::{NamespaceEditError, NamespaceEditor};
+pub use flatten::FlattenAssets;
+pub use interp::{InterpolationType, bracketing_time_samples};
+pub use list_edit::{IntoItem, ListEdit, ListItem, ListPosition};
+pub use model_api::KindValidation;
+pub use object::{Object, Property};
+pub use prim::{Prim, PrimIndexRef, PrimRange, VariantSet, VariantSets};
+pub use prim_definition::{DefProperty, PrimDefinition};
+pub use prim_type_info::{PrimTypeId, PrimTypeInfo};
+pub use relationship::{Relationship, RelationshipBuilder};
+pub use resolve_info::{ResolveInfo, ResolveInfoSource};
+pub use schema::{APISchemaBase, SchemaBase, SchemaKind, Typed};
+pub use schema_decl::{
+    Field, InstanceRestriction, MetadataDecl, MetadataTargets, PropertyDecl, SchemaDecl, SchemaFamily,
+};
+pub use schema_registry::{
+    ApplyApiError, FamilySource, MetadataField, SchemaInfo, SchemaRegistry, SchemaRegistryBuilder, SchemaRegistryError,
+    Schematics, VersionFilter,
+};
+pub use sink::{CommittedChange, PendingChange, Provenance, Resynced, StageSink, StageSinkId};
+pub use stage::{
+    ComposedStatus, EditContext, EditTarget, EditTargetArc, InitialLoadSet, LoadPolicy, PrimPredicate, PrimStatus,
+    Stage, StageAuthoringError, StageBuilder, TypeConflict, WeakStage,
+};
+
+/// The core `usd` family, generated from OpenUSD's own `usd/schema.usda` and
+/// committed rather than built here: `openusd-build` depends on this crate, so
+/// generating it at build time would be a cycle. The `core_family` test there
+/// rewrites it and fails when it drifts.
+///
+/// It carries what every generated family does: the declarations, re-exported
+/// as [`SCHEMAS`] and [`tokens`] so a caller can register the core family on a
+/// builder of its own and name what its schemas call things, and a view for
+/// each schema.
+mod core_schemas {
+    // Included rather than declared, which is also how a consumer's own
+    // generated views reach it: `cargo fmt` walks modules and would lay this
+    // file out its own way, which is not how the generator wrote it, so the two
+    // would fight over every regeneration. A macro is not a module, so rustfmt
+    // never walks into it.
+    include!("core_schemas.rs");
+}
+
+/// The population mask limiting which prims a [`Stage`] exposes, under its C++
+/// name. The type lives in [`pcp`](crate::pcp) because an instance-relative
+/// mask is part of a prototype's instancing key, but C++ defines it as
+/// `UsdStagePopulationMask` and reaches it through `UsdStage`, so that is the
+/// spelling this crate publishes.
+pub use crate::pcp::PopulationMask as StagePopulationMask;
+/// Why a path was rejected from a [`StagePopulationMask`].
+pub use crate::pcp::PopulationMaskError as StagePopulationMaskError;
+/// One spec contributing to a composed property or prim, under the name the
+/// stack queries report it by.
+pub use crate::pcp::SpecSiteRecord as SpecSite;
+pub use timecode::TimeCode;
+
+use crate::{Result, vt};
+
+/// Decodes an optionally-composed value to `T`, folding the conversion
+/// failure into the caller's error. The one decode step behind every generic
+/// read accessor ([`Attribute::get_at`], [`Prim::metadata`], ...), so a
+/// future decode nuance lands in one place.
+pub(crate) fn decode_value<T, E>(value: Option<vt::Value>) -> Result<Option<T>, E>
+where
+    T: TryFrom<vt::Value>,
+    T::Error: Into<E>,
+{
+    value.map(T::try_from).transpose().map_err(Into::into)
+}
+
+/// Decodes an attribute's resolved value to `T` as C++ `UsdAttribute::Get<T>`
+/// reads it: a value of a kind `T` does not accept is no value, since the
+/// typed read fails there without an error, while a failure to convert a
+/// value of an accepted kind is still an error.
+pub(crate) fn decode_accepted<T>(value: Option<vt::Value>) -> Result<Option<T>>
+where
+    T: vt::FromValue,
+    T::Error: Into<crate::Error>,
+{
+    decode_value(value.filter(|value| T::accepts_kind(vt::ValueKind::from(value))))
+}

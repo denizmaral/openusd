@@ -1,0 +1,3404 @@
+//! The schema registry (C++ `UsdSchemaRegistry`) — the type table and prim
+//! definitions behind spec §13.3.
+//!
+//! A schema describes what properties a prim of a given `typeName` has, what
+//! their fallback values are, and which API schemas that type includes. A
+//! [`SchemaRegistry`] is the index of that information: it answers "what does a
+//! `Cube` look like?" without any stage or composition involved.
+//!
+//! Two ingredients define a schema family. The schematics are a fully
+//! flattened layer holding one class prim per schema,
+//! named after the schema identifier — the shape OpenUSD's
+//! `generatedSchema.usda` already has; every property a schema defines, with
+//! its fallback value, lives on that class prim. The manifest supplies what a
+//! flattened layer cannot: each schema's [`SchemaKind`](super::SchemaKind) and
+//! its base schemas. C++ keeps that in `plugInfo.json`; see
+//! [`SchemaRegistryBuilder::family`] for the format.
+//!
+//! Both arrive as opened [`sdf::Layer`]s, so whichever encoding they were
+//! stored in, and wherever they were resolved from, is settled before the
+//! registry sees them. Where the schematics resolved from is what lets
+//! [`Attribute::get`](super::Attribute::get) hand back a resolved path for an
+//! `asset` fallback.
+//!
+//! [`SchemaRegistry::global`] is the lazily built process registry every
+//! [`Stage`](super::Stage) uses by default. It registers that core `usd` family
+//! and no other, so the domain schemas (`UsdGeom`, `UsdShade`, …) resolve no
+//! fallbacks until a caller registers their families and hands the registry to
+//! [`StageBuilder::schema_registry`](super::StageBuilder::schema_registry).
+
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+
+use crate::sdf::AbstractData;
+use crate::{ar, kind, pcp, sdf, tf, vt};
+
+use super::prim_definition::{self, FamilyVersions};
+use super::schema_decl::{Field, MetadataTargets, PropertyKind, SchemaDecl, SchemaFamily};
+use super::{PrimDefinition, PrimTypeId, PrimTypeInfo, SchemaKind};
+
+/// The registered schemas of a process or a stage (C++ `UsdSchemaRegistry`).
+///
+/// A registry is built once from a set of schema families and is immutable
+/// afterwards, so it is cheap to share: stages hold an `Arc` of one, and
+/// [`global`](Self::global) hands out the process-wide default.
+///
+/// Lookups are by schema identifier — the name a `typeName` or an `apiSchemas`
+/// entry uses (`"Sphere"`, `"CollectionAPI"`). An unregistered identifier is
+/// never an error; it simply has no information, so a stage carrying types
+/// this registry has never heard of still composes.
+#[derive(Debug)]
+pub struct SchemaRegistry {
+    infos: HashMap<tf::Token, SchemaInfo>,
+    /// What [`is_a`](Self::is_a) answers from.
+    lineages: Lineages,
+    /// Reverse index over [`SchemaInfo::family`], so a versioned family can be
+    /// queried without scanning `infos`. Ordered as
+    /// [`schema_infos_in_family`](Self::schema_infos_in_family) answers.
+    families: HashMap<tf::Token, Vec<tf::Token>>,
+    /// Definitions of the instantiable types, keyed by `typeName`.
+    concrete_defs: HashMap<tf::Token, Arc<PrimDefinition>>,
+    /// Definitions of the applied API schemas. A multiple-apply schema is
+    /// stored under its bare identifier, its property names still carrying the
+    /// instance-name placeholder.
+    api_defs: HashMap<tf::Token, Arc<PrimDefinition>>,
+    /// The answer for a prim whose type declares nothing, so callers never
+    /// have to special-case an unknown type.
+    empty_def: Arc<PrimDefinition>,
+    empty_type_info: Arc<PrimTypeInfo>,
+    /// Composed definitions, keyed by the type identity that produced them, so
+    /// every prim sharing a type shares one. Pure memoization: it changes what
+    /// the registry has already computed, never what it answers. Entries are
+    /// kept for the registry's lifetime, which is what lets a
+    /// [`PrimTypeInfo`] handle outlive the stage that asked for it.
+    // TODO(perf): shard this if the single lock ever shows up under contention,
+    // and reclaim entries — today they live as long as the registry does.
+    type_infos: RwLock<HashMap<PrimTypeId, Arc<PrimTypeInfo>>>,
+    /// The metadata fields the registered families declare, by name.
+    metadata: HashMap<tf::Token, MetadataField>,
+    /// The built-in kinds and the ones the registered families declare.
+    kinds: kind::Registry,
+}
+
+/// One metadata field a registered family declares (C++
+/// `SdfSchemaBase::FieldDefinition` for a plugin field).
+#[derive(Debug, Clone)]
+pub struct MetadataField {
+    name: tf::Token,
+    type_name: sdf::ValueTypeName,
+    applies_to: MetadataTargets,
+    fallback: Option<vt::Value>,
+    family: tf::Token,
+}
+
+impl MetadataField {
+    /// The field's name, which is the key it is authored under.
+    pub fn name(&self) -> &tf::Token {
+        &self.name
+    }
+
+    /// The value type the field holds, as its declaration spells it. A
+    /// spelling the value-type table does not know — `dictionary`, the
+    /// list-op types — answers no [`kind`](sdf::ValueTypeName::kind).
+    pub fn type_name(&self) -> &sdf::ValueTypeName {
+        &self.type_name
+    }
+
+    /// The specs the field may be authored on.
+    pub fn applies_to(&self) -> MetadataTargets {
+        self.applies_to
+    }
+
+    /// What a stage reads for the field where no layer authors it.
+    pub fn fallback(&self) -> Option<&vt::Value> {
+        self.fallback.as_ref()
+    }
+
+    /// The family that declared it.
+    pub fn family(&self) -> &tf::Token {
+        &self.family
+    }
+}
+
+/// What is known about one registered schema, independent of its properties
+/// (C++ `UsdSchemaRegistry::SchemaInfo`).
+///
+/// This is the cheap tier: identity, kind, inheritance, how the schema
+/// applies, and its [`plug_info`](Self::plug_info), read from the family's
+/// manifest or declarations. The properties and fallback values a schema
+/// defines live in its [`PrimDefinition`](super::PrimDefinition).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaInfo {
+    identifier: tf::Token,
+    family: tf::Token,
+    version: u32,
+    kind: SchemaKind,
+    bases: Vec<tf::Token>,
+    property_namespace_prefix: Option<tf::Token>,
+    auto_apply_to: Vec<tf::Token>,
+    can_only_apply_to: Vec<tf::Token>,
+    /// A multiple-apply schema's `apiSchemaInstances` restrictions: the
+    /// non-empty `apiSchemaCanOnlyApplyTo` list an instance name answers
+    /// [`can_only_apply_to`](Self::can_only_apply_to) with.
+    instance_can_only_apply_to: HashMap<tf::Token, Vec<tf::Token>>,
+    allowed_instance_names: Vec<tf::Token>,
+    plug_info: vt::Dictionary,
+}
+
+/// One family's parsed schematics — the class prims that define what each
+/// schema's properties are.
+///
+/// The registry keeps the parsed [`sdf::Data`] rather than an
+/// [`sdf::Layer`](crate::sdf::Layer) because a layer carries change-notification
+/// state that is neither `Send` nor `Sync`, while a registry is shared across
+/// stages and threads. Reading a fallback is a field read on this store, so
+/// nothing is copied until a caller asks for an owned value.
+#[derive(Debug)]
+pub struct Schematics {
+    family: tf::Token,
+    /// The schematics layer's own location; `None` for an anonymous one.
+    resolved_location: Option<ar::ResolvedPath>,
+    data: sdf::Data,
+}
+
+/// One schema family's two layers, as handed to
+/// [`SchemaRegistryBuilder::family`].
+///
+/// `schematics` is a flattened layer of class prims and `manifest` the
+/// per-schema metadata that flattening cannot preserve. Open them however they
+/// are stored — [`Layer::open`](sdf::Layer::open) for a family on disk,
+/// [`Layer::from_bytes`](sdf::Layer::from_bytes) for one compiled into the
+/// program — and the registry reads what they hold.
+///
+/// The two layers carry schemas alone. A kind such a family needs is declared
+/// with [`SchemaRegistryBuilder::kind`], and a metadata field through a
+/// declared family ([`SchemaFamily::metadata`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FamilySource<'a> {
+    /// Family name, used to attribute read failures and to identify the
+    /// registered [`Schematics`].
+    pub name: &'a str,
+    /// The manifest layer — see [`SchemaRegistryBuilder::family`] for the
+    /// format.
+    pub manifest: &'a sdf::Layer,
+    /// The schematics layer, in `generatedSchema.usda` form. Where it resolved
+    /// from anchors the relative asset paths its fallback values author; see
+    /// [`Attribute::fallback_value`](super::Attribute::fallback_value).
+    pub schematics: &'a sdf::Layer,
+}
+// TODO: a family read from layers cannot declare the metadata fields and kinds
+// a C++ plugin declares beside its schemas in `plugInfo.json`.
+
+/// Accumulates schema families into a [`SchemaRegistry`].
+///
+/// A family arrives either as a pair of layers ([`family`](Self::family)) or as
+/// declarations a crate holds ([`register`](Self::register)); both take what
+/// they need into the builder's own storage as they are called, so the input
+/// may be dropped straight after. A declared family also carries the metadata
+/// fields and the kinds its plugin declares. [`build`](Self::build) then
+/// composes the prim definitions that need every family present, such as a
+/// typed schema whose built-in API schema comes from another family, or one an
+/// API schema auto-applies to.
+///
+/// Registration reports nothing, so families chain; the first failure any of
+/// them hit is held and returned by [`build`](Self::build).
+#[derive(Debug)]
+pub struct SchemaRegistryBuilder {
+    infos: HashMap<tf::Token, SchemaInfo>,
+    /// Which family's schematics holds each identifier's class prim.
+    source_of: HashMap<tf::Token, Arc<Schematics>>,
+    /// The families registered so far, so a repeat is refused by name rather
+    /// than only through whichever identifier it happens to repeat first.
+    families: HashSet<tf::Token>,
+    /// The auto-apply declarations registered through
+    /// [`auto_apply`](Self::auto_apply), keyed by the API schema they apply.
+    /// [`build`](Self::build) merges each into its API schema's
+    /// [`SchemaInfo`].
+    extra_auto_apply: HashMap<tf::Token, Vec<tf::Token>>,
+    /// The first registration failure, reported by [`build`](Self::build).
+    /// Once set, later registrations are skipped so the error a caller sees is
+    /// the one that started it.
+    error: Option<SchemaRegistryError>,
+    /// The metadata fields declared so far, by name.
+    metadata: HashMap<tf::Token, MetadataField>,
+    /// The kinds declared so far, checked together by [`build`](Self::build).
+    kinds: kind::RegistryBuilder,
+}
+
+/// Which versions of a schema family a query accepts (C++
+/// `UsdSchemaRegistry::VersionPolicy`).
+///
+/// C++ passes the policy and the version it compares against separately; here
+/// the version rides on the variant that uses it, so [`All`](Self::All) cannot
+/// be paired with a version that means nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionFilter {
+    /// Every version in the family.
+    All,
+    /// Versions strictly newer than this one.
+    GreaterThan(u32),
+    /// This version and anything newer.
+    GreaterThanOrEqual(u32),
+    /// Versions strictly older than this one.
+    LessThan(u32),
+    /// This version and anything older.
+    LessThanOrEqual(u32),
+}
+
+/// Error registering schema families with a
+/// [`SchemaRegistryBuilder`] or building their definitions.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchemaRegistryError {
+    /// The family's schematics layer could not be taken into the registry.
+    #[error("Unable to read schematics for schema family {family}")]
+    Schematics {
+        /// The offending family.
+        family: tf::Token,
+        /// What reading the layer hit.
+        #[source]
+        source: sdf::FormatError,
+    },
+
+    /// The family's manifest layer could not be taken into the registry.
+    #[error("Unable to read manifest for schema family {family}")]
+    Manifest {
+        /// The offending family.
+        family: tf::Token,
+        /// What reading the layer hit.
+        #[source]
+        source: sdf::FormatError,
+    },
+
+    /// One schema's manifest entry could not be read. The underlying failure
+    /// is part of the message — not a `source()` link — so callers reporting
+    /// by Display see it, and chain-walking reporters print it once.
+    #[error("Unable to read schema {identifier} of family {family}: {cause}")]
+    Schema {
+        /// The schema whose entry failed.
+        identifier: tf::Token,
+        /// The family being registered.
+        family: tf::Token,
+        /// The entry's failure.
+        cause: Box<SchemaRegistryError>,
+    },
+
+    /// A manifest entry declares no `schemaKind`.
+    #[error("schemaKind is required")]
+    MissingSchemaKind,
+
+    /// A manifest entry declares a `schemaKind` this build does not know.
+    #[error("Unknown schemaKind {kind}")]
+    UnknownSchemaKind {
+        /// The unrecognized kind token.
+        kind: tf::Token,
+    },
+
+    /// A manifest entry's `customData.extraPlugInfo` is not a dictionary, so
+    /// the plug info it carries cannot be read.
+    #[error("customData.extraPlugInfo must be a dictionary, not a {kind}")]
+    ExtraPlugInfoNotDictionary {
+        /// The kind of value the entry holds.
+        kind: vt::ValueKind,
+    },
+
+    /// An apply-info entry of a schema's plug info, such as
+    /// `apiSchemaAutoApplyTo`, is not a list of names (a coding error in C++
+    /// `_GetNameListFromMetadata`).
+    #[error("plug info {key} must be a list of names, not a {kind}")]
+    PlugInfoNotNameList {
+        /// The offending key.
+        key: &'static str,
+        /// The kind of value the entry holds.
+        kind: vt::ValueKind,
+    },
+
+    /// A schema identifier is not a legal `family` or `family_N` name.
+    #[error("Schema identifier {identifier} of family {family} is not a valid identifier")]
+    InvalidIdentifier {
+        /// The offending identifier.
+        identifier: tf::Token,
+        /// The family being registered.
+        family: tf::Token,
+    },
+
+    /// The same family was registered twice. A repeat is refused rather than
+    /// replacing or merging what the first registration brought, since neither
+    /// would be what a caller listing a family twice meant.
+    #[error("Schema family {family} is already registered")]
+    DuplicateFamily {
+        /// The repeated family.
+        family: tf::Token,
+    },
+
+    /// Two families declare the same metadata field, so which declaration a
+    /// field's type and fallback come from would depend on registration order.
+    #[error("Metadata field {field} is declared by both {first} and {second}")]
+    DuplicateMetadataField {
+        /// The field declared twice.
+        field: tf::Token,
+        /// The family that declared it first.
+        first: tf::Token,
+        /// The family that declared it again.
+        second: tf::Token,
+    },
+
+    /// The declared kinds do not form a hierarchy.
+    #[error(transparent)]
+    Kind(Box<kind::RegistryError>),
+
+    /// A declaration authors a field the registry derives from the declaration
+    /// itself, or one a schematics may not carry at all.
+    #[error("{path} of family {family} declares the reserved field {field}")]
+    ReservedField {
+        /// The class prim or property that declared it.
+        path: sdf::Path,
+        /// The family being registered.
+        family: tf::Token,
+        /// The field that may not be declared.
+        field: Box<str>,
+    },
+
+    /// A declared attribute names a type the value-type table does not know,
+    /// so the attribute would have no type to read a value under.
+    #[error("{path} of family {family} declares the unknown value type {type_name}")]
+    UnknownValueType {
+        /// The property that declared it.
+        path: sdf::Path,
+        /// The family being registered.
+        family: tf::Token,
+        /// The unrecognized spelling.
+        type_name: Box<str>,
+    },
+
+    /// A declared schema could not be authored as a class prim.
+    #[error("Unable to author the schematics of family {family}")]
+    Authoring {
+        /// The family being registered.
+        family: tf::Token,
+        /// What authoring hit.
+        #[source]
+        source: Box<sdf::AuthoringError>,
+    },
+
+    /// Two registered families claim the same schema identifier.
+    #[error("Duplicate schema identifier {identifier} registering family {family}")]
+    DuplicateIdentifier {
+        /// The repeated identifier.
+        identifier: tf::Token,
+        /// The family being registered when the repeat surfaced.
+        family: tf::Token,
+    },
+
+    /// A definition build named a schema no registered manifest declares.
+    #[error("No manifest entry for schema {identifier}")]
+    MissingManifestEntry {
+        /// The unregistered schema.
+        identifier: tf::Token,
+    },
+
+    /// A definition build named a schema no registered schematics back.
+    #[error("No schematics registered for schema {identifier}")]
+    MissingSchematics {
+        /// The unregistered schema.
+        identifier: tf::Token,
+    },
+
+    /// The schematics carry no class prim for a schema the manifest declares.
+    #[error("No class prim for schema {identifier} in the schematics of family {family}")]
+    MissingClassPrim {
+        /// The schema whose class prim is missing.
+        identifier: tf::Token,
+        /// The family whose schematics were searched.
+        family: tf::Token,
+    },
+
+    /// A path built from a schema identifier failed to parse.
+    #[error(transparent)]
+    Path(#[from] sdf::PathParseError),
+}
+
+/// Why an API schema cannot be applied to a prim — the reason C++
+/// `UsdPrim::CanApplyAPI` reports through its `whyNot`.
+///
+/// Apart from [`PrimNotValid`](Self::PrimNotValid), every variant names a
+/// registered schema: a name no registry knows carries no rules to break, so
+/// applying it is accepted (see [`Prim::apply_api`](super::Prim::apply_api)).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ApplyApiError {
+    /// No prim is composed at the path, so there is nothing to apply to.
+    #[error("no prim at {path} to apply an API schema to")]
+    PrimNotValid {
+        /// The path that composed no prim.
+        path: sdf::Path,
+    },
+
+    /// Deciding the question needed the prim's composed type, and composing it
+    /// failed.
+    #[error(transparent)]
+    Composition(#[from] pcp::QueryError),
+
+    /// The schema is registered, but is not one that applies to a prim through
+    /// `apiSchemas` — a typed schema, or a non-applied API schema.
+    #[error("{schema} is not an applied API schema")]
+    NotAppliedApi {
+        /// The offending schema identifier.
+        schema: tf::Token,
+    },
+
+    /// A multiple-apply schema applies per instance, so it needs an instance
+    /// name (`CollectionAPI:render`).
+    #[error("multiple-apply schema {schema} needs an instance name")]
+    MissingInstanceName {
+        /// The offending schema identifier.
+        schema: tf::Token,
+    },
+
+    /// A single-apply schema applies whole, so it has no instance to name.
+    #[error("single-apply schema {schema} takes no instance name, got {instance}")]
+    UnexpectedInstanceName {
+        /// The offending schema identifier.
+        schema: tf::Token,
+        /// The instance name that was supplied anyway.
+        instance: tf::Token,
+    },
+
+    /// The schema restricts its instance names, or the name collides with one
+    /// of the schema's own property base names.
+    #[error("{instance} is not an allowed instance name for {schema}")]
+    InstanceNameNotAllowed {
+        /// The offending schema identifier.
+        schema: tf::Token,
+        /// The rejected instance name.
+        instance: tf::Token,
+    },
+
+    /// The schema's `apiSchemaCanOnlyApplyTo` does not cover this prim's type.
+    #[error("{schema} can only be applied to {allowed:?}")]
+    PrimTypeNotAllowed {
+        /// The applied name as given — the schema identifier, instanced for a
+        /// multiple-apply schema (`SlotAPI:right`), whose restriction failed.
+        schema: tf::Token,
+        /// The prim types the schema restricts itself to.
+        allowed: Vec<tf::Token>,
+    },
+}
+
+impl SchemaRegistry {
+    /// The process-wide registry, built on first use.
+    ///
+    /// Every stage opened without an explicit
+    /// [`StageBuilder::schema_registry`](crate::usd::StageBuilder::schema_registry)
+    /// shares this one. It carries the core `usd` family alone — see the
+    /// module documentation.
+    pub fn global() -> &'static Arc<SchemaRegistry> {
+        static GLOBAL: OnceLock<Arc<SchemaRegistry>> = OnceLock::new();
+        GLOBAL.get_or_init(|| {
+            SchemaRegistryBuilder::default()
+                .build()
+                .expect("compiled-in schema data must parse")
+        })
+    }
+
+    /// Starts a registry carrying the core `usd` family, ready for the
+    /// families a caller adds through
+    /// [`family`](SchemaRegistryBuilder::family).
+    ///
+    /// The core family comes along because every other family's bases reach
+    /// its roots: a registry without it answers
+    /// [`is_a`](Self::is_a) with `false` for schemas that do derive from them,
+    /// so replacing the process registry with a custom one would otherwise
+    /// lose definitions the same stage had by default. Registering a family
+    /// that redeclares one of its schemas is the usual duplicate-identifier
+    /// error; [`SchemaRegistryBuilder::empty`] starts from nothing instead.
+    pub fn builder() -> SchemaRegistryBuilder {
+        SchemaRegistryBuilder::default()
+    }
+
+    /// The metadata field `name` a registered family declares (C++
+    /// `SdfSchemaBase::GetFieldDefinition` for a plugin field).
+    pub fn metadata_field(&self, name: &str) -> Option<&MetadataField> {
+        self.metadata.get(name)
+    }
+
+    /// The fallback of the stage metadata field `name`: the fallback a
+    /// registered family declares for it where the field applies to layers
+    /// (C++ `SdfSchema::GetFallback` for a layer field).
+    pub fn stage_metadata_fallback(&self, name: &tf::Token) -> Option<&vt::Value> {
+        self.metadata_field(name)
+            .filter(|declared| declared.applies_to().contains(MetadataTargets::LAYERS))
+            .and_then(MetadataField::fallback)
+    }
+
+    /// Every metadata field the registered families declare, in no particular
+    /// order.
+    pub fn metadata_fields(&self) -> impl Iterator<Item = &MetadataField> {
+        self.metadata.values()
+    }
+
+    /// The kinds a prim's `kind` metadata may select: the built-in model
+    /// hierarchy and whatever the registered families declare (C++
+    /// `KindRegistry`, which is a process singleton there).
+    pub fn kinds(&self) -> &kind::Registry {
+        &self.kinds
+    }
+
+    /// Looks up a schema by identifier (C++ `FindSchemaInfo`).
+    pub fn schema_info(&self, identifier: &tf::Token) -> Option<&SchemaInfo> {
+        self.infos.get(identifier)
+    }
+
+    /// Looks up a specific version within a schema family
+    /// (C++ `FindSchemaInfo(family, version)`).
+    ///
+    /// A family may not itself carry a version suffix, so `("Foo_1", 0)` names
+    /// no schema even though `Foo_1` may well be registered.
+    pub fn schema_info_in_family(&self, family: &tf::Token, version: u32) -> Option<&SchemaInfo> {
+        if !Self::is_allowed_family(family) {
+            return None;
+        }
+        self.infos.get(&Self::make_identifier(family, version))
+    }
+
+    /// Every registered schema in `family` that `filter` accepts, newest
+    /// version first (C++ `FindSchemaInfosInFamily`).
+    ///
+    /// The order is what makes a family query answer with the newest version a
+    /// prim satisfies, so a caller that wants the best match takes the first
+    /// item.
+    pub fn schema_infos_in_family<'a>(
+        &'a self,
+        family: &tf::Token,
+        filter: VersionFilter,
+    ) -> impl Iterator<Item = &'a SchemaInfo> + use<'a> {
+        self.families
+            .get(family)
+            .into_iter()
+            .flatten()
+            .filter_map(|identifier| self.infos.get(identifier))
+            .filter(move |info| filter.accepts(info.version))
+    }
+
+    /// The version of `family` that `schema_type` is, or `None` when it is none
+    /// of them (C++ `UsdPrim::GetVersionIfIsInFamily`'s registry half).
+    ///
+    /// A type qualifies by deriving from a schema in the family, not by name,
+    /// so this runs through [`is_a`](Self::is_a).
+    pub fn version_in_family(&self, schema_type: &tf::Token, family: &tf::Token, filter: VersionFilter) -> Option<u32> {
+        self.schema_infos_in_family(family, filter)
+            .find(|info| self.is_a(schema_type, info.identifier()))
+            .map(SchemaInfo::version)
+    }
+
+    /// The family and version `identifier` names, or `None` when it does not
+    /// name one canonically.
+    ///
+    /// Registration is not consulted: an identifier carries its own family and
+    /// version, which is what lets an authored `typeName` be placed in a family
+    /// while no schema data is registered. Only a spelling
+    /// [`is_allowed_identifier`](Self::is_allowed_identifier)
+    /// accepts is placed, so `Foo_01` — which could never name a registered
+    /// schema — belongs to no family rather than to `Foo`. C++
+    /// `ParseSchemaFamilyAndVersionFromIdentifier` parses the same suffix but
+    /// places every spelling, because it reaches this question only for names
+    /// that already resolved through `TfType`.
+    pub fn parse_allowed_identifier(identifier: &tf::Token) -> Option<(tf::Token, u32)> {
+        Self::is_allowed_identifier(identifier).then(|| Self::parse_family_and_version(identifier))
+    }
+
+    /// Every registered schema, in unspecified order.
+    pub fn schema_infos(&self) -> impl Iterator<Item = &SchemaInfo> {
+        self.infos.values()
+    }
+
+    /// The definition of an instantiable prim type
+    /// (C++ `FindConcretePrimDefinition`).
+    ///
+    /// Abstract types and unregistered names have none; callers that want a
+    /// definition regardless fall back to
+    /// [`empty_prim_definition`](Self::empty_prim_definition).
+    pub fn concrete_prim_definition(&self, type_name: &tf::Token) -> Option<&Arc<PrimDefinition>> {
+        self.concrete_defs.get(type_name)
+    }
+
+    /// The definition of an applied API schema
+    /// (C++ `FindAppliedAPIPrimDefinition`).
+    ///
+    /// A multiple-apply schema is keyed by its bare identifier; its properties
+    /// still carry the instance-name placeholder and are instantiated when the
+    /// schema is applied under a name.
+    pub fn api_prim_definition(&self, identifier: &tf::Token) -> Option<&Arc<PrimDefinition>> {
+        self.api_defs.get(identifier)
+    }
+
+    /// The definition that declares nothing.
+    pub fn empty_prim_definition(&self) -> &Arc<PrimDefinition> {
+        &self.empty_def
+    }
+
+    /// Whether no schemas are registered, so every prim resolves the empty
+    /// definition and deriving its type identity would be wasted work.
+    pub fn is_empty(&self) -> bool {
+        self.infos.is_empty()
+    }
+
+    /// Whether `type_name` names an instantiable type this registry knows.
+    pub fn is_concrete_type(&self, type_name: &tf::Token) -> bool {
+        self.concrete_defs.contains_key(type_name)
+    }
+
+    /// Whether `schema` is `base`, or derives from it through the base chain
+    /// the family manifests declare (C++ `UsdPrim::IsA`, which walks the
+    /// `TfType` hierarchy the same information builds).
+    ///
+    /// Every base counts, transitively, so a query against an abstract
+    /// ancestor (`Boundable`, `Imageable`) answers for the concrete types under
+    /// it.
+    ///
+    /// Both sides have to name a registered schema, as they do in C++, where an
+    /// identifier with no `TfType` resolves to nothing. An unregistered name is
+    /// therefore not a schema: nothing derives from it, and it derives from
+    /// nothing — not even itself. Registering a family whose bases live in a
+    /// family that was left out gets the same answer as registering nothing,
+    /// which is the only answer that does not vary with how far up the chain
+    /// the loaded set happens to reach.
+    pub fn is_a(&self, schema: &tf::Token, base: &tf::Token) -> bool {
+        self.lineages.get(schema).is_some_and(|lineage| lineage.contains(base))
+    }
+
+    /// `schema` and then every schema it derives from, in the order a lookup
+    /// by type falls back through them (C++ `TfType::GetAllAncestorTypes`).
+    ///
+    /// A schema with one base is followed by that base's ancestors. One with
+    /// several is followed by a C3 merge of three kinds of sequence, tried
+    /// in this order: its direct bases as declared, then the ancestors of
+    /// each. The next schema is the first one heading a sequence that no
+    /// sequence holds further in, which keeps every schema ahead of its own
+    /// bases and takes a direct base ahead of another base's ancestors.
+    ///
+    /// Only registered schemas are listed, as [`is_a`](Self::is_a) counts
+    /// only them: the answer is empty for an unregistered name, and a base
+    /// that is not registered is passed over. A base that names a schema
+    /// already on the chain leading to it is passed over too, so each schema
+    /// is listed once. The order ends early where the declared bases allow
+    /// no such order, as it does in C++.
+    pub fn ancestors<'a>(&'a self, schema: &'a tf::Token) -> Vec<&'a tf::Token> {
+        let mut order = Vec::new();
+        self.linearize(schema, &mut Vec::new(), &mut order);
+        order
+    }
+
+    /// Append the [`ancestors`](Self::ancestors) of `schema` to `order`,
+    /// where `chain` holds the schemas whose bases are being followed to
+    /// reach it.
+    fn linearize<'a>(&'a self, schema: &'a tf::Token, chain: &mut Vec<&'a tf::Token>, order: &mut Vec<&'a tf::Token>) {
+        let depth = chain.len();
+        let mut schema = schema;
+        while let Some(info) = self.infos.get(schema) {
+            order.push(schema);
+            chain.push(schema);
+            // Manifests are data, so a malformed one can name a base that is
+            // not registered, or a base cycle.
+            let mut bases = info
+                .bases
+                .iter()
+                .filter(|base| self.infos.contains_key(*base) && !chain.contains(base));
+            match (bases.next(), bases.next()) {
+                (None, _) => break,
+                (Some(only), None) => schema = only,
+                (Some(first), Some(second)) => {
+                    let bases: Vec<&tf::Token> = [first, second].into_iter().chain(bases).collect();
+                    let mut sequences: Vec<VecDeque<&tf::Token>> = vec![bases.iter().copied().collect()];
+                    for base in bases {
+                        let mut ancestors = Vec::new();
+                        self.linearize(base, chain, &mut ancestors);
+                        sequences.push(ancestors.into());
+                    }
+                    merge_ancestors(sequences, order);
+                    break;
+                }
+            }
+        }
+        chain.truncate(depth);
+    }
+
+    /// Resolves an applied-schema name to the schema it names and its instance,
+    /// rejecting a name whose shape its kind does not permit.
+    ///
+    /// An applied name carries an instance exactly when the schema is
+    /// multiple-apply (`CollectionAPI:render`), and only an applied API schema
+    /// can appear in `apiSchemas` at all. This is the rule composition applies
+    /// when it walks a prim's list, so authoring answers for a name exactly as
+    /// composition will treat it.
+    ///
+    /// `Ok(None)` for a name this registry has no schema for: it carries no
+    /// rules to break, and composition passes over it.
+    pub fn check_applied_name(
+        &self,
+        name: &tf::Token,
+    ) -> Result<Option<(&SchemaInfo, Option<tf::Token>)>, ApplyApiError> {
+        check_applied_shape(&self.infos, name)
+    }
+
+    /// Whether `instance` may name an instance of the multiple-apply schema
+    /// `identifier` (C++ `IsAllowedAPISchemaInstanceName`).
+    ///
+    /// A schema may restrict its instance names through
+    /// [`SchemaInfo::allowed_instance_names`]; an empty list allows any. On top
+    /// of that, no schema accepts an instance name whose base collides with one
+    /// of its own property base names, since the instantiated property would
+    /// then be indistinguishable from the schema's own.
+    ///
+    /// `false` for anything that is not a registered multiple-apply schema, and
+    /// for an instance name that is not a valid namespaced identifier — the
+    /// name becomes a namespace component of every property the schema
+    /// instantiates, so anything unspellable there is rejected here.
+    pub fn is_allowed_instance_name(&self, identifier: &tf::Token, instance: &tf::Token) -> bool {
+        let (Some(info), Some(definition)) = (self.infos.get(identifier), self.api_defs.get(identifier)) else {
+            return false;
+        };
+        // Every component has to be an identifier in its own right, which is
+        // what C++ `TokenizeIdentifierAsTokens` returns nothing for. The
+        // namespace delimiter is the only one an instance name may carry, so a
+        // `.` is rejected here where a property path would accept it.
+        if !instance.split(':').all(sdf::Path::is_valid_identifier) || info.kind != SchemaKind::MultipleApplyApi {
+            return false;
+        }
+        if !info.allowed_instance_names.is_empty() && !info.allowed_instance_names.contains(instance) {
+            return false;
+        }
+
+        // A property carries the instance-name placeholder, so the comparison
+        // is against each property's base name rather than the whole name: a
+        // built-in from another multiple-apply schema need not share a prefix.
+        let base = instance.rsplit_once(':').map_or(instance.as_str(), |(_, base)| base);
+        !definition
+            .property_names()
+            .iter()
+            .any(|property| SchemaRegistry::name_template_base(property) == base)
+    }
+
+    /// Whether a field is meaningless as a schema fallback
+    /// (C++ `UsdSchemaRegistry::IsDisallowedField`).
+    ///
+    /// A schema's class prim is a prim spec like any other, so it carries
+    /// fields that describe *it* rather than the prims that use it — its
+    /// `specifier`, its children, the `customData` the schema generator wrote.
+    /// Composition and value resolution never consult a fallback for these, so
+    /// a prim definition refuses to report them however the schematics were
+    /// authored. This is what lets a fallback lookup be unconditional: the
+    /// unsafe fields are excluded once, here, rather than at each reader.
+    pub fn is_disallowed_field(field: &str) -> bool {
+        // Composition arcs: a fallback arc would never be composed.
+        const ARCS: [sdf::FieldKey; 6] = [
+            sdf::FieldKey::InheritPaths,
+            sdf::FieldKey::Payload,
+            sdf::FieldKey::References,
+            sdf::FieldKey::Specializes,
+            sdf::FieldKey::VariantSelection,
+            sdf::FieldKey::VariantSetNames,
+        ];
+        // Fields consulted during scenegraph population or value resolution
+        // rather than read as metadata, plus `customData`, which carries the
+        // schema generator's own bookkeeping, and `kind`, whose fallback prim
+        // composition deliberately ignores.
+        const RESOLVED: [sdf::FieldKey; 10] = [
+            sdf::FieldKey::Active,
+            sdf::FieldKey::ConnectionPaths,
+            sdf::FieldKey::CustomData,
+            sdf::FieldKey::Instanceable,
+            sdf::FieldKey::Kind,
+            sdf::FieldKey::Specifier,
+            sdf::FieldKey::TargetPaths,
+            sdf::FieldKey::TimeSamples,
+            sdf::FieldKey::Clips,
+            sdf::FieldKey::ClipSets,
+        ];
+
+        ARCS.iter().chain(RESOLVED.iter()).any(|key| key.as_str() == field) || sdf::is_children_field(field)
+    }
+
+    /// Whether a schema declaration may not carry `field` on a spec of this
+    /// type, either because a registration derives it from the declaration
+    /// itself or because no schematics may carry it at all.
+    ///
+    /// A concrete schema's `typeName` is its identifier, its `apiSchemas` list
+    /// is what it declares as built in, and its `customData` records which
+    /// properties it only overrides; a property's type, variability and
+    /// `custom` flag are what it was declared as. Restating any of them would
+    /// describe something already decided, and which spelling won would come
+    /// down to the order a registration happens to run in.
+    ///
+    /// [`SchemaRegistryBuilder::register`] refuses a field this answers `true`
+    /// for, and a generator writing declarations drops it rather than emitting
+    /// one that would be refused — which is why this is public: the two must
+    /// agree, and they agree by asking here.
+    pub fn is_reserved_field(spec: sdf::SpecType, field: &str) -> bool {
+        // What a class prim's own construction authors. Its `customData` is one
+        // of these too, and `is_disallowed_field` below already refuses it.
+        const CLASS: [sdf::FieldKey; 2] = [sdf::FieldKey::TypeName, sdf::FieldKey::ApiSchemas];
+        // The same for a property: its declared type, and the variability and
+        // `custom` flag its constructor normalizes.
+        const PROPERTY: [sdf::FieldKey; 3] = [
+            sdf::FieldKey::TypeName,
+            sdf::FieldKey::Variability,
+            sdf::FieldKey::Custom,
+        ];
+        // Every field naming a spec's children, which is the namespace holding
+        // a layer together rather than anything a schema declared.
+        // [`is_disallowed_field`](Self::is_disallowed_field) refuses the four
+        // naming a prim's own children, and these are the rest.
+        const CHILDREN: [sdf::ChildrenKey; 5] = [
+            sdf::ChildrenKey::ConnectionChildren,
+            sdf::ChildrenKey::ExpressionChildren,
+            sdf::ChildrenKey::MapperArgChildren,
+            sdf::ChildrenKey::MapperChildren,
+            sdf::ChildrenKey::RelationshipTargetChildren,
+        ];
+
+        let declared: &[sdf::FieldKey] = match spec {
+            sdf::SpecType::Prim => &CLASS,
+            _ => &PROPERTY,
+        };
+        declared.iter().any(|key| key.as_str() == field)
+            || CHILDREN.iter().any(|key| key.as_str() == field)
+            || Self::is_disallowed_field(field)
+    }
+
+    /// The definition of a prim with this type and these applied API schemas
+    /// (C++ `BuildComposedPrimDefinition`).
+    ///
+    /// The type's own definition is strongest, then each applied schema in the
+    /// order given. `applied` is a prim's composed `apiSchemas`, so it may name
+    /// schemas the type already builds in — those contribute once — and schemas
+    /// this registry does not know, which are skipped. A typeless prim still
+    /// gets whatever its applied schemas declare.
+    ///
+    /// With nothing applied this is the type's own definition, shared rather
+    /// than rebuilt.
+    pub fn build_composed_prim_definition(&self, type_name: &tf::Token, applied: &[tf::Token]) -> Arc<PrimDefinition> {
+        let typed = self.concrete_defs.get(type_name).unwrap_or(&self.empty_def);
+        if applied.is_empty() {
+            return typed.clone();
+        }
+
+        // An applied schema may not introduce a second version of a family the
+        // type already builds in, so those versions are claimed up front.
+        let mut seen = FamilyVersions::new();
+        for name in typed.applied_api_schemas() {
+            let (identifier, instance) = SchemaRegistry::type_name_and_instance(name);
+            if let Some(info) = self.infos.get(&identifier) {
+                seen.insert((info.family().clone(), instance), info.version());
+            }
+        }
+
+        let mut definition = PrimDefinition::clone(typed);
+        for name in applied {
+            // A name whose shape its schema does not permit contributes
+            // nothing, as does one no schema backs.
+            // TODO: report the rejected name. C++ `_ComposeAPISchemasIntoPrim-
+            // Definition` warns through `TF_WARN`; this crate has no diagnostic
+            // channel for a composed definition to carry one out through, so
+            // the typed error is discarded here.
+            let Ok(Some((info, instance))) = self.check_applied_name(name) else {
+                continue;
+            };
+            let Some(weaker) = self.api_defs.get(info.identifier()) else {
+                continue;
+            };
+            definition.compose_weaker_api(weaker, instance.as_ref(), &self.infos, &mut seen);
+        }
+        Arc::new(definition)
+    }
+
+    /// The shared information for a prim type identity, composing it on first
+    /// request (C++ `Usd_PrimTypeInfoCache::FindOrCreatePrimTypeInfo`).
+    ///
+    /// Every prim with the same identity gets the same handle, so a stage that
+    /// asks per prim composes each distinct type once. The handle stays valid
+    /// for as long as the registry does.
+    pub fn prim_type_info(&self, id: PrimTypeId) -> Arc<PrimTypeInfo> {
+        if id.is_empty() {
+            return self.empty_type_info.clone();
+        }
+        // A panic while another thread held this lock cannot have left a
+        // half-written entry, so the poison is ignored on both sides.
+        let cached = self.type_infos.read().unwrap_or_else(PoisonError::into_inner);
+        if let Some(info) = cached.get(&id) {
+            return info.clone();
+        }
+        drop(cached);
+
+        // Composed outside the lock, so a slow composition never blocks
+        // lookups. A concurrent caller may finish first, in which case its
+        // entry is the one everyone uses and this one is dropped.
+        // Resolve the type first, then compose from it, so the definition is by
+        // construction the one belonging to the reported schema type. An
+        // unregistered name resolves to the empty token, whose definition is
+        // the empty one.
+        let schema_type_name = match self.is_concrete_type(id.lookup_name()) {
+            true => id.lookup_name().clone(),
+            false => tf::Token::default(),
+        };
+        let definition = self.build_composed_prim_definition(&schema_type_name, id.applied_api_schemas());
+        let info = Arc::new(PrimTypeInfo::new(id.clone(), schema_type_name, definition));
+        self.type_infos
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id)
+            .or_insert(info)
+            .clone()
+    }
+
+    /// The information for a prim with no type and no applied schemas.
+    pub fn empty_prim_type_info(&self) -> &Arc<PrimTypeInfo> {
+        &self.empty_type_info
+    }
+
+    /// Splits a schema identifier into its family and version
+    /// (C++ `ParseSchemaFamilyAndVersionFromIdentifier`).
+    ///
+    /// A version suffix is a trailing underscore followed by one or more
+    /// digits; an identifier without one is version 0.
+    ///
+    /// ```
+    /// use openusd::{tf, usd::SchemaRegistry};
+    ///
+    /// let parse = SchemaRegistry::parse_family_and_version;
+    /// let (family, version) = parse(&tf::Token::new("DomeLight_1"));
+    /// assert_eq!((family.as_str(), version), ("DomeLight", 1));
+    ///
+    /// let (family, version) = parse(&tf::Token::new("DomeLight"));
+    /// assert_eq!((family.as_str(), version), ("DomeLight", 0));
+    /// ```
+    pub fn parse_family_and_version(identifier: &tf::Token) -> (tf::Token, u32) {
+        match split_version_suffix(identifier) {
+            // A version that does not fit a `u32` is treated as absent, which
+            // keeps the identifier addressable under its own full name.
+            (family, Some(suffix)) => match suffix.parse() {
+                Ok(version) => (tf::Token::from(family), version),
+                Err(_) => (identifier.clone(), 0),
+            },
+            (_, None) => (identifier.clone(), 0),
+        }
+    }
+
+    /// Builds the identifier for a family and version
+    /// (C++ `MakeSchemaIdentifierForFamilyAndVersion`). Version 0 is the bare
+    /// family name.
+    pub fn make_identifier(family: &tf::Token, version: u32) -> tf::Token {
+        match version {
+            0 => family.clone(),
+            _ => tf::Token::from(format!("{family}_{version}")),
+        }
+    }
+
+    /// Whether `family` may name a schema family (C++ `IsAllowedSchemaFamily`):
+    /// a valid identifier that does not itself end in a version suffix.
+    pub fn is_allowed_family(family: &str) -> bool {
+        sdf::Path::is_valid_identifier(family) && version_delimiter(family).is_none()
+    }
+
+    /// Whether `identifier` may name a schema (C++ `IsAllowedSchemaIdentifier`):
+    /// an allowed family plus a canonical version suffix, so `Foo_01` and
+    /// `Foo_1_2` are rejected.
+    pub fn is_allowed_identifier(identifier: &str) -> bool {
+        let (family, suffix) = split_version_suffix(identifier);
+        // Version 0 is spelled as the bare family, so `Foo_0` is no more
+        // canonical than `Foo_01`.
+        Self::is_allowed_family(family)
+            && suffix.is_none_or(|suffix| {
+                suffix
+                    .parse::<u32>()
+                    .is_ok_and(|version| version != 0 && version.to_string() == suffix)
+            })
+    }
+
+    /// Splits an applied-schema name into its schema identifier and, when the
+    /// name is an instance of a multiple-apply schema, its instance name
+    /// (C++ `GetTypeNameAndInstance`).
+    ///
+    /// The split is at the first namespace delimiter: an identifier can never
+    /// contain one, while an instance name can.
+    ///
+    /// A name carries an instance only when there is one to carry, so a
+    /// trailing delimiter (`CollectionAPI:`) reads as the bare identifier —
+    /// C++ decides the same question as `!instanceName.IsEmpty()`.
+    pub fn type_name_and_instance(name: &tf::Token) -> (tf::Token, Option<tf::Token>) {
+        match name.split_once(':') {
+            Some((identifier, instance)) if !instance.is_empty() => {
+                (tf::Token::from(identifier), Some(tf::Token::from(instance)))
+            }
+            Some((identifier, _)) => (tf::Token::from(identifier), None),
+            None => (name.clone(), None),
+        }
+    }
+
+    /// The template name of a multiple-apply schema's property or built-in
+    /// before any instance name is chosen
+    /// (C++ `MakeMultipleApplyNameTemplate`): `prefix`, the instance-name
+    /// placeholder and `base` joined as namespace components, an empty
+    /// `prefix` or `base` contributing nothing. A schema's own applied name
+    /// templates as `Identifier:__INSTANCE_NAME__`, a property under the
+    /// prefix `collection` as `collection:__INSTANCE_NAME__:expansionRule`.
+    pub fn make_name_template(prefix: &str, base: &str) -> tf::Token {
+        let mut name = String::with_capacity(prefix.len() + INSTANCE_NAME_PLACEHOLDER.len() + base.len() + 2);
+        for part in [prefix, INSTANCE_NAME_PLACEHOLDER, base]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+        {
+            if !name.is_empty() {
+                name.push(':');
+            }
+            name.push_str(part);
+        }
+        tf::Token::from(name)
+    }
+
+    /// Substitutes `instance` for the placeholder in a multiple-apply template
+    /// name (C++ `MakeMultipleApplyNameInstance`).
+    ///
+    /// Only the first placeholder component is replaced, so a nested template
+    /// like `Other:__INSTANCE_NAME__:foo` instantiates to
+    /// `Other:<instance>:foo`. A name with no placeholder is returned
+    /// unchanged.
+    pub fn make_name_instance(template: &str, instance: &str) -> tf::Token {
+        match placeholder_position(template) {
+            Some(start) => {
+                let mut name = String::with_capacity(template.len() + instance.len());
+                name.push_str(&template[..start]);
+                name.push_str(instance);
+                name.push_str(&template[start + INSTANCE_NAME_PLACEHOLDER.len()..]);
+                tf::Token::from(name)
+            }
+            None => tf::Token::from(template),
+        }
+    }
+
+    /// The name a schema is applied to a prim under, which for a
+    /// multiple-apply schema carries the instance it is applied as.
+    ///
+    /// The inverse of [`type_name_and_instance`](Self::type_name_and_instance),
+    /// and what `apiSchemas` records: `SlotAPI` applied as `front` is
+    /// `SlotAPI:front`. An empty instance names the schema alone, which is what
+    /// a single-apply schema is applied under.
+    pub fn make_applied_name(schema: &str, instance: &str) -> tf::Token {
+        match instance.is_empty() {
+            true => tf::Token::from(schema),
+            false => tf::Token::from(format!("{schema}:{instance}")),
+        }
+    }
+
+    /// The part of a multiple-apply property name that follows the
+    /// instance-name placeholder (C++ `GetMultipleApplyNameTemplateBaseName`).
+    ///
+    /// `collection:__INSTANCE_NAME__:includeRoot` bases to `includeRoot`; a
+    /// name ending at the placeholder bases to nothing, and one without a
+    /// placeholder is its own base.
+    pub fn name_template_base(name: &str) -> &str {
+        match placeholder_position(name) {
+            Some(start) => name
+                .get(start + INSTANCE_NAME_PLACEHOLDER.len() + 1..)
+                .unwrap_or_default(),
+            None => name,
+        }
+    }
+
+    /// Whether `name` still carries the instance-name placeholder, which is
+    /// what distinguishes a multiple-apply template from an applied instance
+    /// (C++ `IsMultipleApplyNameTemplate`).
+    pub fn is_name_template(name: &str) -> bool {
+        placeholder_position(name).is_some()
+    }
+}
+
+impl VersionFilter {
+    /// Whether `version` passes this filter.
+    pub fn accepts(self, version: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::GreaterThan(other) => version > other,
+            Self::GreaterThanOrEqual(other) => version >= other,
+            Self::LessThan(other) => version < other,
+            Self::LessThanOrEqual(other) => version <= other,
+        }
+    }
+}
+
+/// What a source of schema declarations extracts, before [`SchemaInfo::new`]
+/// settles what it means.
+///
+/// A manifest layer reads these out of fields and a [`SchemaDecl`] carries them
+/// outright; neither decides what they amount to.
+#[derive(Debug, Default)]
+struct Declared {
+    bases: Vec<tf::Token>,
+    property_namespace_prefix: Option<tf::Token>,
+    auto_apply_to: Vec<tf::Token>,
+    can_only_apply_to: Vec<tf::Token>,
+    instance_can_only_apply_to: HashMap<tf::Token, Vec<tf::Token>>,
+    allowed_instance_names: Vec<tf::Token>,
+    plug_info: vt::Dictionary,
+}
+
+impl Declared {
+    /// Fills each apply-info list left empty from the plug info key that
+    /// carries it, for the kinds C++ reads that key for: the auto-apply list
+    /// for a single-apply schema, the allowed instance names and per-instance
+    /// restrictions for a multiple-apply one, and the restriction to types for
+    /// either. C++ `Usd_GetAPISchemaPluginApplyToInfoForType` reads them from
+    /// the `plugInfo.json` entry, where `usdGenSchema` leaves the
+    /// `extraPlugInfo` value of a list the schema does not declare.
+    ///
+    /// An instance whose declared list is empty counts as undeclared, since
+    /// [`SchemaInfo::new`] keeps no such instance.
+    fn fill_from_plug_info(&mut self, kind: SchemaKind) -> Result<(), SchemaRegistryError> {
+        if !kind.is_applied_api() {
+            return Ok(());
+        }
+        let plug_info = &self.plug_info;
+        let fill = |list: &mut Vec<tf::Token>, key: &'static str| -> Result<(), SchemaRegistryError> {
+            if list.is_empty() {
+                *list = plug_names(plug_info.get(key), key)?;
+            }
+            Ok(())
+        };
+        fill(&mut self.can_only_apply_to, "apiSchemaCanOnlyApplyTo")?;
+        if kind == SchemaKind::SingleApplyApi {
+            fill(&mut self.auto_apply_to, "apiSchemaAutoApplyTo")?;
+        } else {
+            fill(&mut self.allowed_instance_names, "apiSchemaAllowedInstanceNames")?;
+            if self.instance_can_only_apply_to.values().all(Vec::is_empty) {
+                self.instance_can_only_apply_to = instance_restrictions(plug_info.get("apiSchemaInstances"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SchemaInfo {
+    /// What a schema declares, however it was declared.
+    ///
+    /// Both ways of registering a family — declarations and a manifest layer —
+    /// extract these from their own source and hand them here, so what a
+    /// `SchemaInfo` *means* is settled once: the family and version come from
+    /// splitting the identifier, and an instance restriction is kept only where
+    /// it can apply and only where it names something, so an instance the list
+    /// does not reach falls back to the schema-wide rule. The plug info loses
+    /// the keys C++ `usdGenSchema` writes over it, after
+    /// [`Declared::fill_from_plug_info`] has read any apply-info list the
+    /// schema left empty from it.
+    fn new(identifier: tf::Token, kind: SchemaKind, mut declared: Declared) -> Result<Self, SchemaRegistryError> {
+        declared.fill_from_plug_info(kind)?;
+        let (family, version) = SchemaRegistry::parse_family_and_version(&identifier);
+        let mut info = Self {
+            identifier,
+            family,
+            version,
+            kind,
+            bases: declared.bases,
+            property_namespace_prefix: declared.property_namespace_prefix,
+            auto_apply_to: declared.auto_apply_to,
+            can_only_apply_to: declared.can_only_apply_to,
+            instance_can_only_apply_to: match kind {
+                SchemaKind::MultipleApplyApi => declared
+                    .instance_can_only_apply_to
+                    .into_iter()
+                    .filter(|(_, allowed)| !allowed.is_empty())
+                    .collect(),
+                _ => HashMap::new(),
+            },
+            allowed_instance_names: declared.allowed_instance_names,
+            plug_info: declared.plug_info,
+        };
+        let generated = generated_plug_info(&info);
+        info.plug_info.retain(|key, _| !generated.contains(&key.as_str()));
+        Ok(info)
+    }
+
+    /// The name this schema is registered and referenced under.
+    pub fn identifier(&self) -> &tf::Token {
+        &self.identifier
+    }
+
+    /// The identifier with any version suffix removed.
+    pub fn family(&self) -> &tf::Token {
+        &self.family
+    }
+
+    /// The version parsed from the identifier's suffix; 0 when it has none.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// How this schema applies to a prim.
+    pub fn kind(&self) -> SchemaKind {
+        self.kind
+    }
+
+    /// The schemas this one directly derives from, nearest first, as the
+    /// family manifest declares them. [`SchemaRegistry::is_a`] follows them
+    /// transitively.
+    pub fn bases(&self) -> &[tf::Token] {
+        &self.bases
+    }
+
+    /// The namespace every property of a multiple-apply schema sits under, when
+    /// the family declares one.
+    pub fn property_namespace_prefix(&self) -> Option<&tf::Token> {
+        self.property_namespace_prefix.as_ref()
+    }
+
+    /// Schema identifiers this API schema is automatically applied to
+    /// (C++ `apiSchemaAutoApplyTo`), from the family manifest, or its
+    /// `extraPlugInfo` where the manifest lists none, and any
+    /// [`SchemaRegistryBuilder::auto_apply`] declaration.
+    pub fn auto_apply_to(&self) -> &[tf::Token] {
+        &self.auto_apply_to
+    }
+
+    /// Schema identifiers this API schema may be applied to, as a whole or —
+    /// for a multiple-apply schema — under `instance`
+    /// (C++ `GetAPISchemaCanOnlyApplyToTypeNames(name, instance)`). An instance
+    /// whose `apiSchemaInstances` entry lists any type is restricted to those;
+    /// every other query answers the schema-wide `apiSchemaCanOnlyApplyTo`.
+    /// Empty means unrestricted.
+    pub fn can_only_apply_to(&self, instance: Option<&tf::Token>) -> &[tf::Token] {
+        instance
+            .and_then(|instance| self.instance_can_only_apply_to.get(instance))
+            .map_or(&self.can_only_apply_to, Vec::as_slice)
+    }
+
+    /// Instance names a multiple-apply schema accepts; empty means any.
+    pub fn allowed_instance_names(&self) -> &[tf::Token] {
+        &self.allowed_instance_names
+    }
+
+    /// Whether this schema is applied through a prim's `apiSchemas` list.
+    pub fn is_applied_api(&self) -> bool {
+        self.kind.is_applied_api()
+    }
+
+    /// The extra entries the schema's plugin declares for its type, by key,
+    /// which the registry carries without interpreting: those C++
+    /// `PlugRegistry::GetDataFromPluginMetaData` answers for the schema's type
+    /// beyond the ones this type's other accessors give. A generated C++
+    /// `plugInfo.json` copies them from the class's `customData.extraPlugInfo`,
+    /// as in `providesUsdShadeConnectableAPIBehavior` or
+    /// `implementsComputeExtent`, less the keys C++ `usdGenSchema` writes over
+    /// them (`bases`, `schemaKind` and the others this type's accessors
+    /// answer). They belong to this schema alone: a derived schema does not
+    /// inherit them.
+    pub fn plug_info(&self) -> &vt::Dictionary {
+        &self.plug_info
+    }
+}
+
+impl Schematics {
+    /// The family these class prims came from.
+    pub fn family(&self) -> &tf::Token {
+        &self.family
+    }
+
+    /// Where these class prims were resolved from — the schematics layer's own
+    /// location, and `None` for a layer that resolved from nowhere.
+    pub fn resolved_location(&self) -> Option<&ar::ResolvedPath> {
+        self.resolved_location.as_ref()
+    }
+
+    /// The parsed class prims, keyed by `/<SchemaIdentifier>`.
+    pub fn data(&self) -> &sdf::Data {
+        &self.data
+    }
+}
+
+impl SchemaFamily<'_> {
+    /// The class prims these declarations amount to — the same content a
+    /// `generatedSchema.usda` carries, which is what a registry reads a
+    /// fallback out of.
+    ///
+    /// [`SchemaRegistryBuilder::register`] builds exactly this, so a generator
+    /// can compare what it declares against the schema data it is derived
+    /// from. Authoring goes through the same spec constructors a schematics
+    /// layer is written with, so a family declared in Rust and the same family
+    /// read from a layer reach a registry as the same data.
+    // TODO(perf): the domain families of `openusd-schemas` build in 2.5 ms
+    // here, against 3.4 ms to parse and copy the equivalent layers. Most of
+    // what is left is child-list bookkeeping the caller already knows the
+    // answer to: every property spec re-appends to its prim's
+    // `propertyChildren` (the O(n²) noted in `sdf/spec.rs`) and re-checks the
+    // pseudo-root's `primChildren`, which clones that whole token vector once
+    // per property — measured at ~14k token clones over those families.
+    // Both lists are known up front here, so authoring them once and creating
+    // each spec directly would leave the same data behind for a fraction of
+    // the work.
+    pub fn to_data(&self) -> Result<sdf::Data, SchemaRegistryError> {
+        let family = tf::Token::from(self.name);
+        let family = &family;
+        let schemas = self.schemas;
+        let mut data = sdf::Data::new();
+        let mut fallbacks = vt::Dictionary::new();
+
+        for decl in schemas {
+            let path = sdf::Path::abs_root().append_path(decl.identifier)?;
+
+            // A concrete schema is a prim type and its class prim carries
+            // that type name; no other kind names anything a prim can be.
+            let type_name = match decl.kind {
+                SchemaKind::ConcreteTyped => decl.identifier,
+                _ => "",
+            };
+            authored(
+                family,
+                sdf::PrimSpec::new(&mut data, &path, sdf::Specifier::Class, type_name),
+            )?;
+
+            if !decl.applied_api_schemas.is_empty() {
+                let applied: Vec<tf::Token> = decl.applied_api_schemas.iter().copied().map(tf::Token::from).collect();
+                data.set_field(
+                    &path,
+                    sdf::FieldKey::ApiSchemas.as_str(),
+                    sdf::TokenListOp::explicit(applied).into(),
+                );
+            }
+
+            if !decl.override_property_names.is_empty() {
+                // Sorted, since the set is what matters and a stable order
+                // keeps two registrations comparable.
+                let mut names: Vec<tf::Token> = decl
+                    .override_property_names
+                    .iter()
+                    .copied()
+                    .map(tf::Token::from)
+                    .collect();
+                names.sort();
+                data.set_field(
+                    &path,
+                    sdf::FieldKey::CustomData.as_str(),
+                    vt::Dictionary::from([("apiSchemaOverridePropertyNames".to_owned(), vt::Value::TokenVec(names))])
+                        .into(),
+                );
+            }
+
+            set_fields(&mut data, family, &path, decl.fields, sdf::SpecType::Prim)?;
+
+            for property in decl.properties {
+                let path = path.append_property(property.name)?;
+                match property.kind {
+                    PropertyKind::Attribute(spelling) => {
+                        let type_name = sdf::ValueTypeName::find(spelling).ok_or_else(|| {
+                            SchemaRegistryError::UnknownValueType {
+                                path: path.clone(),
+                                family: family.clone(),
+                                type_name: spelling.into(),
+                            }
+                        })?;
+                        authored(
+                            family,
+                            sdf::AttributeSpec::new(&mut data, &path, type_name, property.variability, property.custom),
+                        )?;
+                    }
+                    PropertyKind::Relationship => authored(
+                        family,
+                        sdf::RelationshipSpec::new(&mut data, &path, property.variability, property.custom),
+                    )?,
+                }
+                set_fields(&mut data, family, &path, property.fields, property.spec_type())?;
+            }
+
+            if !decl.fallback_types.is_empty() {
+                let types: Vec<tf::Token> = decl.fallback_types.iter().copied().map(tf::Token::from).collect();
+                fallbacks.insert(decl.identifier.to_owned(), vt::Value::TokenVec(types));
+            }
+        }
+
+        if !fallbacks.is_empty() {
+            data.set_field(
+                &sdf::Path::abs_root(),
+                sdf::FieldKey::FallbackPrimTypes.as_str(),
+                vt::Value::Dictionary(fallbacks),
+            );
+        }
+
+        Ok(data)
+    }
+}
+
+impl SchemaRegistryBuilder {
+    /// A builder with nothing registered at all, not even the core `usd`
+    /// family [`default`](Self::default) seeds. The built-in kinds belong to
+    /// no family and are in every registry.
+    ///
+    /// For a registry that must hold exactly what it is given and no more: a
+    /// test over one family in isolation, or a generator reading schema data
+    /// that must not resolve against built-ins. Anything else wants
+    /// [`SchemaRegistry::builder`], since a family whose bases do not reach
+    /// the core roots answers [`is_a`](SchemaRegistry::is_a) with `false`.
+    pub fn empty() -> Self {
+        Self {
+            infos: HashMap::new(),
+            source_of: HashMap::new(),
+            families: HashSet::new(),
+            extra_auto_apply: HashMap::new(),
+            error: None,
+            metadata: HashMap::new(),
+            kinds: kind::Registry::builder(),
+        }
+    }
+
+    /// Registers one schema family, or several, from declarations rather than
+    /// from layers.
+    ///
+    /// This is what a crate that knows its schemas at compile time uses: a
+    /// [`SchemaFamily`] is a `const`, and registering it builds the same class
+    /// prims [`family`](Self::family) reads out of a schematics layer. See the
+    /// [`SchemaDecl`] docs for how a declaration is written.
+    ///
+    /// ```
+    /// use openusd::tf;
+    /// use openusd::usd::{SchemaDecl, SchemaFamily, SchemaKind, SchemaRegistry};
+    ///
+    /// static MINE: &SchemaFamily<'_> =
+    ///     &SchemaFamily::new("mine", &[SchemaDecl::new("Widget", SchemaKind::ConcreteTyped).bases(&["Typed"])]);
+    ///
+    /// let registry = SchemaRegistry::builder().register(MINE).build()?;
+    /// assert!(registry.is_a(&tf::Token::new("Widget"), &tf::Token::new("Typed")));
+    /// # Ok::<(), openusd::usd::SchemaRegistryError>(())
+    /// ```
+    ///
+    /// A family already registered is refused rather than replaced or merged,
+    /// so registering one twice is an error, reported by [`build`](Self::build).
+    pub fn register(mut self, family: &SchemaFamily<'_>) -> Self {
+        if self.error.is_none() {
+            self.error = self.add_declared(family).err();
+        }
+        self
+    }
+
+    /// Takes one declared family into the builder's own storage.
+    fn add_declared(&mut self, family: &SchemaFamily<'_>) -> Result<(), SchemaRegistryError> {
+        let name = self.claim_family(family.name)?;
+        let schematics = Arc::new(Schematics {
+            family: name.clone(),
+            // A declaration resolved from nowhere, so a relative asset path in
+            // a fallback anchors against nothing — as an anonymous schematics
+            // layer does, and as C++ gives fallbacks no asset context.
+            resolved_location: None,
+            data: family.to_data()?,
+        });
+
+        for decl in family.schemas {
+            let identifier = tf::Token::from(decl.identifier);
+            let info = schema_info(decl, &identifier).map_err(|cause| SchemaRegistryError::Schema {
+                identifier: identifier.clone(),
+                family: name.clone(),
+                cause: Box::new(cause),
+            })?;
+            self.register_schema(identifier, info, &schematics)?;
+        }
+        for decl in family.metadata {
+            let field = MetadataField {
+                name: tf::Token::from(decl.name),
+                type_name: sdf::ValueTypeName::from(decl.type_name),
+                applies_to: decl.applies_to,
+                fallback: decl.declared_fallback(),
+                family: name.clone(),
+            };
+            if let Some(first) = self.metadata.get(&field.name) {
+                return Err(SchemaRegistryError::DuplicateMetadataField {
+                    field: field.name,
+                    first: first.family.clone(),
+                    second: name,
+                });
+            }
+            self.metadata.insert(field.name.clone(), field);
+        }
+        self.kinds = mem::take(&mut self.kinds).kinds(family.name, family.kinds);
+        Ok(())
+    }
+
+    /// Declares one kind, for a caller with no family to carry it. A family
+    /// declares its own through [`SchemaFamily::kinds`].
+    ///
+    /// The kind may derive from one a family declares, or one declared later:
+    /// [`build`](Self::build) checks every declaration together.
+    pub fn kind(mut self, decl: kind::Decl<'_>) -> Self {
+        self.kinds = self.kinds.kind(decl);
+        self
+    }
+
+    /// Records `name` as registered, refusing a family already taken.
+    fn claim_family(&mut self, name: &str) -> Result<tf::Token, SchemaRegistryError> {
+        let name = tf::Token::from(name);
+        if !self.families.insert(name.clone()) {
+            return Err(SchemaRegistryError::DuplicateFamily { family: name });
+        }
+        Ok(name)
+    }
+
+    /// Registers one schema family.
+    ///
+    /// `schematics` is a flattened layer of class prims, one per schema, named
+    /// after the schema identifier — either `class "CollectionAPI"` or, for a
+    /// concrete type, `class Sphere "Sphere"`. Every property a schema defines
+    /// sits on its class prim, with its fallback as the property's default
+    /// value.
+    ///
+    /// `manifest` supplies what flattening drops: one `def` prim per schema
+    /// identifier carrying uniform attributes.
+    ///
+    /// ```usda
+    /// #usda 1.0
+    ///
+    /// def "CollectionAPI"
+    /// {
+    ///     uniform token schemaKind = "multipleApplyAPI"
+    ///     uniform token[] bases = ["APISchemaBase"]
+    /// }
+    /// ```
+    ///
+    /// `schemaKind` is required and must be one of the spellings
+    /// [`SchemaKind::as_str`] produces. `bases` lists the schema's *direct*
+    /// bases, nearest first, by schema identifier rather than by the C++ type
+    /// name `plugInfo.json` records, and may name a schema registered by
+    /// another family; [`SchemaRegistry::is_a`] follows them transitively.
+    ///
+    /// The optional `propertyNamespacePrefix`, `apiSchemaAutoApplyTo`,
+    /// `apiSchemaCanOnlyApplyTo` and `allowedInstanceNames` attributes map onto
+    /// the matching [`SchemaInfo`] accessors. A multiple-apply schema restricts
+    /// single instances through the prim's
+    /// `customData.apiSchemaInstances.<instance>.apiSchemaCanOnlyApplyTo`
+    /// dictionary, read by [`SchemaInfo::can_only_apply_to`] — a dictionary,
+    /// where the other fields are attributes, because an instance name may
+    /// carry namespaces of its own (`a:b`), which a flat attribute name could
+    /// not split back out of unambiguously.
+    ///
+    /// `apiSchemaAutoApplyTo` auto-applies the declaring API schema to the
+    /// named target schemas, under the same rules as a declaration registered
+    /// through [`auto_apply`](Self::auto_apply).
+    ///
+    /// The prim's `customData.extraPlugInfo` dictionary, when there is one,
+    /// becomes [`SchemaInfo::plug_info`]: the entries a C++ `plugInfo.json`
+    /// records for the schema's type beyond those listed above, less the keys
+    /// `usdGenSchema` writes over it. An `extraPlugInfo` that is not a
+    /// dictionary is
+    /// [`ExtraPlugInfoNotDictionary`](SchemaRegistryError::ExtraPlugInfoNotDictionary).
+    ///
+    /// An applied API schema that leaves an apply-info list above empty takes
+    /// it from the same key of its `extraPlugInfo` (`apiSchemaAutoApplyTo`,
+    /// `apiSchemaCanOnlyApplyTo`, `apiSchemaAllowedInstanceNames`,
+    /// `apiSchemaInstances`), as C++ reads it from the `plugInfo.json` entry
+    /// `usdGenSchema` leaves it in; the key then leaves the plug info. Such an
+    /// entry that is not a list of names is
+    /// [`PlugInfoNotNameList`](SchemaRegistryError::PlugInfoNotNameList).
+    ///
+    /// The layers are read here and not retained, so both may be dropped as
+    /// soon as this returns. A failure is held for [`build`](Self::build), and
+    /// a family already registered is refused rather than replaced.
+    pub fn family(mut self, source: FamilySource<'_>) -> Self {
+        if self.error.is_none() {
+            self.error = self.add_layers(source).err();
+        }
+        self
+    }
+
+    /// Takes one family's layers into the builder's own storage.
+    fn add_layers(&mut self, source: FamilySource<'_>) -> Result<(), SchemaRegistryError> {
+        let family = self.claim_family(source.name)?;
+
+        // TODO: share immutable schema data snapshots. The copy gives the
+        // registry an owned snapshot: one shared across threads, unchanged by a
+        // later edit or reload of the source layer, whose decode failures
+        // surface here at registration. A family handed over as shared
+        // `sdf::Data` (an `Arc`, as `sdf::Layer::from_shared` reads it) could
+        // be retained without the copy, which a `&sdf::Layer` cannot offer. A
+        // binary backend could keep its immutable bytes behind thread-safe
+        // decoding once registration validates the schema structure and
+        // fallback decode failures have a defined route to callers. Measure
+        // registry construction and memory first.
+        let schematics = Arc::new(Schematics {
+            family: family.clone(),
+            resolved_location: source.schematics.anchor_location(),
+            data: sdf::Data::from_abstract(source.schematics.data()).map_err(|error| {
+                SchemaRegistryError::Schematics {
+                    family: family.clone(),
+                    source: error.into(),
+                }
+            })?,
+        });
+
+        let manifest =
+            sdf::Data::from_abstract(source.manifest.data()).map_err(|error| SchemaRegistryError::Manifest {
+                family: family.clone(),
+                source: error.into(),
+            })?;
+
+        for identifier in root_prims(&manifest) {
+            let info = read_schema_info(&manifest, &identifier).map_err(|cause| SchemaRegistryError::Schema {
+                identifier: identifier.clone(),
+                family: family.clone(),
+                cause: Box::new(cause),
+            })?;
+            self.register_schema(identifier, info, &schematics)?;
+        }
+
+        Ok(())
+    }
+
+    /// Adds one schema to the registry being built, whatever declared it.
+    fn register_schema(
+        &mut self,
+        identifier: tf::Token,
+        info: SchemaInfo,
+        schematics: &Arc<Schematics>,
+    ) -> Result<(), SchemaRegistryError> {
+        let family = schematics.family.clone();
+        if !SchemaRegistry::is_allowed_identifier(&identifier) {
+            return Err(SchemaRegistryError::InvalidIdentifier { identifier, family });
+        }
+        // An allowed identifier is exactly its family plus its version, so
+        // rejecting a repeat identifier also rejects a repeated
+        // (family, version).
+        if self.infos.contains_key(&identifier) {
+            return Err(SchemaRegistryError::DuplicateIdentifier { identifier, family });
+        }
+        self.source_of.insert(identifier.clone(), schematics.clone());
+        self.infos.insert(identifier, info);
+        Ok(())
+    }
+
+    /// Auto-applies an API schema to schemas whose families do not declare it
+    /// (C++ `CollectAddtlAutoApplyAPISchemasFromPlugins`).
+    ///
+    /// A family declares its own auto-applies through the manifest's
+    /// `apiSchemaAutoApplyTo`; this registers one that no manifest carries,
+    /// which is what lets an API schema reach a type owned by a family it
+    /// cannot edit. Both sources follow the same rules: `targets` name
+    /// schemas by identifier, each carrying everything derived from it, and
+    /// only a single-apply API schema is applied — applying a multiple-apply
+    /// one takes an instance name, which no declaration supplies.
+    ///
+    /// Neither side has to be registered yet: [`build`](Self::build) resolves
+    /// the declaration, and one that names no registered schema resolves to
+    /// nothing. A merged declaration reads back through
+    /// [`SchemaInfo::auto_apply_to`] beside what the manifest declares.
+    pub fn auto_apply(
+        mut self,
+        api: impl Into<tf::Token>,
+        targets: impl IntoIterator<Item = impl Into<tf::Token>>,
+    ) -> Self {
+        self.extra_auto_apply
+            .entry(api.into())
+            .or_default()
+            .extend(targets.into_iter().map(Into::into));
+        self
+    }
+
+    /// Composes the registered families into a registry.
+    ///
+    /// Auto-apply declarations resolve first, since they decide which API
+    /// schemas a definition builds in. Applied API schemas are defined next
+    /// and fully expanded, so a typed schema that includes one picks up
+    /// everything that schema itself includes.
+    pub fn build(mut self) -> Result<Arc<SchemaRegistry>, SchemaRegistryError> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let kinds = mem::take(&mut self.kinds)
+            .build()
+            .map_err(|error| SchemaRegistryError::Kind(Box::new(error)))?;
+        // TODO: report an auto-apply declaration that resolves to nothing —
+        // an API schema name no family registered (dropped here) or one that
+        // is not single-apply (ignored by `compute_auto_applied`). C++ lets
+        // such a name flow into definition composition, which warns through
+        // `TF_WARN`; this crate has no diagnostic channel for a registry
+        // build to carry the report out through.
+        for (api, targets) in mem::take(&mut self.extra_auto_apply) {
+            if let Some(info) = self.infos.get_mut(&api) {
+                info.auto_apply_to.extend(targets);
+            }
+        }
+        let lineages = self.lineages();
+        let auto_applied = self.compute_auto_applied(&lineages);
+
+        let mut api_defs = HashMap::new();
+        for identifier in self.sorted_identifiers(SchemaInfo::is_applied_api) {
+            if api_defs.contains_key(&identifier) {
+                continue;
+            }
+            let mut expansion = Expansion::default();
+            self.expand_api_definition(&identifier, &auto_applied, &mut api_defs, &mut expansion)?;
+            // Whatever this root reached while a cycle was open saw only part of
+            // its own built-ins. Drop those so each is rebuilt from its own
+            // root, where the cycle truncates at the schema that closes it. The
+            // root itself was expanded from the top, so it stands.
+            expansion.provisional.remove(&identifier);
+            for identifier in expansion.provisional {
+                api_defs.remove(&identifier);
+            }
+        }
+
+        let mut concrete_defs = HashMap::new();
+        for identifier in self.sorted_identifiers(|info| info.kind == SchemaKind::ConcreteTyped) {
+            let definition = self.typed_definition(&identifier, &auto_applied, &api_defs)?;
+            concrete_defs.insert(identifier, Arc::new(definition));
+        }
+
+        // A family answers newest version first, so the index is ordered here,
+        // keyed on the version each identifier carries.
+        let mut grouped: HashMap<tf::Token, Vec<(u32, tf::Token)>> = HashMap::new();
+        for (identifier, info) in &self.infos {
+            grouped
+                .entry(info.family.clone())
+                .or_default()
+                .push((info.version, identifier.clone()));
+        }
+        let families = grouped
+            .into_iter()
+            .map(|(family, mut versions)| {
+                versions.sort_unstable_by_key(|(version, _)| Reverse(*version));
+                (family, versions.into_iter().map(|(_, identifier)| identifier).collect())
+            })
+            .collect();
+
+        let empty_def = Arc::new(PrimDefinition::default());
+        Ok(Arc::new(SchemaRegistry {
+            infos: self.infos,
+            lineages,
+            families,
+            concrete_defs,
+            api_defs,
+            empty_def: empty_def.clone(),
+            empty_type_info: Arc::new(PrimTypeInfo::new(
+                PrimTypeId::default(),
+                tf::Token::default(),
+                empty_def,
+            )),
+            type_infos: RwLock::default(),
+            metadata: self.metadata,
+            kinds,
+        }))
+    }
+
+    /// Per registered schema, itself and every registered schema its bases
+    /// reach, for [`SchemaRegistry::is_a`] and auto-apply resolution.
+    fn lineages(&self) -> Lineages {
+        // TODO(rayon): each schema's walk is independent of the others'.
+        self.infos
+            .keys()
+            .map(|schema| {
+                // Manifests are data, so a malformed one can name a base that
+                // is not registered, which ends that branch of the walk, or a
+                // base cycle, which the reached set ends.
+                let mut reached = HashSet::new();
+                let mut pending = vec![schema];
+                while let Some(next) = pending.pop() {
+                    if !reached.contains(next)
+                        && let Some(info) = self.infos.get(next)
+                    {
+                        reached.insert(next.clone());
+                        pending.extend(&info.bases);
+                    }
+                }
+                (schema.clone(), reached)
+            })
+            .collect()
+    }
+
+    /// Inverts every auto-apply declaration into the API schemas each schema
+    /// builds in (C++ `_GetTypeToAutoAppliedAPISchemaNames`): a schema builds
+    /// in every API that targets it or one of its bases, so a target carries
+    /// everything derived from it. What [`auto_apply`](Self::auto_apply)'s
+    /// rules exclude is dropped.
+    ///
+    /// Each schema's list is sorted in reverse dictionary order, which places
+    /// a later version of a family ahead of an earlier one. Composition takes
+    /// one version per family, so that ordering is what makes the newest
+    /// auto-applied version of a family the one that contributes.
+    fn compute_auto_applied(&self, lineages: &Lineages) -> AutoApplied {
+        let mut by_target: HashMap<&tf::Token, Vec<&tf::Token>> = HashMap::new();
+        for (api, info) in &self.infos {
+            if info.kind == SchemaKind::SingleApplyApi {
+                for target in &info.auto_apply_to {
+                    by_target.entry(target).or_default().push(api);
+                }
+            }
+        }
+        if by_target.is_empty() {
+            return AutoApplied::new();
+        }
+
+        // TODO(rayon): each schema's list is independent of the others'.
+        lineages
+            .iter()
+            .filter_map(|(schema, lineage)| {
+                let mut names: Vec<tf::Token> = lineage
+                    .iter()
+                    .filter_map(|ancestor| by_target.get(ancestor))
+                    .flatten()
+                    .map(|&api| api.clone())
+                    .collect();
+                if names.is_empty() {
+                    return None;
+                }
+                // A schema reached through several targets builds an API in
+                // once.
+                names.sort_unstable_by(|a, b| sdf::element_cmp(b, a));
+                names.dedup();
+                Some((schema.clone(), names))
+            })
+            .collect()
+    }
+
+    /// The registered identifiers matching `wanted`, in a stable order so a
+    /// registry built twice from the same families is identical.
+    fn sorted_identifiers(&self, wanted: impl Fn(&SchemaInfo) -> bool) -> Vec<tf::Token> {
+        let mut identifiers: Vec<tf::Token> = self
+            .infos
+            .iter()
+            .filter(|(_, info)| wanted(info))
+            .map(|(identifier, _)| identifier.clone())
+            .collect();
+        identifiers.sort_by(|a, b| sdf::element_cmp(a, b));
+        identifiers
+    }
+
+    /// Builds an applied API schema's definition, with the definitions of the
+    /// API schemas it includes composed in beneath it.
+    ///
+    /// A schema that includes itself, directly or through another, stops
+    /// expanding at the repeat and registers what it had reached by then.
+    fn expand_api_definition(
+        &self,
+        identifier: &tf::Token,
+        auto_applied: &AutoApplied,
+        api_defs: &mut HashMap<tf::Token, Arc<PrimDefinition>>,
+        expansion: &mut Expansion,
+    ) -> Result<(), SchemaRegistryError> {
+        if api_defs.contains_key(identifier) {
+            return Ok(());
+        }
+        if !expansion.open.insert(identifier.clone()) {
+            // The schema includes itself, directly or through another. Stop
+            // here; everything still open is composing a partial view of its
+            // own built-ins.
+            expansion.truncated = true;
+            return Ok(());
+        }
+
+        let mut pending = self.begin_definition(identifier, auto_applied)?;
+        for name in mem::take(&mut pending.built_ins) {
+            let (built_in, instance) = SchemaRegistry::type_name_and_instance(&name);
+            // A built-in no family registered contributes nothing; the schema
+            // that names it is still worth defining.
+            if !self.infos.contains_key(&built_in) {
+                continue;
+            }
+            self.expand_api_definition(&built_in, auto_applied, api_defs, expansion)?;
+            pending.compose_built_in(&built_in, instance.as_ref(), api_defs, &self.infos);
+        }
+
+        expansion.open.remove(identifier);
+        if expansion.truncated {
+            expansion.provisional.insert(identifier.clone());
+        }
+        api_defs.insert(identifier.clone(), Arc::new(pending.finish()));
+        Ok(())
+    }
+
+    /// Builds a typed schema's definition. Its own properties are strongest;
+    /// each built-in API schema contributes beneath them, in declared order.
+    fn typed_definition(
+        &self,
+        identifier: &tf::Token,
+        auto_applied: &AutoApplied,
+        api_defs: &HashMap<tf::Token, Arc<PrimDefinition>>,
+    ) -> Result<PrimDefinition, SchemaRegistryError> {
+        let mut pending = self.begin_definition(identifier, auto_applied)?;
+        for name in mem::take(&mut pending.built_ins) {
+            let (built_in, instance) = SchemaRegistry::type_name_and_instance(&name);
+            pending.compose_built_in(&built_in, instance.as_ref(), api_defs, &self.infos);
+        }
+        Ok(pending.finish())
+    }
+
+    /// Starts one schema's definition from its own class prim, before any
+    /// built-in API schema contributes.
+    fn begin_definition(
+        &self,
+        identifier: &tf::Token,
+        auto_applied: &AutoApplied,
+    ) -> Result<PendingDefinition, SchemaRegistryError> {
+        let info = self
+            .infos
+            .get(identifier)
+            .ok_or_else(|| SchemaRegistryError::MissingManifestEntry {
+                identifier: identifier.clone(),
+            })?;
+        let schematics = self
+            .source_of
+            .get(identifier)
+            .ok_or_else(|| SchemaRegistryError::MissingSchematics {
+                identifier: identifier.clone(),
+            })?
+            .clone();
+
+        let class_prim = sdf::Path::abs_root().append_path(identifier.as_str())?;
+        let overrides = override_property_names(&schematics, &class_prim);
+
+        // A multiple-apply schema is a template: it contributes under a name
+        // carrying the instance-name placeholder until an instance is chosen.
+        let applied_name = match info.kind {
+            SchemaKind::MultipleApplyApi => Some(SchemaRegistry::make_name_template(identifier, "")),
+            SchemaKind::SingleApplyApi => Some(identifier.clone()),
+            _ => None,
+        };
+
+        // Claim this schema's own family version up front, so a built-in that
+        // names a different version of the same family is refused rather than
+        // composed in beside it. The claim is keyed the way the schema's own
+        // applied name is, so a multiple-apply schema claims the placeholder
+        // instance its template contributes under — otherwise the conflict goes
+        // unnoticed until an instance name is chosen, where the rollback
+        // discards the whole definition instead of just the bad built-in.
+        //
+        // C++ always claims the empty instance here, with an `XXX` noting the
+        // multiple-apply case needs revisiting.
+        let mut seen = FamilyVersions::new();
+        if info.is_applied_api() {
+            let instance = applied_name
+                .as_ref()
+                .and_then(|name| SchemaRegistry::type_name_and_instance(name).1);
+            seen.insert((info.family.clone(), instance), info.version);
+        }
+
+        Ok(PendingDefinition {
+            definition: PrimDefinition::from_class_prim(&schematics, identifier, applied_name, &overrides)?,
+            built_ins: self.direct_built_ins(&schematics, &class_prim, info, auto_applied),
+            schematics,
+            class_prim,
+            overrides,
+            seen,
+        })
+    }
+
+    /// The API schemas a class prim declares as built in, followed by the ones
+    /// auto-applied to it (C++ `_GetDirectBuiltinAPISchemas`).
+    ///
+    /// An auto-applied schema comes last, so everything the class prim
+    /// declares is stronger than anything applied to it from outside.
+    ///
+    /// A multiple-apply schema may only include other templates, and any other
+    /// schema may only include non-templates: a template's properties are only
+    /// meaningful once an instance name replaces the placeholder, so mixing the
+    /// two would leave a placeholder in a concrete prim's properties. Names on
+    /// the wrong side of that rule are dropped, which is also what keeps an
+    /// auto-applied schema — never a template — out of a multiple-apply one.
+    fn direct_built_ins(
+        &self,
+        schematics: &Schematics,
+        class_prim: &sdf::Path,
+        info: &SchemaInfo,
+        auto_applied: &AutoApplied,
+    ) -> Vec<tf::Token> {
+        let declared = prim_field(schematics.data(), class_prim, sdf::FieldKey::ApiSchemas)
+            .and_then(|value| value.clone().try_as_token_list_op())
+            .map(|list_op| list_op.compose_over(&[]))
+            .unwrap_or_default();
+        let auto_applied = auto_applied.get(info.identifier()).into_iter().flatten().cloned();
+
+        let wants_templates = info.kind == SchemaKind::MultipleApplyApi;
+        declared
+            .into_iter()
+            .chain(auto_applied)
+            .filter(|name| SchemaRegistry::is_name_template(name) == wants_templates)
+            .filter(|name| {
+                // The reference also has to agree with what it names: only a
+                // multiple-apply schema is applied under an instance name, so a
+                // single-apply schema dressed as a template would compose its
+                // properties without the instance the name promises. A built-in
+                // no family registered names no schema, so it drops here too.
+                check_applied_shape(&self.infos, name).is_ok_and(|resolved| resolved.is_some())
+            })
+            .collect()
+    }
+}
+
+/// Which API schemas are auto-applied to each schema identifier, strongest
+/// first (C++ `_typeToAutoAppliedAPISchemaNames`).
+type AutoApplied = HashMap<tf::Token, Vec<tf::Token>>;
+
+/// Per registered schema, itself and every registered schema it derives from.
+type Lineages = HashMap<tf::Token, HashSet<tf::Token>>;
+
+/// State threaded through one root's recursive built-in expansion.
+#[derive(Default)]
+struct Expansion {
+    /// The schemas whose expansion is still open, so a repeat is a cycle.
+    open: HashSet<tf::Token>,
+    /// Whether a cycle was reached anywhere under this root.
+    truncated: bool,
+    /// Definitions completed while a cycle was open, and so possibly missing
+    /// built-ins. They are dropped once the root finishes.
+    provisional: HashSet<tf::Token>,
+}
+
+/// A definition part-way through its build: the schema's own properties are
+/// installed, and the built-in API schemas and property overrides still have to
+/// be composed in.
+///
+/// Typed and applied API schemas share this shape; they differ only in how each
+/// built-in's definition is obtained, which is why the caller drives the loop.
+struct PendingDefinition {
+    definition: PrimDefinition,
+    /// The API schemas the class prim declares as built in, strongest first.
+    built_ins: Vec<tf::Token>,
+    schematics: Arc<Schematics>,
+    class_prim: sdf::Path,
+    /// Properties the class prim declares only to override a built-in's,
+    /// composed once every built-in has contributed.
+    overrides: Vec<tf::Token>,
+    seen: FamilyVersions,
+}
+
+impl PendingDefinition {
+    /// Composes one already-built built-in schema in as a weaker tier.
+    fn compose_built_in(
+        &mut self,
+        built_in: &tf::Token,
+        instance: Option<&tf::Token>,
+        api_defs: &HashMap<tf::Token, Arc<PrimDefinition>>,
+        infos: &HashMap<tf::Token, SchemaInfo>,
+    ) {
+        if let Some(weaker) = api_defs.get(built_in) {
+            self.definition
+                .compose_weaker_api(weaker, instance, infos, &mut self.seen);
+        }
+    }
+
+    /// Applies the class prim's property overrides over what the built-ins
+    /// contributed, yielding the finished definition.
+    fn finish(mut self) -> PrimDefinition {
+        for name in &self.overrides {
+            self.definition
+                .compose_override(name, &self.schematics, &self.class_prim);
+        }
+        self.definition
+    }
+}
+
+/// The property names a class prim declares only to override a built-in API
+/// schema's, read from its `customData` (C++
+/// `apiSchemaOverridePropertyNames`).
+fn override_property_names(schematics: &Schematics, class_prim: &sdf::Path) -> Vec<tf::Token> {
+    const OVERRIDE_NAMES: &str = "apiSchemaOverridePropertyNames";
+
+    custom_data(schematics.data(), class_prim)
+        .and_then(|custom| custom.get(OVERRIDE_NAMES))
+        .and_then(vt::Value::try_as_token_vec_ref)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Reads one field off a prim in a family's parsed text — a schema's class
+/// prim in the schematics, or its entry in the manifest.
+fn prim_field<'a>(data: &'a sdf::Data, prim: &sdf::Path, field: sdf::FieldKey) -> Option<&'a vt::Value> {
+    data.spec(prim)?.get(field.as_str())
+}
+
+/// The rule behind [`SchemaRegistry::check_applied_name`], over the schema
+/// table alone so the builder can apply it before a registry exists.
+///
+/// `Ok(None)` for a name `infos` has no schema for.
+fn check_applied_shape<'a>(
+    infos: &'a HashMap<tf::Token, SchemaInfo>,
+    name: &tf::Token,
+) -> Result<Option<(&'a SchemaInfo, Option<tf::Token>)>, ApplyApiError> {
+    let (schema, instance) = SchemaRegistry::type_name_and_instance(name);
+    let Some(info) = infos.get(&schema) else {
+        return Ok(None);
+    };
+    if !info.is_applied_api() {
+        return Err(ApplyApiError::NotAppliedApi { schema });
+    }
+
+    match (info.kind == SchemaKind::MultipleApplyApi, instance) {
+        (true, None) => Err(ApplyApiError::MissingInstanceName { schema }),
+        (false, Some(instance)) => Err(ApplyApiError::UnexpectedInstanceName { schema, instance }),
+        (_, instance) => Ok(Some((info, instance))),
+    }
+}
+
+/// The placeholder that stands in for an instance name in a multiple-apply
+/// schema's property and built-in names (C++ `__INSTANCE_NAME__`).
+const INSTANCE_NAME_PLACEHOLDER: &str = "__INSTANCE_NAME__";
+
+/// Where the placeholder starts, matched as a whole namespace component so a
+/// property merely containing the text does not count.
+fn placeholder_position(name: &str) -> Option<usize> {
+    let mut start = 0;
+    for component in name.split(':') {
+        if component == INSTANCE_NAME_PLACEHOLDER {
+            return Some(start);
+        }
+        start += component.len() + 1;
+    }
+    None
+}
+
+/// The names of a parsed layer's root prims, in authored order.
+fn root_prims(data: &sdf::Data) -> Vec<tf::Token> {
+    prim_definition::child_names(data, &sdf::Path::abs_root(), sdf::ChildrenKey::PrimChildren)
+}
+
+/// The core `usd` family alone, generated from OpenUSD's own definitions.
+///
+/// It defines the root every schema derives from, `SchemaBase`, the `Typed`
+/// and `APISchemaBase` roots under it, and the API schemas the core library
+/// itself implements. Seeding it means a family registered on top answers
+/// [`is_a`](SchemaRegistry::is_a) for the bases it declares, which every
+/// domain family's bases reach; [`empty`](SchemaRegistryBuilder::empty) opts
+/// out.
+///
+/// The declarations are compiled into the program, where C++ installs the same
+/// data beside a plugin and opens it at first use (`_GetGeneratedSchema`) — a
+/// linked crate has nowhere to install it. Nothing is read from disk, so the
+/// fallbacks they declare anchor against nothing, as C++'s do.
+impl Default for SchemaRegistryBuilder {
+    fn default() -> Self {
+        Self::empty().register(super::core_schemas::SCHEMAS)
+    }
+}
+
+/// Writes a declaration's own fields onto the spec at `path`.
+///
+/// A field [`SchemaRegistry::is_reserved_field`] answers for is refused rather
+/// than written, so which spelling won cannot come down to the order this
+/// happens to run in.
+fn set_fields(
+    data: &mut sdf::Data,
+    family: &tf::Token,
+    path: &sdf::Path,
+    fields: &[Field<'_>],
+    spec: sdf::SpecType,
+) -> Result<(), SchemaRegistryError> {
+    for field in fields {
+        if SchemaRegistry::is_reserved_field(spec, field.name) {
+            return Err(SchemaRegistryError::ReservedField {
+                path: path.clone(),
+                family: family.clone(),
+                field: field.name.into(),
+            });
+        }
+        data.set_field(path, field.name, field.value());
+    }
+    Ok(())
+}
+
+/// Reports an authoring failure against the family being registered.
+fn authored<T>(family: &tf::Token, result: Result<T, sdf::AuthoringError>) -> Result<(), SchemaRegistryError> {
+    result.map(|_| ()).map_err(|source| SchemaRegistryError::Authoring {
+        family: family.clone(),
+        source: Box::new(source),
+    })
+}
+
+/// What a declaration says about how its schema applies.
+fn schema_info(decl: &SchemaDecl<'_>, identifier: &tf::Token) -> Result<SchemaInfo, SchemaRegistryError> {
+    let tokens = |names: &[&str]| names.iter().copied().map(tf::Token::from).collect();
+
+    SchemaInfo::new(
+        identifier.clone(),
+        decl.kind,
+        Declared {
+            bases: tokens(decl.bases),
+            property_namespace_prefix: decl.property_namespace_prefix.map(tf::Token::from),
+            auto_apply_to: tokens(decl.auto_apply_to),
+            can_only_apply_to: tokens(decl.can_only_apply_to),
+            instance_can_only_apply_to: decl
+                .instance_restrictions
+                .iter()
+                .map(|(instance, allowed)| (tf::Token::from(*instance), tokens(allowed)))
+                .collect(),
+            allowed_instance_names: tokens(decl.allowed_instance_names),
+            plug_info: decl
+                .plug_info
+                .iter()
+                .map(|entry| (entry.name.to_owned(), entry.value()))
+                .collect(),
+        },
+    )
+}
+
+/// The keys C++ `usdGenSchema` writes into a schema's `plugInfo.json` entry
+/// over its `extraPlugInfo`, which a generated file therefore loses
+/// (`usdGenSchema.py:1498-1529, 1597-1621`).
+///
+/// `bases`, `autoGenerated`, `schemaKind` and `schemaIdentifier` are always
+/// written. An applied API schema has each of its apply-info lists written
+/// when the list is not empty; other schemas have none written. `alias` is
+/// written where the C++ class name differs from the schema's identifier,
+/// which a registry does not record, so an `alias` entry is kept here.
+fn generated_plug_info(info: &SchemaInfo) -> Vec<&'static str> {
+    let mut keys = vec!["bases", "autoGenerated", "schemaKind", "schemaIdentifier"];
+    if info.kind.is_applied_api() {
+        let lists = [
+            ("apiSchemaAutoApplyTo", info.auto_apply_to.is_empty()),
+            ("apiSchemaCanOnlyApplyTo", info.can_only_apply_to.is_empty()),
+            ("apiSchemaAllowedInstanceNames", info.allowed_instance_names.is_empty()),
+            ("apiSchemaInstances", info.instance_can_only_apply_to.is_empty()),
+        ];
+        keys.extend(lists.into_iter().filter(|(_, empty)| !empty).map(|(key, _)| key));
+    }
+    keys
+}
+
+/// The names the plug info entry `key` holds, as C++
+/// `_GetNameListFromMetadata` reads them: none where the entry is missing,
+/// and an error where it is not a list of names.
+fn plug_names(value: Option<&vt::Value>, key: &'static str) -> Result<Vec<tf::Token>, SchemaRegistryError> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(vt::Value::TokenVec(names)) => Ok(names.clone()),
+        Some(vt::Value::StringVec(names)) => Ok(names.iter().map(|name| tf::Token::from(name.as_str())).collect()),
+        Some(other) => Err(SchemaRegistryError::PlugInfoNotNameList {
+            key,
+            kind: other.into(),
+        }),
+    }
+}
+
+/// Reads one schema's manifest entry from the prim at `/<identifier>`.
+fn read_schema_info(manifest: &sdf::Data, identifier: &tf::Token) -> Result<SchemaInfo, SchemaRegistryError> {
+    let prim = sdf::Path::abs_root().append_path(identifier.as_str())?;
+
+    let kind = manifest_token(manifest, &prim, "schemaKind").ok_or(SchemaRegistryError::MissingSchemaKind)?;
+    let kind = SchemaKind::from_token(kind.as_str()).ok_or_else(|| SchemaRegistryError::UnknownSchemaKind { kind })?;
+    let plug_info = custom_data(manifest, &prim)
+        .and_then(|custom| custom.get("extraPlugInfo"))
+        .map(|value| {
+            value
+                .try_as_dictionary_ref()
+                .cloned()
+                .ok_or_else(|| SchemaRegistryError::ExtraPlugInfoNotDictionary { kind: value.into() })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    SchemaInfo::new(
+        identifier.clone(),
+        kind,
+        Declared {
+            bases: manifest_token_vec(manifest, &prim, "bases"),
+            property_namespace_prefix: manifest_token(manifest, &prim, "propertyNamespacePrefix"),
+            auto_apply_to: manifest_token_vec(manifest, &prim, "apiSchemaAutoApplyTo"),
+            can_only_apply_to: manifest_token_vec(manifest, &prim, "apiSchemaCanOnlyApplyTo"),
+            instance_can_only_apply_to: manifest_instance_restrictions(manifest, &prim)?,
+            allowed_instance_names: manifest_token_vec(manifest, &prim, "allowedInstanceNames"),
+            plug_info,
+        },
+    )
+}
+
+/// The `customData` dictionary of a prim in a family's parsed text.
+fn custom_data<'a>(data: &'a sdf::Data, prim: &sdf::Path) -> Option<&'a vt::Dictionary> {
+    prim_field(data, prim, sdf::FieldKey::CustomData).and_then(vt::Value::try_as_dictionary_ref)
+}
+
+/// Reads a multiple-apply schema's per-instance `apiSchemaCanOnlyApplyTo`
+/// lists from the manifest prim's `customData.apiSchemaInstances` dictionary.
+/// An empty list is not recorded, as C++ `UsdSchemaRegistry`'s plugin loader
+/// stores none, so the instance keeps the schema-wide restriction.
+fn manifest_instance_restrictions(
+    manifest: &sdf::Data,
+    prim: &sdf::Path,
+) -> Result<HashMap<tf::Token, Vec<tf::Token>>, SchemaRegistryError> {
+    instance_restrictions(custom_data(manifest, prim).and_then(|custom| custom.get("apiSchemaInstances")))
+}
+
+/// The per-instance `apiSchemaCanOnlyApplyTo` lists an `apiSchemaInstances`
+/// dictionary holds, keeping only an instance whose list names something.
+fn instance_restrictions(
+    instances: Option<&vt::Value>,
+) -> Result<HashMap<tf::Token, Vec<tf::Token>>, SchemaRegistryError> {
+    let mut restrictions = HashMap::new();
+    let entries = instances
+        .and_then(vt::Value::try_as_dictionary_ref)
+        .into_iter()
+        .flatten();
+    for (instance, entry) in entries {
+        let Some(entry) = entry.try_as_dictionary_ref() else {
+            continue;
+        };
+        let allowed = plug_names(entry.get("apiSchemaCanOnlyApplyTo"), "apiSchemaCanOnlyApplyTo")?;
+        if !allowed.is_empty() {
+            restrictions.insert(tf::Token::from(instance.as_str()), allowed);
+        }
+    }
+    Ok(restrictions)
+}
+
+/// Reads a manifest attribute's default value as a token.
+fn manifest_token(manifest: &sdf::Data, prim: &sdf::Path, attribute: &str) -> Option<tf::Token> {
+    manifest_default(manifest, prim, attribute)?.clone().try_as_token()
+}
+
+/// Reads a manifest attribute's default value as a token array, treating an
+/// absent attribute as empty.
+fn manifest_token_vec(manifest: &sdf::Data, prim: &sdf::Path, attribute: &str) -> Vec<tf::Token> {
+    manifest_default(manifest, prim, attribute)
+        .and_then(|value| value.clone().try_as_token_vec())
+        .unwrap_or_default()
+}
+
+/// Reads the `default` field of a manifest attribute.
+fn manifest_default<'a>(manifest: &'a sdf::Data, prim: &sdf::Path, attribute: &str) -> Option<&'a vt::Value> {
+    let path = prim.append_property(attribute).ok()?;
+    manifest.spec(&path)?.get(sdf::FieldKey::Default.as_str())
+}
+
+/// Splits `identifier` at its version suffix, borrowing both halves:
+/// `("DomeLight", Some("1"))`, or `("DomeLight", None)` without one.
+fn split_version_suffix(identifier: &str) -> (&str, Option<&str>) {
+    match version_delimiter(identifier) {
+        Some(delim) => (&identifier[..delim], Some(&identifier[delim + 1..])),
+        None => (identifier, None),
+    }
+}
+
+/// Locates a schema identifier's version suffix: the index of the underscore
+/// that is followed by digits only, with at least one digit.
+///
+/// Mirrors C++ `_FindVersionDelimiter`, which scans back from the end and
+/// stops at the first character that is neither a digit nor the delimiter.
+fn version_delimiter(identifier: &str) -> Option<usize> {
+    let stem = identifier.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.len() == identifier.len() {
+        return None;
+    }
+    stem.strip_suffix('_').map(str::len)
+}
+
+/// A miniature family shaped like the real OpenUSD schema data, shared by
+/// every module's tests so they exercise the same topology the vendored data
+/// will: a multiple-apply schema whose properties carry the instance-name
+/// placeholder, a single-apply schema that declares a built-in and overrides
+/// one of its properties, and a concrete type that in turn overrides one of
+/// its own built-in's properties.
+#[cfg(test)]
+impl SchemaRegistry {
+    const TEST_MANIFEST: &'static str = r#"#usda 1.0
+
+def "APISchemaBase"
+{
+    uniform token schemaKind = "abstractBase"
+}
+
+def "Typed"
+{
+    uniform token schemaKind = "abstractBase"
+}
+
+def "CollectionAPI"
+{
+    uniform token schemaKind = "multipleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+}
+
+def "SlotAPI" (
+    customData = {
+        dictionary apiSchemaInstances = {
+            dictionary left = {
+                token[] apiSchemaCanOnlyApplyTo = []
+            }
+            dictionary right = {
+                token[] apiSchemaCanOnlyApplyTo = ["DomeLight"]
+            }
+        }
+    }
+)
+{
+    uniform token schemaKind = "multipleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+    uniform token[] allowedInstanceNames = ["left", "right"]
+    uniform token[] apiSchemaCanOnlyApplyTo = ["NonboundableLightBase"]
+}
+
+def "LightAPI"
+{
+    uniform token schemaKind = "singleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+    uniform token[] apiSchemaCanOnlyApplyTo = ["DistantLight"]
+}
+
+def "LightAPI_2"
+{
+    uniform token schemaKind = "singleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+}
+
+def "NonboundableLightBase"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Typed"]
+}
+
+def "DistantLight"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["NonboundableLightBase"]
+}
+
+def "DomeLight"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["NonboundableLightBase"]
+}
+
+def "DomeLight_1"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["NonboundableLightBase"]
+}
+"#;
+
+    const TEST_SCHEMATICS: &'static str = r#"#usda 1.0
+
+class "APISchemaBase"
+{
+}
+
+class "Typed"
+{
+}
+
+class "CollectionAPI"
+{
+    uniform token collection:__INSTANCE_NAME__:expansionRule = "expandPrims" (
+        allowedTokens = ["explicitOnly", "expandPrims", "expandPrimsAndProperties"]
+    )
+    uniform bool collection:__INSTANCE_NAME__:includeRoot
+    rel collection:__INSTANCE_NAME__:includes
+}
+
+class "LightAPI" (
+    apiSchemas = ["CollectionAPI:lightLink"]
+    customData = {
+        token[] apiSchemaOverridePropertyNames = ["collection:lightLink:includeRoot"]
+    }
+)
+{
+    uniform bool collection:lightLink:includeRoot = 1
+    float inputs:intensity = 1
+    uniform token light:shaderId = ""
+}
+
+class "SlotAPI"
+{
+    float slot:__INSTANCE_NAME__:depth = 0
+}
+
+class "LightAPI_2"
+{
+    float inputs:intensity = 2
+}
+
+class "NonboundableLightBase"
+{
+}
+
+class DistantLight "DistantLight" (
+    apiSchemas = ["LightAPI"]
+    customData = {
+        token[] apiSchemaOverridePropertyNames = ["inputs:intensity", "light:shaderId"]
+    }
+)
+{
+    float inputs:angle = 0.53
+    float inputs:intensity = 50000
+    uniform token light:shaderId = "DistantLight"
+}
+
+class DomeLight "DomeLight"
+{
+    float inputs:intensity = 1
+}
+
+class DomeLight_1 "DomeLight_1"
+{
+    float inputs:intensity = 1
+    uniform token poleAxis = "scene"
+}
+"#;
+
+    /// The miniature family, registered.
+    pub(crate) fn test_registry() -> Arc<SchemaRegistry> {
+        Self::test_family(Self::TEST_MANIFEST, Self::TEST_SCHEMATICS)
+    }
+
+    /// A registry of one family built from the given manifest and schematics.
+    pub(crate) fn test_family(manifest: &str, schematics: &str) -> Arc<SchemaRegistry> {
+        // Empty: the family below redeclares `Typed`, `APISchemaBase` and
+        // `CollectionAPI`, which the core family already owns.
+        SchemaRegistryBuilder::empty()
+            .family(FamilySource {
+                name: "test",
+                manifest: &Self::test_layer(manifest),
+                schematics: &Self::test_layer(schematics),
+            })
+            .build()
+            .expect("test registry builds")
+    }
+
+    /// One of a test family's layers, over text.
+    pub(crate) fn test_layer(text: &str) -> sdf::Layer {
+        sdf::Layer::from_bytes("test", text.as_bytes().to_vec()).expect("the test layer parses")
+    }
+}
+
+/// Append to `order` the C3 merge of `sequences` (C++ `_MergeAncestors`): the
+/// first schema heading a sequence that no sequence holds further in, taken
+/// off every sequence it heads, until none is left or none qualifies.
+fn merge_ancestors<'a>(mut sequences: Vec<VecDeque<&'a tf::Token>>, order: &mut Vec<&'a tf::Token>) {
+    loop {
+        let next = sequences
+            .iter()
+            .filter_map(|sequence| sequence.front().copied())
+            .find(|head| {
+                sequences
+                    .iter()
+                    .all(|sequence| !sequence.iter().skip(1).any(|later| later == head))
+            });
+        let Some(next) = next else {
+            return;
+        };
+        order.push(next);
+        for sequence in &mut sequences {
+            if sequence.front() == Some(&next) {
+                sequence.pop_front();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_infos() {
+        let registry = SchemaRegistry::test_registry();
+
+        let light = registry.schema_info(&tf::Token::new("LightAPI")).expect("LightAPI");
+        assert_eq!(light.kind(), SchemaKind::SingleApplyApi);
+        assert_eq!(light.bases(), [tf::Token::new("APISchemaBase")]);
+        assert_eq!(light.can_only_apply_to(None), [tf::Token::new("DistantLight")]);
+        assert!(light.is_applied_api());
+
+        let collection = registry
+            .schema_info(&tf::Token::new("CollectionAPI"))
+            .expect("CollectionAPI");
+        assert_eq!(collection.kind(), SchemaKind::MultipleApplyApi);
+        assert!(collection.auto_apply_to().is_empty());
+
+        assert!(registry.schema_info(&tf::Token::new("Nonexistent")).is_none());
+    }
+
+    /// A family of `Marker`, whose manifest entry's `customData` authors
+    /// `extra_plug_info`, and `Plain`, which derives from it.
+    fn plug_info_family(extra_plug_info: &str) -> Result<Arc<SchemaRegistry>, SchemaRegistryError> {
+        const SCHEMATICS: &str = r#"#usda 1.0
+
+class "Typed"
+{
+}
+
+class Marker "Marker"
+{
+}
+
+class Plain "Plain"
+{
+}
+
+class "APISchemaBase"
+{
+}
+
+class "FlaggedAPI"
+{
+}
+
+class "ExtraAPI"
+{
+}
+
+class "ExtraInstanceAPI"
+{
+}
+"#;
+        let manifest = format!(
+            r#"#usda 1.0
+
+def "Typed"
+{{
+    uniform token schemaKind = "abstractBase"
+}}
+
+def "Marker" (
+    customData = {{
+        {extra_plug_info}
+    }}
+)
+{{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Typed"]
+}}
+
+def "Plain"
+{{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Marker"]
+}}
+
+def "APISchemaBase"
+{{
+    uniform token schemaKind = "abstractBase"
+}}
+
+def "FlaggedAPI" (
+    customData = {{
+        dictionary extraPlugInfo = {{
+            string apiSchemaAutoApplyTo = "lost"
+            bool note = 1
+        }}
+    }}
+)
+{{
+    uniform token schemaKind = "singleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+    uniform token[] apiSchemaAutoApplyTo = ["Marker"]
+}}
+
+def "ExtraAPI" (
+    customData = {{
+        dictionary extraPlugInfo = {{
+            token[] apiSchemaAutoApplyTo = ["Plain"]
+            string[] apiSchemaCanOnlyApplyTo = ["Plain"]
+        }}
+    }}
+)
+{{
+    uniform token schemaKind = "singleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+}}
+
+def "ExtraInstanceAPI" (
+    customData = {{
+        dictionary extraPlugInfo = {{
+            token[] apiSchemaAllowedInstanceNames = ["one"]
+            dictionary apiSchemaInstances = {{
+                dictionary one = {{
+                    token[] apiSchemaCanOnlyApplyTo = ["Plain"]
+                }}
+            }}
+        }}
+    }}
+)
+{{
+    uniform token schemaKind = "multipleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+}}
+"#
+        );
+        SchemaRegistryBuilder::empty()
+            .family(FamilySource {
+                name: "test",
+                manifest: &SchemaRegistry::test_layer(&manifest),
+                schematics: &SchemaRegistry::test_layer(SCHEMATICS),
+            })
+            .build()
+    }
+
+    /// A manifest prim's `customData.extraPlugInfo` is the schema's plug
+    /// info, kept whole and uninterpreted, and a schema without one has
+    /// none.
+    #[test]
+    fn plug_info_from_manifest() -> Result<(), SchemaRegistryError> {
+        let registry = plug_info_family(
+            "dictionary extraPlugInfo = {
+            bool providesUsdShadeConnectableAPIBehavior = 1
+            string note = \"kept\"
+            dictionary nested = {
+                int depth = 2
+            }
+        }",
+        )?;
+        let marker = registry.schema_info(&tf::Token::new("Marker")).expect("Marker");
+        let info = marker.plug_info();
+        assert_eq!(info.len(), 3);
+        assert_eq!(
+            info.get("providesUsdShadeConnectableAPIBehavior"),
+            Some(&vt::Value::Bool(true))
+        );
+        assert_eq!(info.get("note"), Some(&vt::Value::String("kept".into())));
+        let nested = info
+            .get("nested")
+            .and_then(vt::Value::try_as_dictionary_ref)
+            .expect("a nested dictionary");
+        assert_eq!(nested.get("depth"), Some(&vt::Value::Int(2)));
+
+        // A derived schema does not inherit its base's entries.
+        let plain = registry.schema_info(&tf::Token::new("Plain")).expect("Plain");
+        assert!(plain.plug_info().is_empty());
+        Ok(())
+    }
+
+    /// A manifest `extraPlugInfo` loses the keys `usdGenSchema` writes over
+    /// it, and keeps the ones it writes only for another kind of schema.
+    #[test]
+    fn plug_info_overwritten_keys() -> Result<(), SchemaRegistryError> {
+        let registry = plug_info_family(
+            "dictionary extraPlugInfo = {
+            string bases = \"lost\"
+            string schemaKind = \"lost\"
+            string apiSchemaAutoApplyTo = \"kept on a typed schema\"
+            bool note = 1
+        }",
+        )?;
+        let marker = registry.schema_info(&tf::Token::new("Marker")).expect("Marker");
+        let mut keys: Vec<_> = marker.plug_info().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["apiSchemaAutoApplyTo", "note"]);
+
+        // An applied API schema loses the lists it writes, whatever the plug
+        // info held for them.
+        let flagged = registry.schema_info(&tf::Token::new("FlaggedAPI")).expect("FlaggedAPI");
+        let keys: Vec<_> = flagged.plug_info().keys().cloned().collect();
+        assert_eq!(keys, ["note"]);
+        Ok(())
+    }
+
+    /// An apply-info list a manifest leaves empty is read from its
+    /// `extraPlugInfo`, which then keeps no entry for it.
+    #[test]
+    fn apply_info_from_plug_info() -> Result<(), SchemaRegistryError> {
+        let registry = plug_info_family("")?;
+        let plain = [tf::Token::new("Plain")];
+        let extra = registry.schema_info(&tf::Token::new("ExtraAPI")).expect("ExtraAPI");
+        assert_eq!(extra.auto_apply_to(), plain);
+        assert_eq!(extra.can_only_apply_to(None), plain);
+        assert!(extra.plug_info().is_empty());
+
+        let instanced = registry
+            .schema_info(&tf::Token::new("ExtraInstanceAPI"))
+            .expect("ExtraInstanceAPI");
+        assert_eq!(instanced.allowed_instance_names(), [tf::Token::new("one")]);
+        assert_eq!(instanced.can_only_apply_to(Some(&tf::Token::new("one"))), plain);
+        assert!(instanced.plug_info().is_empty());
+        Ok(())
+    }
+
+    /// A manifest `extraPlugInfo` that is not a dictionary fails the family's
+    /// registration.
+    #[test]
+    fn plug_info_not_dictionary() {
+        let error = plug_info_family("string extraPlugInfo = \"providesUsdShadeConnectableAPIBehavior\"")
+            .expect_err("extraPlugInfo is a dictionary");
+        let SchemaRegistryError::Schema { cause, .. } = error else {
+            panic!("expected a schema entry failure, got {error}");
+        };
+        assert!(
+            matches!(
+                *cause,
+                SchemaRegistryError::ExtraPlugInfoNotDictionary {
+                    kind: vt::ValueKind::String
+                }
+            ),
+            "{cause}"
+        );
+    }
+
+    /// An apply-info entry that is not a list of names fails the family's
+    /// registration.
+    #[test]
+    fn plug_info_not_name_list() {
+        static MINE: &SchemaFamily<'_> = &SchemaFamily::new(
+            "mine",
+            &[SchemaDecl::new("WidgetAPI", SchemaKind::SingleApplyApi)
+                .bases(&["APISchemaBase"])
+                .plug_info(&[Field::token("apiSchemaAutoApplyTo", "Mesh")])],
+        );
+        let error = SchemaRegistry::builder()
+            .register(MINE)
+            .build()
+            .expect_err("a list of names");
+        let SchemaRegistryError::Schema { cause, .. } = error else {
+            panic!("a schema error: {error}");
+        };
+        assert!(matches!(
+            *cause,
+            SchemaRegistryError::PlugInfoNotNameList {
+                key: "apiSchemaAutoApplyTo",
+                ..
+            }
+        ));
+    }
+
+    /// A declared instance whose list is empty takes its restriction from
+    /// the plug info.
+    #[test]
+    fn empty_instance_from_plug_info() -> Result<(), SchemaRegistryError> {
+        static MINE: &SchemaFamily<'_> = &SchemaFamily::new(
+            "mine",
+            &[SchemaDecl::new("WidgetAPI", SchemaKind::MultipleApplyApi)
+                .bases(&["APISchemaBase"])
+                .instance_restrictions(&[("one", &[])])
+                .plug_info(&[Field::new("apiSchemaInstances", || {
+                    let one = vt::Dictionary::from([(
+                        "apiSchemaCanOnlyApplyTo".to_string(),
+                        vt::Value::TokenVec(vec![tf::Token::new("Mesh")]),
+                    )]);
+                    vt::Value::Dictionary(vt::Dictionary::from([("one".to_string(), vt::Value::Dictionary(one))]))
+                })])],
+        );
+        let registry = SchemaRegistry::builder().register(MINE).build()?;
+        let info = registry.schema_info(&tf::Token::new("WidgetAPI")).expect("WidgetAPI");
+        assert_eq!(
+            info.can_only_apply_to(Some(&tf::Token::new("one"))),
+            [tf::Token::new("Mesh")]
+        );
+        Ok(())
+    }
+
+    /// A declaration's plug info entries are the schema's plug info.
+    #[test]
+    fn plug_info_from_decl() -> Result<(), SchemaRegistryError> {
+        static MINE: &SchemaFamily<'_> = &SchemaFamily::new(
+            "mine",
+            &[SchemaDecl::new("Widget", SchemaKind::ConcreteTyped)
+                .bases(&["Typed"])
+                .plug_info(&[
+                    Field::new("isUsdShadeContainer", || vt::Value::Bool(true)),
+                    Field::string("note", "kept"),
+                ])],
+        );
+        let registry = SchemaRegistry::builder().register(MINE).build()?;
+        let info = registry
+            .schema_info(&tf::Token::new("Widget"))
+            .expect("Widget")
+            .plug_info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info.get("isUsdShadeContainer"), Some(&vt::Value::Bool(true)));
+        assert_eq!(info.get("note"), Some(&vt::Value::String("kept".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn is_a_walks_bases() {
+        let registry = SchemaRegistry::test_registry();
+        let distant = tf::Token::new("DistantLight");
+
+        // A type is itself, its direct base, and every base above that.
+        assert!(registry.is_a(&distant, &distant));
+        assert!(registry.is_a(&distant, &tf::Token::new("NonboundableLightBase")));
+        assert!(registry.is_a(&distant, &tf::Token::new("Typed")));
+
+        // Siblings and unrelated hierarchies do not match.
+        assert!(!registry.is_a(&distant, &tf::Token::new("DomeLight_1")));
+        assert!(!registry.is_a(&distant, &tf::Token::new("APISchemaBase")));
+        // An unregistered name is not a schema, so it derives from nothing and
+        // nothing derives from it — not even itself.
+        assert!(!registry.is_a(&tf::Token::new("Bogus"), &tf::Token::new("Typed")));
+        assert!(!registry.is_a(&tf::Token::new("Bogus"), &tf::Token::new("Bogus")));
+        assert!(!registry.is_a(&distant, &tf::Token::default()));
+    }
+
+    /// A base that is not registered ends only its own branch of the bases
+    /// `is_a` follows.
+    #[test]
+    fn is_a_missing_base() {
+        let decl = |name, bases| SchemaDecl::new(name, SchemaKind::ConcreteTyped).bases(bases);
+        let decls = [
+            decl("Base", &[]),
+            decl("Orphan", &["Missing"]),
+            decl("Mixed", &["Missing", "Base"]),
+        ];
+        let family = SchemaFamily::new("mine", &decls);
+        let registry = SchemaRegistry::builder().register(&family).build().unwrap();
+        let is_a = |schema: &str, base: &str| registry.is_a(&tf::Token::from(schema), &tf::Token::from(base));
+
+        assert!(is_a("Orphan", "Orphan") && !is_a("Orphan", "Missing"));
+        assert!(is_a("Mixed", "Base") && !is_a("Mixed", "Missing"));
+    }
+
+    /// A schema comes before its bases, and a direct base before another
+    /// base's ancestors.
+    #[test]
+    fn ancestors_order() {
+        let decl = |name, bases| SchemaDecl::new(name, SchemaKind::ConcreteTyped).bases(bases);
+        let decls = [
+            decl("Deep", &["Typed"]),
+            decl("Left", &["Deep"]),
+            decl("Right", &["Typed"]),
+            decl("Shared", &["Deep"]),
+            // A direct base comes before another base's ancestors.
+            decl("Both", &["Left", "Right"]),
+            // A base two schemas share comes after both of them.
+            decl("Diamond", &["Left", "Shared"]),
+            decl("Loop", &["Pool"]),
+            decl("Pool", &["Loop"]),
+        ];
+        let family = SchemaFamily::new("mine", &decls);
+        let registry = SchemaRegistry::builder().register(&family).build().unwrap();
+        let ancestors = |name: &str| {
+            let name = tf::Token::from(name);
+            let order: Vec<String> = registry.ancestors(&name).into_iter().map(|t| t.to_string()).collect();
+            order
+        };
+
+        assert_eq!(ancestors("Left"), ["Left", "Deep", "Typed", "SchemaBase"]);
+        assert_eq!(
+            ancestors("Both"),
+            ["Both", "Left", "Right", "Deep", "Typed", "SchemaBase"]
+        );
+        assert_eq!(
+            ancestors("Diamond"),
+            ["Diamond", "Left", "Shared", "Deep", "Typed", "SchemaBase"]
+        );
+        // A base cycle lists each schema once, and an unregistered name is
+        // no schema.
+        assert_eq!(ancestors("Loop"), ["Loop", "Pool"]);
+        assert_eq!(ancestors("Bogus"), [""; 0]);
+    }
+
+    #[test]
+    fn instance_restrictions() {
+        let registry = SchemaRegistry::test_registry();
+        let slot = registry.schema_info(&tf::Token::new("SlotAPI")).expect("SlotAPI");
+        let base = [tf::Token::new("NonboundableLightBase")];
+        assert_eq!(slot.can_only_apply_to(None), base);
+        assert_eq!(
+            slot.can_only_apply_to(Some(&tf::Token::new("right"))),
+            [tf::Token::new("DomeLight")],
+            "a non-empty instance list replaces the schema-wide one"
+        );
+        // An empty instance list is not stored, and an instance with no entry
+        // has none, so both keep the schema-wide restriction.
+        assert_eq!(slot.can_only_apply_to(Some(&tf::Token::new("left"))), base);
+        assert_eq!(slot.can_only_apply_to(Some(&tf::Token::new("other"))), base);
+    }
+
+    #[test]
+    fn allowed_instance_names() {
+        let registry = SchemaRegistry::test_registry();
+        let slot = tf::Token::new("SlotAPI");
+        let collection = tf::Token::new("CollectionAPI");
+
+        // A declared list restricts the schema to those names.
+        assert!(registry.is_allowed_instance_name(&slot, &tf::Token::new("left")));
+        assert!(!registry.is_allowed_instance_name(&slot, &tf::Token::new("middle")));
+        // No list means any name, and an empty name is never one.
+        assert!(registry.is_allowed_instance_name(&collection, &tf::Token::new("anything")));
+        assert!(!registry.is_allowed_instance_name(&collection, &tf::Token::default()));
+
+        // Only a registered multiple-apply schema has instances at all.
+        assert!(!registry.is_allowed_instance_name(&tf::Token::new("LightAPI"), &tf::Token::new("x")));
+        assert!(!registry.is_allowed_instance_name(&tf::Token::new("Bogus"), &tf::Token::new("x")));
+    }
+
+    #[test]
+    fn family_version_filters() {
+        let registry = SchemaRegistry::test_registry();
+        let dome = tf::Token::new("DomeLight");
+        let identifiers = |family, filter| {
+            registry
+                .schema_infos_in_family(family, filter)
+                .map(|info| info.identifier().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // A family answers newest version first, whatever order it registered
+        // in, so the first hit is the best match.
+        assert_eq!(identifiers(&dome, VersionFilter::All), ["DomeLight_1", "DomeLight"]);
+        assert_eq!(identifiers(&dome, VersionFilter::GreaterThan(0)), ["DomeLight_1"]);
+        assert_eq!(
+            identifiers(&dome, VersionFilter::GreaterThanOrEqual(1)),
+            ["DomeLight_1"]
+        );
+        assert_eq!(identifiers(&dome, VersionFilter::LessThan(1)), ["DomeLight"]);
+        assert_eq!(
+            identifiers(&dome, VersionFilter::LessThanOrEqual(1)),
+            ["DomeLight_1", "DomeLight"]
+        );
+        assert!(identifiers(&dome, VersionFilter::GreaterThan(1)).is_empty());
+
+        // An unregistered family has no schemas rather than being an error.
+        assert!(identifiers(&tf::Token::new("Bogus"), VersionFilter::All).is_empty());
+    }
+
+    #[test]
+    fn identifier_places_family() {
+        let placed = |name| SchemaRegistry::parse_allowed_identifier(&tf::Token::new(name));
+        let family = |name| placed(name).map(|(family, _)| family.to_string());
+
+        // An identifier carries its own family and version, registered or not.
+        assert_eq!(placed("DomeLight_1"), Some((tf::Token::new("DomeLight"), 1)));
+        assert_eq!(placed("DistantLight"), Some((tf::Token::new("DistantLight"), 0)));
+        assert_eq!(family("Bogus_2").as_deref(), Some("Bogus"));
+
+        // A spelling that could never name a registered schema is in no family:
+        // a non-canonical version suffix, or one on the family itself.
+        assert_eq!(placed("DomeLight_01"), None);
+        assert_eq!(placed("DomeLight_1_2"), None);
+        assert_eq!(placed("1Light"), None);
+
+        // A family never carries a version suffix, so it names no schema under
+        // one that does, even though `DomeLight_1` is registered.
+        let registry = SchemaRegistry::test_registry();
+        assert!(
+            registry
+                .schema_info_in_family(&tf::Token::new("DomeLight_1"), 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn instance_name_identifier() {
+        let registry = SchemaRegistry::test_registry();
+        let collection = tf::Token::new("CollectionAPI");
+
+        // The name becomes a namespace component of every instantiated
+        // property, so it has to be spellable as one.
+        for bad in ["", "my instance", "render:", ":render", "a::b", "1st", "in.dot"] {
+            let instance = tf::Token::from(bad);
+            assert!(
+                !registry.is_allowed_instance_name(&collection, &instance),
+                "accepted {bad:?}"
+            );
+        }
+
+        // A namespaced name is still fine when every component is one.
+        assert!(registry.is_allowed_instance_name(&collection, &tf::Token::new("a:b")));
+    }
+
+    #[test]
+    fn instance_name_property_collision() {
+        let registry = SchemaRegistry::test_registry();
+
+        // `CollectionAPI` declares `collection:__INSTANCE_NAME__:includeRoot`,
+        // so an instance named `includeRoot` would make the instantiated
+        // property ambiguous with the schema's own.
+        let collection = tf::Token::new("CollectionAPI");
+        assert!(!registry.is_allowed_instance_name(&collection, &tf::Token::new("includeRoot")));
+
+        // The comparison is against the property's base name, so a namespaced
+        // instance is judged by its last component.
+        assert!(!registry.is_allowed_instance_name(&collection, &tf::Token::new("a:includeRoot")));
+        assert!(registry.is_allowed_instance_name(&collection, &tf::Token::new("includeRoot:a")));
+    }
+
+    #[test]
+    fn name_template_bases() {
+        let cases = [
+            ("collection:__INSTANCE_NAME__:includeRoot", "includeRoot"),
+            ("collection:__INSTANCE_NAME__", ""),
+            ("inputs:intensity", "inputs:intensity"),
+        ];
+        for (name, base) in cases {
+            assert_eq!(SchemaRegistry::name_template_base(name), base, "basing {name}");
+        }
+    }
+
+    #[test]
+    fn versioned_identifier() {
+        let registry = SchemaRegistry::test_registry();
+
+        let dome = registry
+            .schema_info(&tf::Token::new("DomeLight_1"))
+            .expect("DomeLight_1");
+        assert_eq!(dome.family().as_str(), "DomeLight");
+        assert_eq!(dome.version(), 1);
+
+        // A bare identifier is version 0 of its own family, so both versions
+        // are addressable through the family index.
+        let family = tf::Token::new("DomeLight");
+        let versioned = registry.schema_info_in_family(&family, 1).expect("DomeLight version 1");
+        assert_eq!(versioned.identifier().as_str(), "DomeLight_1");
+        let bare = registry.schema_info_in_family(&family, 0).expect("DomeLight version 0");
+        assert_eq!(bare.identifier().as_str(), "DomeLight");
+        assert!(registry.schema_info_in_family(&family, 2).is_none());
+    }
+
+    #[test]
+    fn parse_identifier_cases() {
+        let cases = [
+            ("DomeLight", "DomeLight", 0),
+            ("DomeLight_1", "DomeLight", 1),
+            ("DomeLight_12", "DomeLight", 12),
+            // No digits after the delimiter, so there is no version suffix.
+            ("DomeLight_", "DomeLight_", 0),
+            // Not a suffix at all: the trailing digits have no delimiter.
+            ("Basis2Curves", "Basis2Curves", 0),
+            // The delimiter search stops at the last underscore.
+            ("Foo_1_2", "Foo_1", 2),
+            ("_1", "", 1),
+        ];
+        for (identifier, family, version) in cases {
+            let parsed = SchemaRegistry::parse_family_and_version(&tf::Token::new(identifier));
+            assert_eq!((parsed.0.as_str(), parsed.1), (family, version), "parsing {identifier}");
+        }
+    }
+
+    #[test]
+    fn allowed_identifiers() {
+        assert!(SchemaRegistry::is_allowed_identifier("DomeLight"));
+        assert!(SchemaRegistry::is_allowed_identifier("DomeLight_1"));
+        // A non-canonical version suffix does not round-trip.
+        assert!(!SchemaRegistry::is_allowed_identifier("DomeLight_01"));
+        assert!(
+            !SchemaRegistry::is_allowed_identifier("DomeLight_0"),
+            "version 0 is the bare family"
+        );
+        // The family may not itself carry a version suffix.
+        assert!(!SchemaRegistry::is_allowed_identifier("Foo_1_2"));
+        assert!(!SchemaRegistry::is_allowed_family("2Foo"));
+        assert!(SchemaRegistry::is_allowed_family("_Foo"));
+    }
+
+    #[test]
+    fn instance_name_math() {
+        let template = tf::Token::new("collection:__INSTANCE_NAME__:includeRoot");
+        assert!(SchemaRegistry::is_name_template(&template));
+        assert_eq!(
+            SchemaRegistry::make_name_instance(&template, "lightLink"),
+            tf::Token::new("collection:lightLink:includeRoot")
+        );
+
+        // Only the first placeholder component is substituted, so a nested
+        // template keeps the rest of its shape.
+        let nested = tf::Token::new("Other:__INSTANCE_NAME__:foo");
+        assert_eq!(
+            SchemaRegistry::make_name_instance(&nested, "bar"),
+            tf::Token::new("Other:bar:foo")
+        );
+
+        // A name without the placeholder is left alone, and the placeholder is
+        // matched as a whole component rather than as text.
+        let plain = tf::Token::new("inputs:intensity");
+        assert!(!SchemaRegistry::is_name_template(&plain));
+        assert_eq!(SchemaRegistry::make_name_instance(&plain, "x"), plain);
+        assert!(!SchemaRegistry::is_name_template("my__INSTANCE_NAME__thing"));
+
+        assert_eq!(
+            SchemaRegistry::make_name_template("CollectionAPI", ""),
+            tf::Token::new("CollectionAPI:__INSTANCE_NAME__")
+        );
+    }
+
+    #[test]
+    fn instance_name_split() {
+        let (identifier, instance) = SchemaRegistry::type_name_and_instance(&tf::Token::new("CollectionAPI:lightLink"));
+        assert_eq!(identifier, tf::Token::new("CollectionAPI"));
+        assert_eq!(instance, Some(tf::Token::new("lightLink")));
+
+        // An instance name may itself be namespaced; the identifier never is,
+        // so the split is at the first delimiter.
+        let (identifier, instance) = SchemaRegistry::type_name_and_instance(&tf::Token::new("CollectionAPI:a:b"));
+        assert_eq!(identifier, tf::Token::new("CollectionAPI"));
+        assert_eq!(instance, Some(tf::Token::new("a:b")));
+
+        let (identifier, instance) = SchemaRegistry::type_name_and_instance(&tf::Token::new("LightAPI"));
+        assert_eq!(identifier, tf::Token::new("LightAPI"));
+        assert_eq!(instance, None);
+
+        // A trailing delimiter carries no instance to name.
+        let (identifier, instance) = SchemaRegistry::type_name_and_instance(&tf::Token::new("CollectionAPI:"));
+        assert_eq!(identifier, tf::Token::new("CollectionAPI"));
+        assert_eq!(instance, None);
+    }
+
+    #[test]
+    fn composed_typeless_prim() {
+        let registry = SchemaRegistry::test_registry();
+        let definition =
+            registry.build_composed_prim_definition(&tf::Token::default(), &[tf::Token::new("CollectionAPI:render")]);
+
+        // A prim with no type still gets everything its applied schemas declare.
+        assert_eq!(
+            definition.attribute_fallback(&tf::Token::new("collection:render:expansionRule")),
+            Some(vt::Value::token("expandPrims"))
+        );
+        assert_eq!(
+            definition.applied_api_schemas(),
+            [tf::Token::new("CollectionAPI:render")]
+        );
+    }
+
+    #[test]
+    fn composed_typed_beats_authored() {
+        let registry = SchemaRegistry::test_registry();
+        let definition = registry.build_composed_prim_definition(
+            &tf::Token::new("DistantLight"),
+            &[tf::Token::new("CollectionAPI:render")],
+        );
+
+        // The type's own override still wins over everything authored.
+        assert_eq!(
+            definition.attribute_fallback(&tf::Token::new("inputs:intensity")),
+            Some(vt::Value::Float(50000.0))
+        );
+        assert_eq!(
+            definition.applied_api_schemas(),
+            [
+                tf::Token::new("LightAPI"),
+                tf::Token::new("CollectionAPI:lightLink"),
+                tf::Token::new("CollectionAPI:render"),
+            ]
+        );
+    }
+
+    #[test]
+    fn composed_skips_duplicates_and_unknowns() {
+        let registry = SchemaRegistry::test_registry();
+        let definition = registry.build_composed_prim_definition(
+            &tf::Token::new("DistantLight"),
+            &[
+                // Already built in through LightAPI.
+                tf::Token::new("CollectionAPI:lightLink"),
+                tf::Token::new("Unregistered"),
+                // A multiple-apply schema needs an instance name, and a
+                // single-apply one cannot take one.
+                tf::Token::new("CollectionAPI"),
+                tf::Token::new("LightAPI:instance"),
+            ],
+        );
+
+        assert_eq!(
+            definition.applied_api_schemas(),
+            [tf::Token::new("LightAPI"), tf::Token::new("CollectionAPI:lightLink")]
+        );
+    }
+
+    #[test]
+    fn composed_with_no_applied_shares_typed() {
+        let registry = SchemaRegistry::test_registry();
+        let type_name = tf::Token::new("DistantLight");
+
+        let composed = registry.build_composed_prim_definition(&type_name, &[]);
+        assert!(Arc::ptr_eq(
+            &composed,
+            registry.concrete_prim_definition(&type_name).expect("DistantLight")
+        ));
+
+        // An unknown type with nothing applied is the shared empty definition.
+        let unknown = registry.build_composed_prim_definition(&tf::Token::new("Bogus"), &[]);
+        assert!(Arc::ptr_eq(&unknown, registry.empty_prim_definition()));
+    }
+
+    #[test]
+    fn kind_round_trip() {
+        let kinds = [
+            SchemaKind::AbstractBase,
+            SchemaKind::AbstractTyped,
+            SchemaKind::ConcreteTyped,
+            SchemaKind::NonAppliedApi,
+            SchemaKind::SingleApplyApi,
+            SchemaKind::MultipleApplyApi,
+        ];
+        for kind in kinds {
+            assert_eq!(SchemaKind::from_token(kind.as_str()), Some(kind));
+        }
+        assert_eq!(SchemaKind::from_token("bogus"), None);
+    }
+
+    #[test]
+    fn family_kinds_any_order() -> Result<(), SchemaRegistryError> {
+        static SITE: &SchemaFamily<'_> =
+            &SchemaFamily::new("site", &[]).kinds(&[kind::Decl::new("chargroup").base("assembly")]);
+        static CHARACTERS: &SchemaFamily<'_> =
+            &SchemaFamily::new("characters", &[]).kinds(&[kind::Decl::new("hero").base("chargroup")]);
+
+        for families in [[SITE, CHARACTERS], [CHARACTERS, SITE]] {
+            let registry = families
+                .into_iter()
+                .fold(SchemaRegistry::builder(), SchemaRegistryBuilder::register)
+                .kind(kind::Decl::new("prop").base("component"))
+                .build()?;
+            let kinds = registry.kinds();
+            assert!(kinds.is_group("hero") && kinds.is_a("hero", "chargroup"));
+            assert!(kinds.is_component("prop"));
+            // A kinds-only family brings no schemas with it.
+            assert_eq!(registry.schema_infos().count(), 8);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn family_kinds_duplicate() {
+        static FIRST: &SchemaFamily<'_> = &SchemaFamily::new("first", &[]).kinds(&[kind::Decl::new("prop")]);
+        static SECOND: &SchemaFamily<'_> =
+            &SchemaFamily::new("second", &[]).kinds(&[kind::Decl::new("prop").base("component")]);
+
+        let error = SchemaRegistry::builder()
+            .register(FIRST)
+            .register(SECOND)
+            .build()
+            .expect_err("a kind declared by two families");
+        assert_eq!(
+            error.to_string(),
+            "kind `prop` is declared by `first` and again by `second`"
+        );
+    }
+
+    #[test]
+    fn family_kinds_unknown_base() {
+        let error = SchemaRegistry::builder()
+            .kind(kind::Decl::new("hero").base("chargroup"))
+            .build()
+            .expect_err("a base no family declares");
+        let SchemaRegistryError::Kind(error) = error else {
+            panic!("not a kind error: {error}");
+        };
+        assert!(matches!(*error, kind::RegistryError::UnknownBase { .. }));
+    }
+
+    #[test]
+    fn global_kinds_built_in() {
+        let kinds = SchemaRegistry::global().kinds();
+        assert_eq!(
+            kinds.kinds(),
+            ["assembly", "component", "group", "model", "subcomponent"]
+        );
+    }
+
+    #[test]
+    fn global_registers_usd_family() {
+        let registry = SchemaRegistry::global();
+        assert!(Arc::ptr_eq(registry, SchemaRegistry::global()));
+        assert_eq!(registry.schema_infos().count(), 8);
+        assert!(registry.is_a(&tf::Token::new("ColorSpaceAPI"), &tf::Token::new("APISchemaBase")));
+        // Every schema reaches `SchemaBase`, the root C++ puts above both
+        // `Typed` and `APISchemaBase`.
+        assert!(registry.is_a(&tf::Token::new("ColorSpaceAPI"), &tf::Token::new("SchemaBase")));
+
+        let collection = registry
+            .schema_info(&tf::Token::new("CollectionAPI"))
+            .expect("the core family declares CollectionAPI");
+        assert_eq!(collection.kind(), SchemaKind::MultipleApplyApi);
+        assert_eq!(
+            collection.property_namespace_prefix(),
+            Some(&tf::Token::new("collection"))
+        );
+
+        // A multiple-apply schema's properties stay templated in its own
+        // definition; a prim's definition instantiates them per instance.
+        let definition = registry
+            .api_prim_definition(&tf::Token::new("CollectionAPI"))
+            .expect("CollectionAPI has a definition");
+        assert!(definition.has_property(&tf::Token::new("collection:__INSTANCE_NAME__:expansionRule")));
+    }
+}

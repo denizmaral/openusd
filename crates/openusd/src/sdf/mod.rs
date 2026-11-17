@@ -1,0 +1,709 @@
+//! Scene description foundations.
+//!
+//! This module contains common data types used by parsers.
+//! Roughly this correspond to C++ SDF module <https://openusd.org/dev/api/sdf_page_front.html>
+
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::{fmt::Debug, mem};
+
+use bytemuck::{Pod, Zeroable};
+use strum::FromRepr;
+
+use crate::tf::Token;
+use crate::vt::{Dictionary, Value};
+
+mod anchor;
+mod asset_path;
+mod change;
+mod commit;
+mod copy;
+mod data;
+pub mod expr;
+mod file_format;
+mod handle;
+pub(crate) mod layer;
+pub(crate) mod layer_registry;
+pub(crate) mod layer_store;
+mod ordering;
+pub(crate) mod path;
+pub mod path_expr;
+mod path_table;
+pub mod schema;
+pub mod sink;
+mod spec;
+mod unit;
+mod value_type;
+
+pub(crate) use anchor::{HeldListing, Listing, ReadListing, absolute_path_at, absolute_path_with, held_packages};
+pub use asset_path::AssetPath;
+pub(crate) use asset_path::{
+    AssetExpressionFailure, AssetOutcome, anchor_asset_paths, evaluate_asset_paths, holds_asset_expression,
+    resolve_asset_paths,
+};
+pub use change::{ChangeEntry, ChangeFlags, ChangeList, FieldChange};
+pub(crate) use commit::{
+    CommitRecord, Committed, EditorId, Footprint, PendingCommit, Prepared, StopRunning, Subscriber, TxnContext,
+};
+pub use copy::{
+    CopyChildren, CopyChildrenArgs, CopyValue, CopyValueArgs, copy_spec, copy_spec_with, copy_spec_within,
+    should_copy_children, should_copy_value,
+};
+pub(crate) use copy::{author_spec, child_slot, is_children_field, is_ordered_children, join_child};
+pub(crate) use data::mask_of;
+pub use data::{AbstractData, CowData, Data, DataError, Patch};
+pub use expr::{Evaluation, EvaluationValue, Expr, ExprError, StringEvaluation, StringSegment};
+pub use file_format::{FileFormat, FileFormatCaps, FormatError, PackageFiles, WriteSeek, Written};
+pub use handle::{AttributeHandle, PrimHandle, PseudoRootHandle, RelationshipHandle};
+pub use layer::{
+    AuthoringError, CommittedLayerChange, EditError, ExportError, Layer, LayerEdit, LayerSink, LayerSinkId,
+    PendingLayerChange, default_prim_path,
+};
+pub(crate) use layer::{TargetLayer, dry_run_layers, edit_layers};
+pub use layer_registry::LayerRegistry;
+pub(crate) use layer_registry::{LoadedLayer, PreparedLayer, Presence};
+pub use layer_store::{AdoptError, LayerError, LayerGuard, LayerHandle};
+pub(crate) use layer_store::{
+    Held, HeldCell, HeldMut, LayerStore, PackageListings, StoreRead, Subscription, SweepHold,
+};
+pub use ordering::{apply_ordering, element_cmp, order_properties, reorder};
+pub use path::{
+    IntoPath, Path, PathComponent, PathComponents, PathElement, PathHasher, PathMap, PathParseError, PathSet, path,
+    try_into_path,
+};
+pub use path_expr::{EvalError, ExpressionReference, PathExpression, PathPattern, PredicateExpression};
+pub(crate) use path_table::Covering;
+pub use path_table::PathTable;
+pub use schema::{
+    ANY_TYPE, ChildrenKey, FieldKey, FieldType, folds_list_ops, is_vector_field, registered_field_type,
+    schema_field_type,
+};
+pub(crate) use spec::prim_chain;
+pub use spec::{
+    AttributeSpec, AttributeSpecMut, AttributeSpecRef, PrimSpec, PrimSpecMut, PrimSpecRef, PropertySpec,
+    PropertySpecMut, PropertySpecRef, PseudoRootSpec, PseudoRootSpecMut, PseudoRootSpecRef, RelationshipSpec,
+    RelationshipSpecMut, RelationshipSpecRef, Spec, SpecData, SpecError, SpecMut, SpecRef, SpecType,
+};
+pub use unit::{Unit, UnitCategory};
+pub use value_type::{Dimensions, Role, ValueTypeError, ValueTypeName};
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromRepr)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub enum Specifier {
+    Def,
+    Over,
+    Class,
+}
+
+/// An enum that defines permission levels.
+///
+/// Permissions control which layers may refer to or express
+/// opinions about a prim. Opinions expressed about a prim, or
+/// relationships to that prim, by layers that are not allowed
+/// permission to access the prim will be ignored.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromRepr)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub enum Permission {
+    Public,
+    Private,
+}
+
+/// An enum that identifies variability types for attributes.
+/// Variability indicates whether the attribute may vary over time and
+/// value coordinates, and if its value comes through authoring or
+/// or from its owner.
+#[repr(i32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromRepr)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub enum Variability {
+    #[default]
+    Varying,
+    Uniform,
+}
+
+/// A time-coded `double` (C++ `SdfTimeCode`) — the value held by a
+/// `timecode`-typed attribute (e.g. `UsdMediaSpatialAudio.startTime`). Unlike
+/// a plain `double`, a `TimeCode` value is retimed by layer offsets during
+/// composition.
+///
+/// This is the authored *value* type, distinct from a time-query *parameter*
+/// (C++ `UsdTimeCode`, passed to `Attribute::get_at`). Read it with
+/// `Attribute::get::<sdf::TimeCode>()` and author it with
+/// `set(sdf::TimeCode(..))`; it round-trips through [`Value::TimeCode`].
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, derive_more::From)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TimeCode(pub f64);
+
+impl TimeCode {
+    /// The wrapped time value.
+    #[inline]
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+/// Represents a time offset and scale between layers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct LayerOffset {
+    /// Time offset.
+    pub offset: f64,
+    /// Scale factor.
+    pub scale: f64,
+}
+
+impl Default for LayerOffset {
+    fn default() -> Self {
+        Self {
+            offset: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+impl LayerOffset {
+    /// Identity layer offset: offset 0, scale 1.
+    pub const IDENTITY: LayerOffset = LayerOffset {
+        offset: 0.0,
+        scale: 1.0,
+    };
+
+    #[inline]
+    pub fn new(offset: f64, scale: f64) -> Self {
+        Self { offset, scale }
+    }
+
+    /// A pure time scaling `(0.0, scale)` with no offset. Composed onto another
+    /// offset it scales without shifting — used to fold a `timeCodesPerSecond`
+    /// retiming ratio into an arc's offset (spec 12.3.2).
+    #[inline]
+    pub fn scale_only(scale: f64) -> Self {
+        Self { offset: 0.0, scale }
+    }
+
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.offset.is_finite() && self.scale.is_finite()
+    }
+
+    /// Returns `true` if this is the identity offset `(0.0, 1.0)`.
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        self.offset == 0.0 && self.scale == 1.0
+    }
+
+    /// Whether this offset and `other` are equal as C++ `SdfLayerOffset`'s
+    /// `operator==` compares them: two valid offsets within 1e-6 of each
+    /// other in both parts, or two invalid ones that are exactly equal.
+    pub fn is_close(&self, other: &LayerOffset) -> bool {
+        const EPSILON: f64 = 1e-6;
+        match (self.is_valid(), other.is_valid()) {
+            (true, true) => (self.offset - other.offset).abs() < EPSILON && (self.scale - other.scale).abs() < EPSILON,
+            (false, false) => self.to_bits() == other.to_bits(),
+            _ => false,
+        }
+    }
+
+    /// The `(offset, scale)` pair as exact bit patterns, for hashing it into a
+    /// key or comparing two copies of it. An authored NaN offset or scale is
+    /// unequal to itself under float equality, yet two offsets that reproduce it
+    /// bit for bit are the same offset.
+    #[inline]
+    pub fn to_bits(&self) -> (u64, u64) {
+        (self.offset.to_bits(), self.scale.to_bits())
+    }
+
+    /// Applies this offset to a time value as `offset + scale * time` — the
+    /// retiming a layer offset performs on the time coordinate of samples and
+    /// clip schedules.
+    #[inline]
+    pub fn apply(&self, time: f64) -> f64 {
+        self.offset + self.scale * time
+    }
+
+    /// Applies this offset to every time coordinate a value holds, mapping it
+    /// out of the frame of the layer that authored it (spec 12.3.2.1, C++
+    /// `Usd_ApplyLayerOffsetToValue`).
+    ///
+    /// A `timecode` is a time coordinate, not a plain number, so an offset
+    /// retimes the value itself just as [`apply`](Self::apply) retimes the times
+    /// a sample map is keyed by: an attribute authoring `timecode t = 5` in a
+    /// layer sublayered with `(offset = 10; scale = 2)` resolves to `20` on the
+    /// stage. The timecodes a value holds at the reach of
+    /// [`try_transform`](Value::try_transform) are retimed, and a sample map's
+    /// times with them.
+    ///
+    /// `None` where nothing is retimed: a value that holds no time, and any
+    /// value at all under the identity offset. A sample map holds times
+    /// whatever its samples hold, so any other offset retimes one.
+    pub fn apply_to_value(&self, value: &Value) -> Option<Value> {
+        if self.is_identity() {
+            return None;
+        }
+        value.try_transform(&mut |value| match value {
+            Value::TimeCode(time) => Some(Value::TimeCode(TimeCode(self.apply(time.value())))),
+            Value::TimeCodeVec(times) => Some(Value::TimeCodeVec(
+                times.iter().map(|time| TimeCode(self.apply(time.value()))).collect(),
+            )),
+            Value::TimeSamples(samples) => {
+                // TODO(perf): the clone copies each sample that is then
+                // replaced; the retimed map could be built sample by sample.
+                let mut samples = samples.clone();
+                self.apply_to_samples(&mut samples);
+                Some(Value::TimeSamples(samples))
+            }
+            _ => None,
+        })
+    }
+
+    /// Applies this offset to a sample map in place: every key is a time in the
+    /// authoring layer's frame, and every sample may itself be time-valued.
+    ///
+    /// A [`TimeSampleMap`] is keyed in ascending time, which a negative scale
+    /// reverses; the keys are restored to ascending order so a bracketing search
+    /// over the result stays valid. Composition never authors one — a
+    /// non-positive scale [sanitizes](Self::sanitized) to the identity — but the
+    /// arithmetic here is defined for any offset.
+    pub fn apply_to_samples(&self, samples: &mut TimeSampleMap) {
+        self.retime_samples(samples, |sample| self.apply_to_value(sample));
+    }
+
+    /// Moves a sample map's times through this offset in place and replaces
+    /// each sample `f` rewrites (C++ `_TransformSampleMap`), keeping the map
+    /// in ascending time as [`apply_to_samples`](Self::apply_to_samples) does.
+    pub(crate) fn retime_samples(&self, samples: &mut TimeSampleMap, mut f: impl FnMut(&Value) -> Option<Value>) {
+        for (time, sample) in samples.iter_mut() {
+            *time = self.apply(*time);
+            if let Some(rewritten) = f(sample) {
+                *sample = rewritten;
+            }
+        }
+        if self.scale < 0.0 {
+            samples.reverse();
+        }
+    }
+
+    /// Interpolates a sample map at stage `time`, returning the result in stage
+    /// time.
+    ///
+    /// `samples` stays in its authoring layer's frame: `time` maps backwards
+    /// through this offset to select and blend the samples, and the interpolated
+    /// value maps forward again through [`apply_to_value`](Self::apply_to_value).
+    /// The lerp fraction is invariant under an affine offset, so the result is
+    /// the one stage-frame samples would give, and a per-time query allocates
+    /// only the value it returns.
+    ///
+    /// `interp` supplies the interpolation policy, which lives above this tier.
+    pub fn sample_in_stage_time(
+        &self,
+        samples: &TimeSampleMap,
+        time: f64,
+        interp: impl Fn(&TimeSampleMap, f64) -> Option<Value>,
+    ) -> Option<Value> {
+        let value = interp(samples, self.inverse().apply(time))?;
+        Some(self.apply_to_value(&value).unwrap_or(value))
+    }
+
+    /// Returns the inverse offset, undoing [`apply`](Self::apply): if `self`
+    /// maps a source time `t` to `offset + scale * t`, the inverse maps that
+    /// result back to `t`. The identity inverts to itself; a `scale == 0`
+    /// offset has no inverse and yields the identity.
+    #[inline]
+    pub fn inverse(&self) -> LayerOffset {
+        if self.scale == 0.0 {
+            return LayerOffset::IDENTITY;
+        }
+        LayerOffset {
+            offset: -self.offset / self.scale,
+            scale: 1.0 / self.scale,
+        }
+    }
+
+    /// Returns `true` if this offset is well-formed for composition:
+    /// finite `offset` and a strictly positive, finite `scale`.
+    ///
+    /// Per spec 10.3.1.1 / 10.3.2.1.2, a non-positive scale is a composition
+    /// error.
+    #[inline]
+    pub fn is_valid_composition(&self) -> bool {
+        self.offset.is_finite() && self.scale.is_finite() && self.scale > 0.0
+    }
+
+    /// Returns this offset if valid for composition, or the identity otherwise.
+    ///
+    /// Matches OpenUSD behaviour of silently dropping back to identity when a
+    /// non-positive or non-finite scale is authored.
+    #[inline]
+    pub fn sanitized(self) -> Self {
+        if self.is_valid_composition() {
+            self
+        } else {
+            Self::IDENTITY
+        }
+    }
+
+    /// Concatenates `self` (outer / closer to root) with `inner` (deeper).
+    ///
+    /// Given two offsets where a time value `t` in the inner frame maps to
+    /// the outer frame as `t * inner.scale + inner.offset`, and outer's own
+    /// transform is `t * outer.scale + outer.offset`, the composed transform
+    /// from the deepest frame to the outermost is:
+    ///
+    /// ```text
+    /// offset = outer.offset + outer.scale * inner.offset
+    /// scale  = outer.scale * inner.scale
+    /// ```
+    #[inline]
+    pub fn concatenate(&self, inner: &LayerOffset) -> LayerOffset {
+        LayerOffset {
+            offset: self.offset + self.scale * inner.offset,
+            scale: self.scale * inner.scale,
+        }
+    }
+}
+
+/// Represents a payload and all its meta data.
+///
+/// A payload represents a prim reference to an external layer. A payload
+/// is similar to a prim reference (see `SdfReference`) with the major
+/// difference that payloads are explicitly loaded by the user.
+///
+/// Unloaded payloads represent a boundary that lazy composition and
+/// system behaviors will not traverse across, providing a user-visible
+/// way to manage the working set of the scene.
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Payload {
+    /// The asset path to the external layer.
+    #[cfg_attr(feature = "serde", serde(rename = "asset", skip_serializing_if = "String::is_empty"))]
+    pub asset_path: String,
+    /// The root prim path to the referenced prim in the external layer.
+    #[cfg_attr(feature = "serde", serde(rename = "path", skip_serializing_if = "Path::is_empty"))]
+    pub prim_path: Path,
+    /// The layer offset to transform time.
+    #[cfg_attr(feature = "serde", serde(rename = "layerOffset"))]
+    pub layer_offset: LayerOffset,
+}
+
+/// Equal payloads name the same asset and prim, which is what is hashed:
+/// the layer offset holds floats.
+impl Hash for Payload {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.asset_path.hash(state);
+        self.prim_path.hash(state);
+    }
+}
+
+/// Represents a reference and all its meta data.
+///
+/// A reference is expressed on a prim in a given layer and it identifies a
+/// prim in a layer stack. All opinions in the namespace hierarchy
+/// under the referenced prim will be composed with the opinions in the
+/// namespace hierarchy under the referencing prim.
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Reference {
+    /// The asset path to the external layer.
+    #[cfg_attr(feature = "serde", serde(rename = "asset", skip_serializing_if = "String::is_empty"))]
+    pub asset_path: String,
+    /// The path to the referenced prim in the external layer.
+    #[cfg_attr(feature = "serde", serde(rename = "path", skip_serializing_if = "Path::is_empty"))]
+    pub prim_path: Path,
+    /// The layer offset to transform time.
+    #[cfg_attr(feature = "serde", serde(rename = "layerOffset"))]
+    pub layer_offset: LayerOffset,
+    /// The custom data associated with the reference.
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "customData", skip_serializing_if = "is_empty_dictionary")
+    )]
+    pub custom_data: Dictionary,
+}
+
+/// Whether `dict` holds nothing, for serde to skip an empty one.
+#[cfg(feature = "serde")]
+fn is_empty_dictionary(dict: &Dictionary) -> bool {
+    dict.is_empty()
+}
+
+/// Equal references name the same asset and prim, which is what is hashed:
+/// the layer offset holds floats, and the custom data any value.
+impl Hash for Reference {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.asset_path.hash(state);
+        self.prim_path.hash(state);
+    }
+}
+
+pub(crate) mod list_edit;
+mod list_op;
+
+pub use list_edit::PathListEdit;
+pub use list_op::{ListOp, ListOpType};
+
+pub type IntListOp = ListOp<i32>;
+pub type UintListOp = ListOp<u32>;
+
+pub type Int64ListOp = ListOp<i64>;
+pub type Uint64ListOp = ListOp<u64>;
+
+pub type StringListOp = ListOp<String>;
+pub type TokenListOp = ListOp<Token>;
+pub type PathListOp = ListOp<Path>;
+pub type ReferenceListOp = ListOp<Reference>;
+pub type PayloadListOp = ListOp<Payload>;
+
+/// A time-sample map: `(time, value)` pairs sorted ascending by
+/// [`compare_sample_times`] with one entry per time, the order C++
+/// `SdfTimeSampleMap` (a `std::map`) keeps. The readers establish it through
+/// [`normalize_time_samples`] as they decode a layer and
+/// [`AttributeSpecMut::set_time_sample`] keeps it, so value resolution and
+/// interpolation can binary-search a map. A raw field write (`Spec::set`, a
+/// replayed diff) must supply an ordered map.
+// TODO: a `TimeSampleMap` newtype whose constructors order it would make the
+// invariant unbreakable; today any `Vec<(f64, Value)>` is accepted.
+pub type TimeSampleMap = Vec<(f64, Value)>;
+
+/// The order a [`TimeSampleMap`] keeps its times in: [`f64::total_cmp`],
+/// except that the two zeros are one time, as they are one key of C++'s
+/// `std::map<double, VtValue>`.
+#[inline]
+pub fn compare_sample_times(a: f64, b: f64) -> Ordering {
+    let zero_folded = |t: f64| if t == 0.0 { 0.0 } else { t };
+    zero_folded(a).total_cmp(&zero_folded(b))
+}
+
+/// Sorts `times` into the order [`compare_sample_times`] gives and keeps one
+/// entry per time. Of times that order calls equal, the first in `times`
+/// survives: of `[0.0, -0.0]`, `0.0`.
+pub fn normalize_sample_times(times: &mut Vec<f64>) {
+    times.sort_by(|a, b| compare_sample_times(*a, *b));
+    times.dedup_by(|a, b| compare_sample_times(*a, *b).is_eq());
+}
+
+/// Orders `samples` as a [`TimeSampleMap`] requires. A repeated time keeps
+/// the spelling it was first given and the sample it was last given, as
+/// assigning into C++'s `std::map` does, so the two zeros collapse the way
+/// [`AttributeSpecMut::set_time_sample`] collapses them. C++ builds such a
+/// map for a crate file too, so it orders one as well, but it emplaces and
+/// so keeps a repeated time's first sample; applying one rule to both
+/// formats is a deliberate divergence there. A map already in order, as
+/// every file a conforming writer produced holds, is returned untouched.
+pub fn normalize_time_samples(mut samples: Vec<(f64, Value)>) -> TimeSampleMap {
+    if samples.is_sorted_by(|a, b| compare_sample_times(a.0, b.0).is_lt()) {
+        return samples;
+    }
+    // The sort is stable, so each repeated time's run stays in authoring
+    // order and the dedup carries the last sample back onto the first entry.
+    samples.sort_by(|a, b| compare_sample_times(a.0, b.0));
+    samples.dedup_by(|later, kept| {
+        if compare_sample_times(kept.0, later.0).is_ne() {
+            return false;
+        }
+        mem::swap(&mut kept.1, &mut later.1);
+        true
+    });
+    samples
+}
+
+/// A single namespace relocation `(source, target)`: the prim at `source` is
+/// moved to `target` in composed namespace. An empty `target` is a deletion
+/// that makes `source` a prohibited (invalid) child name. Mirrors C++
+/// `SdfRelocate`, a `std::pair<SdfPath, SdfPath>`.
+pub type Relocate = (Path, Path);
+
+/// The ordered list of [`Relocate`]s authored in a layer's `relocates`
+/// metadata. Mirrors C++ `SdfRelocates`, a `std::vector<SdfRelocate>`.
+pub type RelocateList = Vec<Relocate>;
+
+/// A boxed layer data source, used throughout the layer stack.
+pub type LayerData = Box<dyn AbstractData>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn normalize_sample_times_order() {
+        let mut times = vec![10.0, 0.0, f64::NAN, -0.0, 10.0, f64::NAN];
+        normalize_sample_times(&mut times);
+        assert_eq!(times.len(), 3);
+        // Compared by bits: `-0.0 == 0.0` would accept either zero.
+        assert_eq!(times[0].to_bits(), 0.0_f64.to_bits(), "the first zero survives");
+        assert_eq!(times[1], 10.0);
+        assert!(times[2].is_nan(), "NaNs of the same bits are one time");
+    }
+
+    #[test]
+    fn normalize_time_samples_order() {
+        let samples = normalize_time_samples(vec![
+            (10.0, Value::Int(1)),
+            (-0.0, Value::Int(2)),
+            (0.0, Value::Int(3)),
+            (10.0, Value::Int(4)),
+            (f64::NAN, Value::Int(5)),
+        ]);
+        let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+        // Compared by bits: `-0.0 == 0.0` would accept an unfolded zero.
+        assert_eq!(
+            times[0].to_bits(),
+            (-0.0_f64).to_bits(),
+            "the time keeps its first spelling"
+        );
+        assert_eq!(times[1], 10.0);
+        assert!(times[2].is_nan(), "a positive NaN orders past every number");
+        let values: Vec<&Value> = samples.iter().map(|(_, v)| v).collect();
+        assert_eq!(
+            values,
+            [&Value::Int(3), &Value::Int(4), &Value::Int(5)],
+            "the last sample of a repeated time wins, the two zeros being one time"
+        );
+        assert_eq!(
+            normalize_time_samples(vec![(f64::NAN, Value::Int(1)), (-f64::NAN, Value::Int(2))]).len(),
+            2,
+            "the order separates the NaNs by sign, so they are two times"
+        );
+        assert_eq!(
+            normalize_time_samples(vec![(0.0, Value::Int(1)), (1.0, Value::Int(2))]),
+            vec![(0.0, Value::Int(1)), (1.0, Value::Int(2))]
+        );
+    }
+
+    #[test]
+    fn layer_offset_identity_is_identity() {
+        assert!(LayerOffset::IDENTITY.is_identity());
+        assert!(LayerOffset::default().is_identity());
+        assert!(!LayerOffset::new(0.0, 2.0).is_identity());
+        assert!(!LayerOffset::new(1.0, 1.0).is_identity());
+    }
+
+    #[test]
+    fn layer_offset_valid_composition_rejects_non_positive_scale() {
+        assert!(LayerOffset::new(10.0, 1.0).is_valid_composition());
+        assert!(!LayerOffset::new(10.0, 0.0).is_valid_composition());
+        assert!(!LayerOffset::new(10.0, -1.0).is_valid_composition());
+        assert!(!LayerOffset::new(f64::INFINITY, 1.0).is_valid_composition());
+        assert!(!LayerOffset::new(0.0, f64::NAN).is_valid_composition());
+    }
+
+    #[test]
+    fn samples_offset_scale() {
+        let mut samples: TimeSampleMap = vec![(1.0, Value::Double(0.0)), (5.0, Value::Double(1.0))];
+        LayerOffset::new(10.0, 2.0).apply_to_samples(&mut samples);
+        let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![12.0, 20.0]);
+    }
+
+    #[test]
+    fn samples_negative_scale() {
+        // Reversing the time axis must leave the keys ascending, which is what
+        // a bracketing search over the result relies on.
+        let mut samples: TimeSampleMap = vec![(1.0, Value::Double(0.0)), (5.0, Value::Double(1.0))];
+        LayerOffset::new(0.0, -1.0).apply_to_samples(&mut samples);
+        let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+        assert_eq!(times, vec![-5.0, -1.0]);
+        assert_eq!(samples[0].1, Value::Double(1.0));
+    }
+
+    #[test]
+    fn value_identity_passthrough() {
+        let value = Value::TimeSamples(vec![(1.0, Value::Double(0.0))]);
+        assert_eq!(LayerOffset::IDENTITY.apply_to_value(&value), None);
+    }
+
+    #[test]
+    fn value_time_codes() {
+        let offset = LayerOffset::new(10.0, 2.0);
+
+        let scalar = Value::TimeCode(TimeCode(5.0));
+        assert_eq!(offset.apply_to_value(&scalar), Some(Value::TimeCode(TimeCode(20.0))));
+
+        let array = Value::TimeCodeVec(vec![TimeCode(5.0), TimeCode(10.0)]);
+        assert_eq!(
+            offset.apply_to_value(&array),
+            Some(Value::TimeCodeVec(vec![TimeCode(20.0), TimeCode(30.0)]))
+        );
+
+        // A plain number is not a time coordinate, whatever it holds.
+        assert_eq!(offset.apply_to_value(&Value::Double(5.0)), None);
+    }
+
+    #[test]
+    fn value_nested() {
+        let offset = LayerOffset::new(10.0, 2.0);
+
+        // A dictionary carries timecodes at any depth.
+        let inner = HashMap::from([("deep".to_string(), Value::TimeCode(TimeCode(5.0)))]);
+        let dict = Value::Dictionary(Dictionary::from([
+            ("nested".to_string(), Value::Dictionary(inner.into())),
+            ("kept".to_string(), Value::Double(5.0)),
+        ]));
+        let dict = offset.apply_to_value(&dict).expect("a timecode is retimed");
+        let entries = dict.try_as_dictionary_ref().expect("dictionary");
+        assert_eq!(entries.get("kept"), Some(&Value::Double(5.0)));
+        let nested = entries.get("nested").expect("nested").try_as_dictionary_ref().unwrap();
+        assert_eq!(nested.get("deep"), Some(&Value::TimeCode(TimeCode(20.0))));
+
+        // A sample map's keys and its time-valued samples both move.
+        let samples = Value::TimeSamples(vec![(1.0, Value::TimeCode(TimeCode(5.0)))]);
+        assert_eq!(
+            offset.apply_to_value(&samples),
+            Some(Value::TimeSamples(vec![(12.0, Value::TimeCode(TimeCode(20.0)))]))
+        );
+    }
+
+    #[test]
+    fn layer_offset_sanitized_drops_invalid_to_identity() {
+        assert_eq!(LayerOffset::new(10.0, 2.0).sanitized(), LayerOffset::new(10.0, 2.0));
+        assert_eq!(LayerOffset::new(5.0, -1.0).sanitized(), LayerOffset::IDENTITY);
+        assert_eq!(LayerOffset::new(5.0, 0.0).sanitized(), LayerOffset::IDENTITY);
+    }
+
+    #[test]
+    fn layer_offset_concatenate_matches_spec_formula() {
+        let outer = LayerOffset::new(10.0, 2.0);
+        let inner = LayerOffset::new(20.0, 1.0);
+        // Matches BasicTimeOffset_root pcp.txt: (10,2) concat (20,1) = (50, 2).
+        assert_eq!(outer.concatenate(&inner), LayerOffset::new(50.0, 2.0));
+    }
+
+    #[test]
+    fn layer_offset_concatenate_is_associative() {
+        let a = LayerOffset::new(10.0, 2.0);
+        let b = LayerOffset::new(20.0, 0.5);
+        let c = LayerOffset::new(5.0, 3.0);
+        let ab_c = a.concatenate(&b).concatenate(&c);
+        let a_bc = a.concatenate(&b.concatenate(&c));
+        assert!((ab_c.offset - a_bc.offset).abs() < 1e-12);
+        assert!((ab_c.scale - a_bc.scale).abs() < 1e-12);
+    }
+
+    #[test]
+    fn layer_offset_identity_is_neutral() {
+        let a = LayerOffset::new(10.0, 2.0);
+        assert_eq!(a.concatenate(&LayerOffset::IDENTITY), a);
+        assert_eq!(LayerOffset::IDENTITY.concatenate(&a), a);
+    }
+
+    #[test]
+    fn layer_offset_inverse_undoes_apply() {
+        // A dyadic scale round-trips exactly.
+        let a = LayerOffset::new(10.0, 2.0);
+        assert_eq!(a.inverse(), LayerOffset::new(-5.0, 0.5));
+        assert_eq!(a.inverse().apply(a.apply(7.0)), 7.0);
+        // A non-dyadic scale (e.g. a 1/3 retiming ratio) round-trips only to
+        // within float rounding, not exactly.
+        let b = LayerOffset::new(1.0, 3.0);
+        assert!((b.inverse().apply(b.apply(7.0)) - 7.0).abs() < 1e-9);
+        // The identity inverts to itself; a zero scale has no inverse.
+        assert_eq!(LayerOffset::IDENTITY.inverse(), LayerOffset::IDENTITY);
+        assert_eq!(LayerOffset::new(3.0, 0.0).inverse(), LayerOffset::IDENTITY);
+    }
+}

@@ -1,0 +1,873 @@
+//! The Rust a lowered schema library is written as.
+//!
+//! Everything here reads [`RustLibrary`](super::lower::RustLibrary) and writes
+//! Rust. What it decides is what that Rust looks like: which construct carries
+//! an accessor, how a call chain is laid out, where a doc comment goes. Those
+//! are real decisions, and a wrong one compiles and behaves wrongly — writing
+//! syntax is not the same as writing correct code.
+//!
+//! What it does not do is resolve a name or read a schema. Every identifier,
+//! path and membership was settled by [`lower`](super::lower) and arrives
+//! already decided, so nothing here can disagree with the rest of the pipeline
+//! about what a schema declares or what anything is called. That is the
+//! boundary worth relying on; the code it writes is held to its own tests.
+//! [`family`](super::family) writes the schema data on the same terms.
+//!
+//! The output is built as tokens rather than as text. `quote!` writes it in the
+//! shape it will take, `syn` parses it back so anything malformed fails here
+//! rather than in a consumer's build, and `prettyplease` lays it out without an
+//! external formatter. What that buys over writing strings is that an
+//! identifier, a path and a string literal are different things, so none can be
+//! mistaken for another.
+//!
+//! Documentation a schema wrote arrives as text and is written one `#[doc]`
+//! attribute per line: `prettyplease` writes a value verbatim after the `///`,
+//! hence the space each line opens with, and lays a value that holds newlines
+//! out as a `/** … */` block instead. What this crate says about the code it
+//! writes is a doc comment in the `quote!` itself.
+
+use std::iter;
+
+use openusd::usd;
+use proc_macro2::TokenStream;
+use quote::quote;
+
+use super::{ident, items};
+
+use super::lower::{
+    AccessorTrait, Constant, Instancing, MetadataAccessor, MetadataTrait, PropertyKind, Reflected, RustAccessor,
+    RustClass, RustEnum, RustLibrary, TypedRead, kind_constant, schema_root,
+};
+use crate::doc;
+
+/// The whole generated file: the tokens its schemas name things by, what
+/// registers them, and a trait and a view per schema.
+pub fn library(library: &RustLibrary, declarations: &TokenStream) -> TokenStream {
+    let name = library.library.as_str();
+    let tokens = tokens_module(&library.tokens);
+    let classes = library.classes.iter().map(|class| {
+        let accessors = accessor_trait(class);
+        let view = view(class);
+        quote! {
+            #accessors
+            #view
+        }
+    });
+
+    let enums = library.enums.iter().map(token_enum);
+    let metadata = library.metadata.iter().map(metadata_trait);
+
+    let library_name = ident(items::LIBRARY_NAME);
+
+    quote! {
+        #tokens
+
+        #(#enums)*
+
+        /// The library's name, which is the family its declarations register
+        /// under.
+        pub const #library_name: &str = #name;
+
+        #declarations
+        #(#classes)*
+        #(#metadata)*
+    }
+}
+
+/// The module holding a library's token constants.
+pub(super) fn tokens_module(constants: &[Constant]) -> TokenStream {
+    let constants = constants.iter().map(|constant| {
+        let Constant {
+            name,
+            value,
+            documentation,
+        } = constant;
+        let documentation = super::doc_lines(documentation);
+        quote! {
+            #(#[doc = #documentation])*
+            pub const #name: &str = #value;
+        }
+    });
+    let tokens = ident(items::TOKENS);
+    quote! {
+        /// The strings this library names things by.
+        ///
+        /// A token's value is what a stage actually reads; the constant is a
+        /// name for it, so an application can say what it means instead of
+        /// retyping a string.
+        pub mod #tokens {
+            #(#constants)*
+        }
+    }
+}
+
+/// One metadata trait and its implementation.
+///
+/// A field's reader and writer are the handle's own generic metadata calls,
+/// named for the field and typed as it is declared, so a caller neither
+/// spells the key nor restates the type. A stage reads its layers' metadata,
+/// with the field's registered default behind them, and authors it on the
+/// edit target's layer.
+fn metadata_trait(generated: &MetadataTrait) -> TokenStream {
+    let MetadataTrait {
+        name,
+        documentation,
+        handle,
+        stage,
+        fields,
+    } = generated;
+    let documentation = super::doc_lines(documentation);
+
+    let (declarations, bodies): (Vec<TokenStream>, Vec<TokenStream>) = fields
+        .iter()
+        .map(|field| {
+            let MetadataAccessor {
+                getter,
+                setter,
+                token,
+                rust_type,
+                documentation,
+            } = field;
+            let documentation = super::doc_lines(documentation);
+            let read = quote! { fn #getter(&self) -> ::openusd::Result<::std::option::Option<#rust_type>> };
+            // A stage is not consumed by an edit, where a prim or property
+            // handle is handed back to chain the next one.
+            let (write, sized, write_doc, writes) = if *stage {
+                (
+                    quote! {
+                        fn #setter(&self, value: #rust_type) -> ::std::result::Result<(), ::openusd::usd::StageAuthoringError>
+                    },
+                    quote! {},
+                    "Authors the field on the edit target, which must be the
+stage's root or session layer.",
+                    quote! { self.set_stage_metadata(#token, value) },
+                )
+            } else {
+                (
+                    quote! {
+                        fn #setter(self, value: #rust_type) -> ::std::result::Result<Self, ::openusd::usd::StageAuthoringError>
+                    },
+                    quote! { where Self: ::std::marker::Sized },
+                    "Authors the field on the edit target, and returns the
+handle.",
+                    quote! { self.set_metadata(#token, value) },
+                )
+            };
+            let write_doc = super::doc_lines(write_doc);
+            let declaration = quote! {
+                #(#[doc = #documentation])*
+                #read;
+
+                #(#[doc = #write_doc])*
+                #write
+                #sized;
+            };
+            let reads = if *stage {
+                quote! {
+                    self.stage_metadata(#token)?
+                        .map(<#rust_type as ::std::convert::TryFrom<::openusd::vt::Value>>::try_from)
+                        .transpose()
+                        .map_err(::std::convert::Into::into)
+                }
+            } else {
+                quote! { self.metadata::<#rust_type>(#token) }
+            };
+            let body = quote! {
+                #read {
+                    #reads
+                }
+
+                #write {
+                    #writes
+                }
+            };
+            (declaration, body)
+        })
+        .unzip();
+
+    quote! {
+        #(#[doc = #documentation])*
+        pub trait #name {
+            #(#declarations)*
+        }
+
+        impl #name for #handle {
+            #(#bodies)*
+        }
+    }
+}
+
+/// One token enum: its values, the tokens they are written as, and the call
+/// that makes it a value.
+///
+/// The token constants are what the variants are defined in terms of, so the
+/// enum and the strings it stands for cannot drift apart. Reading and authoring
+/// it as a value is `openusd`'s own macro, which every token enum invokes.
+fn token_enum(generated: &RustEnum) -> TokenStream {
+    let RustEnum {
+        name,
+        documentation,
+        variants,
+        default,
+        ..
+    } = generated;
+    let documentation = super::doc_lines(documentation);
+
+    let declared = variants.iter().map(|variant| {
+        let name = &variant.name;
+        let documentation = format!(" `{:?}`.", variant.value);
+        let default = (default.as_ref() == Some(name)).then(|| quote! { #[default] });
+        quote! {
+            #[doc = #documentation]
+            #default
+            #name
+        }
+    });
+    let written = variants.iter().map(|variant| {
+        let (name, constant) = (&variant.name, &variant.constant);
+        quote! { Self::#name => #constant }
+    });
+    let read = variants.iter().map(|variant| {
+        let (name, constant) = (&variant.name, &variant.constant);
+        quote! { #constant => ::std::option::Option::Some(Self::#name) }
+    });
+
+    // `Default` only where the configuration asked for the source property's
+    // fallback, since a token set carries no default of its own.
+    let derive_default = default.as_ref().map(|_| quote! { , ::std::default::Default });
+
+    quote! {
+        #(#[doc = #documentation])*
+        #[derive(
+            ::std::clone::Clone, ::std::marker::Copy, ::std::fmt::Debug,
+            ::std::cmp::PartialEq, ::std::cmp::Eq, ::std::hash::Hash #derive_default
+        )]
+        pub enum #name {
+            #(#declared),*
+        }
+
+        impl #name {
+            /// The token this value is written as.
+            pub const fn as_token(self) -> &'static str {
+                match self {
+                    #(#written),*
+                }
+            }
+
+            /// The value `token` names, or `None` where it names none.
+            pub fn from_token(token: impl ::std::convert::AsRef<str>) -> ::std::option::Option<Self> {
+                match token.as_ref() {
+                    #(#read,)*
+                    _ => ::std::option::Option::None,
+                }
+            }
+        }
+
+        ::openusd::vt::impl_token_value!(#name);
+    }
+}
+
+/// A schema's documentation as the doc comment above its trait and its view,
+/// followed by whatever `note` the two say for themselves.
+fn documented(class: &RustClass, note: &str) -> TokenStream {
+    let own = class.documentation.as_deref().unwrap_or_default();
+    // A blank line parts the two, where both have something to say.
+    let separator = (!own.is_empty() && !note.is_empty()).then_some("");
+    let lines = own
+        .lines()
+        .chain(separator)
+        .chain(note.lines())
+        .map(|line| format!(" {line}"));
+    quote! { #(#[doc = #lines])* }
+}
+
+/// What a view says about where its accessors are, since reaching one means
+/// having the trait that declares it in scope.
+///
+/// The schema's own documentation is upstream's and describes the schema, which
+/// the trait and the view share; this is what parts them, and is why a reader
+/// landing on either knows which to import.
+fn accessor_note(class: &RustClass) -> String {
+    // An applied API schema writes its accessors on the view, there being no
+    // trait to derive from, so a caller needs nothing else in scope.
+    let Some(own) = &class.accessor_trait else {
+        return String::new();
+    };
+
+    let own = doc::link(&own.name.to_string(), None);
+    let inherited: Vec<String> = class.inherited.iter().map(linked).collect();
+    let text = match (class.accessors.is_empty(), inherited.is_empty()) {
+        // A schema that declares no property and derives from none of its own
+        // has nothing to reach, so it says nothing about reaching it.
+        (true, true) => return String::new(),
+        (true, false) => format!(
+            "Its accessors are those of the classes behind it, on {}, which a caller has to have in \
+             scope to reach one.",
+            listed(&inherited)
+        ),
+        (false, true) => format!("Its accessors live on {own}, which a caller has to have in scope to reach one."),
+        (false, false) => format!(
+            "A property is reached through the trait that declares it, which a caller has to have in \
+             scope. This schema's own are on {own}; the rest come from the classes behind it, on {}.",
+            listed(&inherited)
+        ),
+    };
+    format!("# Accessors\n\n{}", doc::wrap(&text))
+}
+
+/// What the trait says for itself, which is what it is for: the accessors a
+/// view carries, held apart so that a schema deriving from this one carries
+/// them too.
+fn trait_note(class: &RustClass) -> String {
+    // A trait with no accessor of its own carries nothing to say this about; it
+    // is there for a view to derive the ones behind it through.
+    if class.accessors.is_empty() {
+        return String::new();
+    }
+
+    let name = doc::link(&class.name.to_string(), None);
+    doc::wrap(&format!(
+        "The accessors {name} carries. They live on a trait so that a schema deriving from this one \
+         carries them too."
+    ))
+}
+
+/// A trait as a link, whatever module it came from: the name a reader sees,
+/// and the path that reaches it.
+fn linked(path: &syn::Path) -> String {
+    let name = match path.segments.last() {
+        Some(segment) => segment.ident.to_string(),
+        None => return String::new(),
+    };
+    // A trait of this library is named where the view is, so its own name
+    // reaches it; one from another module needs the path spelled out.
+    if path.segments.len() == 1 && path.leading_colon.is_none() {
+        return doc::link(&name, None);
+    }
+    doc::link(&name, Some(&super::path_text(path)))
+}
+
+/// Names in a sentence, the last joined with `and`.
+fn listed(names: &[String]) -> String {
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// The trait a class's own accessors live on.
+///
+/// Its supertrait is the parent's, so a view reaching for an inherited property
+/// finds it without this class restating it, and a class with no accessors of
+/// its own still earns a trait: what it offers is everything behind it.
+fn accessor_trait(class: &RustClass) -> TokenStream {
+    let Some(AccessorTrait { name, parent }) = &class.accessor_trait else {
+        return TokenStream::new();
+    };
+    let documentation = documented(class, &trait_note(class));
+    let allow = allow_non_camel_case(class);
+    let methods = class.accessors.iter().map(|accessor| method(accessor, false));
+    let reflected = class
+        .reflected
+        .iter()
+        .map(|reflected| reflected_method(reflected, false));
+
+    quote! {
+        #documentation
+        #allow
+        pub trait #name: #parent {
+            #(#reflected)*
+            #(#methods)*
+        }
+    }
+}
+
+/// The method that views the prim through a schema the class reflects, for
+/// what that schema offers beyond the properties this one carries. It goes
+/// wherever the class's accessors go.
+fn reflected_method(reflected: &Reflected, inherent: bool) -> TokenStream {
+    let Reflected { accessor, view } = reflected;
+    let documentation = doc::wrap(&format!(
+        "Views the prim through {}, whose properties this schema carries.",
+        linked(view)
+    ));
+    let documentation = super::doc_lines(&documentation);
+    let (visibility, prim) = reach(inherent);
+
+    quote! {
+        #(#[doc = #documentation])*
+        #visibility fn #accessor(&self) -> #view {
+            #view::from_prim_unchecked(::openusd::usd::Prim::clone(#prim))
+        }
+    }
+}
+
+/// How a method written as a trait default or as an inherent method is
+/// declared, and how it reaches the prim.
+///
+/// A trait default reaches the prim through `SchemaBase`, which its own
+/// supertrait bound brings along. An inherent method cannot: the generated file
+/// carries no `use`, so a trait the consumer's module has not imported is not
+/// in scope there, however the type implements it. Those reach the prim through
+/// the view's own `Deref` instead.
+fn reach(inherent: bool) -> (TokenStream, TokenStream) {
+    match inherent {
+        true => (quote! { pub }, quote! { self }),
+        false => (TokenStream::new(), quote! { self.prim() }),
+    }
+}
+
+/// What lets a versioned schema keep the name its identifier gives it.
+///
+/// `Cylinder_1` is what the registry knows the schema as and what a schema
+/// author reads, so the view is called that too rather than being respelled
+/// into a camel-case name that matches nothing.
+fn allow_non_camel_case(class: &RustClass) -> TokenStream {
+    match class.name.to_string().contains('_') {
+        true => quote! {
+            #[allow(
+                non_camel_case_types,
+                reason = "the schema's identifier carries its version, and the view is named after it"
+            )]
+        },
+        false => TokenStream::new(),
+    }
+}
+
+/// The struct a prim is viewed through: what it holds, what reaches the prim
+/// inside it, and every trait it implements.
+fn view(class: &RustClass) -> TokenStream {
+    let name = &class.name;
+    let documentation = documented(class, &accessor_note(class));
+    let allow = allow_non_camel_case(class);
+    let kind = kind_constant(class.kind);
+    let constructors = constructors(class);
+
+    // A multiple-apply view carries the instance name it was applied under
+    // beside the prim; every other kind is the prim alone.
+    let (declaration, prim) = match class.kind.is_multiple_apply() {
+        true => (
+            quote! {
+                pub struct #name {
+                    prim: ::openusd::usd::Prim,
+                    name: ::openusd::tf::Token,
+                }
+            },
+            quote! { &self.prim },
+        ),
+        false => (quote! { pub struct #name(::openusd::usd::Prim); }, quote! { &self.0 }),
+    };
+
+    // An applied API schema is never derived from, so its accessors are written
+    // on the view rather than on a trait nothing would implement, and the
+    // methods viewing the prim through what it reflects go with them. A class
+    // with a trait puts them all there instead, so this is empty for it.
+    let inherent = class
+        .accessor_trait
+        .is_none()
+        .then(|| {
+            class
+                .reflected
+                .iter()
+                .map(|reflected| reflected_method(reflected, true))
+                .chain(class.accessors.iter().map(|accessor| method(accessor, true)))
+        })
+        .into_iter()
+        .flatten();
+    let own = class.accessor_trait.iter().map(|own| {
+        let own = &own.name;
+        quote! { impl #own for #name {} }
+    });
+    let root = schema_root(class.kind);
+    let answers_to = iter::once(&root)
+        .chain(&class.inherited)
+        .map(|path| quote! { impl #path for #name {} });
+
+    quote! {
+        #documentation
+        #allow
+        #[derive(::std::clone::Clone, ::std::fmt::Debug)]
+        #declaration
+
+        impl #name {
+            #constructors
+            #(#inherent)*
+        }
+
+        impl ::openusd::usd::SchemaBase for #name {
+            const KIND: ::openusd::usd::SchemaKind = #kind;
+
+            fn prim(&self) -> &::openusd::usd::Prim {
+                #prim
+            }
+        }
+
+        impl ::std::ops::Deref for #name {
+            type Target = ::openusd::usd::Prim;
+
+            fn deref(&self) -> &Self::Target {
+                #prim
+            }
+        }
+
+        #(#own)*
+        #(#answers_to)*
+    }
+}
+
+/// What views a prim as the schema, and what authors it.
+///
+/// Every kind is constructed from a prim the same way, by
+/// `from_prim_unchecked`, which is what lets a schema that reflects another
+/// reach its view without knowing what kind it is. Where a prim can be asked
+/// whether it is one, a checked constructor sits beside it.
+///
+/// A prim type is defined at a path and recognised by what a prim is; a base of
+/// prim types is recognised the same way, but defines none, being no type a
+/// prim carries. An applied API schema is applied to a prim already there and
+/// recognised by what it carries, under an instance name where the schema takes
+/// one. Anything else is a view over whatever prim a caller hands it.
+fn constructors(class: &RustClass) -> TokenStream {
+    let constant = &class.constant;
+
+    match class.kind {
+        // Both are recognised by what a prim is, which is one question however
+        // far up the chain it is asked: a prim of a type under `Gprim` is a
+        // `Gprim`, as one of type `Sphere` is a `Sphere`. Only authoring parts
+        // them, a base of prim types naming nothing a prim can be defined as.
+        usd::SchemaKind::ConcreteTyped | usd::SchemaKind::AbstractTyped => {
+            let define = class.kind.is_concrete().then(|| {
+                quote! {
+                    /// Defines a prim of this schema at `path` and views it.
+                    pub fn define(
+                        stage: &::openusd::usd::Stage,
+                        path: impl ::openusd::sdf::IntoPath,
+                    ) -> ::openusd::Result<Self> {
+                        ::std::result::Result::Ok(Self(stage.define_typed_prim(path, #constant)?))
+                    }
+                }
+            });
+            quote! {
+                /// Views `prim` as this schema without asking whether it is one.
+                ///
+                /// Unchecked of the schema, not of memory: nothing here is
+                /// `unsafe`, and a prim of another type simply answers nothing
+                /// for the properties this schema declares.
+                /// [`from_prim`](Self::from_prim) is the constructor that asks.
+                pub fn from_prim_unchecked(prim: ::openusd::usd::Prim) -> Self {
+                    Self(prim)
+                }
+
+                #define
+
+                /// Views `prim` as this schema, or `None` where it is not one.
+                ///
+                /// The stage's registry is what answers, so a prim from a stage
+                /// opened without this library's family registered is never one.
+                pub fn from_prim(
+                    prim: ::openusd::usd::Prim,
+                ) -> ::openusd::Result<::std::option::Option<Self>> {
+                    ::std::result::Result::Ok(prim.is_a(#constant)?.then_some(Self(prim)))
+                }
+
+                /// Views the prim at `path` as this schema, or `None` where it
+                /// is not one — [`from_prim`](Self::from_prim) over the prim
+                /// `path` names.
+                pub fn get(
+                    stage: &::openusd::usd::Stage,
+                    path: impl ::openusd::sdf::IntoPath,
+                ) -> ::openusd::Result<::std::option::Option<Self>> {
+                    Self::from_prim(stage.prim(path)?)
+                }
+            }
+        }
+        usd::SchemaKind::SingleApplyApi => quote! {
+            /// Views `prim` as this schema whether or not it carries it.
+            ///
+            /// Unchecked of the schema, not of memory: nothing here is
+            /// `unsafe`, and a prim that does not carry this schema simply
+            /// answers nothing for the properties it declares.
+            /// [`from_prim`](Self::from_prim) is the constructor that asks.
+            pub fn from_prim_unchecked(prim: ::openusd::usd::Prim) -> Self {
+                Self(prim)
+            }
+
+            /// Applies the schema to `prim` and views it.
+            pub fn apply(prim: &::openusd::usd::Prim) -> ::openusd::Result<Self> {
+                ::std::result::Result::Ok(Self(prim.clone().apply_api(#constant)?))
+            }
+
+            /// Whether the schema may be applied to `prim`.
+            pub fn can_apply(
+                prim: &::openusd::usd::Prim,
+            ) -> ::std::result::Result<(), ::openusd::usd::ApplyApiError> {
+                prim.can_apply_api(#constant)
+            }
+
+            /// Views `prim` as this schema, or `None` where it does not carry
+            /// it.
+            pub fn from_prim(
+                prim: ::openusd::usd::Prim,
+            ) -> ::openusd::Result<::std::option::Option<Self>> {
+                ::std::result::Result::Ok(prim.has_api_schema(#constant)?.then_some(Self(prim)))
+            }
+
+            /// Views the prim at `path` as this schema, or `None` where it does
+            /// not carry it — [`from_prim`](Self::from_prim) over the prim
+            /// `path` names.
+            pub fn get(
+                stage: &::openusd::usd::Stage,
+                path: impl ::openusd::sdf::IntoPath,
+            ) -> ::openusd::Result<::std::option::Option<Self>> {
+                Self::from_prim(stage.prim(path)?)
+            }
+        },
+        usd::SchemaKind::MultipleApplyApi => {
+            let decoding = class.instancing.as_ref().map(decoding);
+            quote! {
+            /// Views `prim` as this schema applied under `name`, whether or not
+            /// it is.
+            ///
+            /// Unchecked of the schema, not of memory: nothing here is
+            /// `unsafe`, and a prim that does not carry this schema under this
+            /// name simply answers nothing for the properties it declares.
+            /// [`from_prim`](Self::from_prim) is the constructor that
+            /// asks.
+            pub fn from_prim_unchecked(
+                prim: ::openusd::usd::Prim,
+                name: impl ::std::convert::Into<::openusd::tf::Token>,
+            ) -> Self {
+                Self { prim, name: name.into() }
+            }
+
+            /// The instance name this view reads its properties under.
+            pub fn name(&self) -> &::openusd::tf::Token {
+                &self.name
+            }
+
+            /// Applies the schema to `prim` under `name` and views it.
+            pub fn apply(
+                prim: &::openusd::usd::Prim,
+                name: impl ::std::convert::Into<::openusd::tf::Token>,
+            ) -> ::openusd::Result<Self> {
+                let name = name.into();
+                let applied =
+                    ::openusd::usd::SchemaRegistry::make_applied_name(#constant, name.as_str());
+                ::std::result::Result::Ok(Self::from_prim_unchecked(prim.clone().apply_api(applied)?, name))
+            }
+
+            /// Views `prim` as this schema applied under `name`, or `None`
+            /// where it does not carry it.
+            pub fn from_prim(
+                prim: &::openusd::usd::Prim,
+                name: impl ::std::convert::Into<::openusd::tf::Token>,
+            ) -> ::openusd::Result<::std::option::Option<Self>> {
+                let name = name.into();
+                let applied =
+                    ::openusd::usd::SchemaRegistry::make_applied_name(#constant, name.as_str());
+                let carried = prim.has_api_schema(applied)?;
+                ::std::result::Result::Ok(carried.then(|| Self::from_prim_unchecked(prim.clone(), name)))
+            }
+
+            /// Whether the schema may be applied to `prim` under `name`.
+            pub fn can_apply(
+                prim: &::openusd::usd::Prim,
+                name: &str,
+            ) -> ::std::result::Result<(), ::openusd::usd::ApplyApiError> {
+                prim.can_apply_api(
+                    ::openusd::usd::SchemaRegistry::make_applied_name(#constant, name),
+                )
+            }
+
+            /// Every instance of this schema applied to `prim`.
+            pub fn all(prim: &::openusd::usd::Prim) -> ::openusd::Result<::std::vec::Vec<Self>> {
+                prim.api_schema_instance_names(#constant).map(|names| {
+                    names
+                        .into_iter()
+                        .map(|name| Self::from_prim_unchecked(prim.clone(), name))
+                        .collect()
+                })
+            }
+
+            #decoding
+            }
+        }
+        // An abstract base is no root here — a root is never lowered — so it
+        // is viewed as any schema that is applied to nothing is.
+        usd::SchemaKind::AbstractBase | usd::SchemaKind::NonAppliedApi => quote! {
+            /// Views `prim` as this schema, which any prim can be viewed as.
+            ///
+            /// Unchecked of the schema, not of memory: nothing here is
+            /// `unsafe`. This schema is applied to no prim and names no prim
+            /// type, so there is nothing to ask about one — which is why it has
+            /// no constructor that asks.
+            pub fn from_prim_unchecked(prim: ::openusd::usd::Prim) -> Self {
+                Self(prim)
+            }
+        },
+    }
+}
+
+/// The name tests of a multiple-apply view: whether a property name is its
+/// own, and reading an instance back out of one of its property paths, which
+/// only a multiple-apply schema's properties carry (C++
+/// `CanContainPropertyName`, `IsSchemaPropertyBaseName` and `Is<Name>Path`).
+///
+/// A property of an instance is `<prefix>:<instance name>:<base name>`, so
+/// what remains between the prefix and a name the schema declares is the
+/// instance. The identity property is the case with nothing after the
+/// instance at all.
+fn decoding(instancing: &Instancing) -> TokenStream {
+    let Instancing { prefix, base_names } = instancing;
+    quote! {
+        /// Whether this schema owns the property named `name`: its namespace
+        /// prefix, or a name under it. A C++ `CanContainPropertyName`, where
+        /// a schema declares one, accepts any name starting with the prefix,
+        /// a longer identifier included.
+        pub fn owns_property(name: &str) -> bool {
+            name.strip_prefix(#prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        }
+
+        /// Whether `base_name` is one of the property names this schema
+        /// declares, which an instance name may therefore not end with.
+        pub fn is_property_base_name(base_name: &str) -> bool {
+            ::std::matches!(base_name, #(#base_names)|*)
+        }
+
+        /// The prim and instance name a property path of this schema names,
+        /// or `None` where `path` names no instance of it.
+        ///
+        /// The identity property is what this recognises: a path reaching a
+        /// property the schema declares belongs to an instance, but does not
+        /// name one.
+        pub fn instance_at_path(
+            path: &::openusd::sdf::Path,
+        ) -> ::std::option::Option<(::openusd::sdf::Path, ::openusd::tf::Token)> {
+            let (prim, property) = path.split_property()?;
+            if !property.split(':').all(::openusd::sdf::Path::is_valid_identifier) {
+                return ::std::option::Option::None;
+            }
+            let instance = property.strip_prefix(#prefix)?.strip_prefix(':')?;
+            let base_name = instance.rsplit(':').next()?;
+            match Self::is_property_base_name(base_name) {
+                true => ::std::option::Option::None,
+                false => ::std::option::Option::Some((prim, ::openusd::tf::Token::from(instance))),
+            }
+        }
+    }
+}
+
+/// One property's accessor pair, written where its class puts them:
+/// `inherent` on the view itself, otherwise as defaults of its trait.
+fn method(accessor: &RustAccessor, inherent: bool) -> TokenStream {
+    let RustAccessor {
+        getter,
+        creator,
+        builder,
+        token,
+        instanced,
+        documentation,
+        ..
+    } = accessor;
+
+    // A multiple-apply schema's property is named by a template, and the view
+    // fills it in with the instance name it carries.
+    let token = match instanced {
+        true => quote! {
+            ::openusd::usd::SchemaRegistry::make_name_instance(#token, self.name.as_str())
+        },
+        false => token.clone(),
+    };
+
+    let (visibility, prim) = reach(inherent);
+
+    // The creator authors what the schema declared, not what a bare property
+    // would default to: a stage reading either back has no schema to ask. The
+    // builder carries the whole declaration, so it reaches the stage as one
+    // edit.
+    //
+    // Authoring a property leaves it `custom`, as C++ `CreateAttribute` does,
+    // so a schema's own property is the one that has to say it is not.
+    // Only what the schema declares differently from a bare property is said,
+    // so a creator reads as the declaration itself.
+    let custom = (!accessor.custom).then(|| quote! { .custom(false) });
+    let uniform = accessor
+        .uniform
+        .then(|| quote! { .variability(::openusd::sdf::Variability::Uniform) });
+    let (kind, reader, builder_kind, declared) = match &accessor.kind {
+        PropertyKind::Relationship => (
+            quote! { ::openusd::usd::Relationship },
+            quote! { relationship },
+            quote! { ::openusd::usd::RelationshipBuilder<'static> },
+            quote! { #prim.relationship_builder(#token) #custom },
+        ),
+        PropertyKind::Attribute { type_constant, .. } => (
+            quote! { ::openusd::usd::Attribute },
+            quote! { attribute },
+            quote! { ::openusd::usd::AttributeBuilder<'static> },
+            quote! { #prim.attribute_builder(#token, #type_constant) #custom #uniform },
+        ),
+    };
+
+    let documentation = super::doc_lines(documentation);
+    let read = if accessor.custom_get {
+        TokenStream::new()
+    } else {
+        quote! {
+            #(#[doc = #documentation])*
+            #visibility fn #getter(&self) -> #kind {
+                #prim.#reader(#token)
+            }
+        }
+    };
+
+    // The typed reads decode the value as the type the property is declared
+    // with, so a caller does not restate it; the attribute stays one call away
+    // for a read of any other type.
+    let typed = accessor.typed.as_ref().map(|TypedRead { value, value_at, ty }| {
+        let at = value_at.as_ref().map(|value_at| {
+            quote! {
+                /// The property's value at `time`, where `None` is the
+                /// default time, as the type it is declared with: what a
+                /// layer authors there, else the fallback the schema
+                /// declares.
+                #visibility fn #value_at(
+                    &self,
+                    time: impl ::std::convert::Into<::std::option::Option<::openusd::usd::TimeCode>>,
+                ) -> ::openusd::Result<::std::option::Option<#ty>> {
+                    self.#getter().get_at::<#ty>(time)
+                }
+            }
+        });
+        quote! {
+            /// The property's value at the default time, as the type it is
+            /// declared with: what a layer authors, else the fallback the
+            /// schema declares.
+            #visibility fn #value(&self) -> ::openusd::Result<::std::option::Option<#ty>> {
+                self.#getter().get::<#ty>()
+            }
+
+            #at
+        }
+    });
+
+    quote! {
+        #read
+
+        #typed
+
+        /// The property's declaration, unauthored. Give it a value and
+        /// `build` it to author both as one edit; `build` it alone for the
+        /// declaration by itself.
+        #visibility fn #builder(&self) -> #builder_kind {
+            #declared
+        }
+
+        /// Authors the property as the schema declares it, and returns it.
+        #visibility fn #creator(&self) -> ::openusd::Result<#kind> {
+            ::std::result::Result::Ok(self.#builder().build()?)
+        }
+    }
+}

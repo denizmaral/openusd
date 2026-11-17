@@ -1,0 +1,70 @@
+[package]
+name = "openusd"
+description = "Rust native USD library"
+keywords = ["usd", "usda", "usdc", "usdz", "pxr"]
+readme = "README.md"
+exclude = ["/fixtures"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+categories.workspace = true
+
+[features]
+# A file asset can be served from a read-only memory mapping of it, which
+# `ar::DefaultResolver::map_files` opts into; the feature compiles the
+# capability and nothing maps without the opt-in.
+mmap = ["dep:memmap2"]
+serde = ["dep:serde", "half/serde"]
+
+# Feature-gated surface only renders if docs.rs turns the features on.
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+bitflags.workspace = true
+bytemuck.workspace = true
+derive_more.workspace = true
+half.workspace = true
+logos = "0.16.0"
+lz4_flex = "0.14.0"
+memmap2 = { version = "0.9", optional = true }
+num-traits.workspace = true
+regex-lite = "0.1.9"
+rustc-hash = "2.1"
+serde = { workspace = true, optional = true }
+strum.workspace = true
+thiserror.workspace = true
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+zmij = "1.0.23"
+
+# The access control a replaced file keeps on Windows, which only the Win32
+# security API reaches.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+
+[dev-dependencies]
+diff_json.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "text_format"
+required-features = ["serde"]
+
+[[test]]
+name = "text_writer_roundtrip"
+required-features = ["serde"]
+
+[[test]]
+name = "binary_writer_roundtrip"
+required-features = ["serde"]
+
+[[test]]
+name = "cross_format_roundtrip"
+required-features = ["serde"]

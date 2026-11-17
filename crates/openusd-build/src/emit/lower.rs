@@ -1,0 +1,1527 @@
+//! Lowering a schema library to the Rust it becomes.
+//!
+//! [`model`](crate::model) says what a schema *is*, in terms no language owns.
+//! This says what it is in Rust: what each type and trait is called, which
+//! traits a view implements, which accessors it offers and which it inherits,
+//! and what constant holds each token. Rendering then writes what this decided
+//! and decides nothing itself.
+//!
+//! Keeping the two apart is what lets a name be settled once. A name minted
+//! where it is used is a name minted twice, and the collisions this checks —
+//! two tokens reaching one constant, two methods reaching one name, two schemas
+//! reaching one type — can only be checked where the names are made.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::iter;
+
+use openusd::{sdf, tf, usd, usda, vt};
+use proc_macro2::{Ident, Span, TokenStream};
+use quote::quote;
+
+use crate::model::{API_SCHEMA_BASE, Base, Class, Library, Property, Reflection, Shape, TYPED, is_root};
+use crate::validate::Violation;
+use crate::{Externs, TokenEnum, doc, error::Error, error::TokenEnumError, names, types};
+
+/// A whole library, ready to render.
+pub struct RustLibrary {
+    /// The `libraryName` the schema declared.
+    pub library: String,
+    /// The token constants, in the order they are declared.
+    pub tokens: Vec<Constant>,
+    /// The enums over token properties the configuration asked for, in the
+    /// order it declared them.
+    pub enums: Vec<RustEnum>,
+    /// The schemas, in the order the root layer declares them.
+    pub classes: Vec<RustClass>,
+    /// One trait per kind of handle the library's metadata fields apply to.
+    pub metadata: Vec<MetadataTrait>,
+}
+
+/// The metadata fields a library registers for one kind of handle, read and
+/// written through a trait that handle implements.
+pub struct MetadataTrait {
+    /// What the trait is called.
+    pub name: Ident,
+    /// What it is for.
+    pub documentation: String,
+    /// The handle it is implemented for.
+    pub handle: syn::Path,
+    /// Whether it reads a stage's metadata, which the stage resolves from its
+    /// layers with the field's registered default behind them.
+    pub stage: bool,
+    /// Its fields, in the order the library declares them.
+    pub fields: Vec<MetadataAccessor>,
+}
+
+/// One metadata field's reader and writer.
+pub struct MetadataAccessor {
+    /// The method reading it.
+    pub getter: Ident,
+    /// The method authoring it.
+    pub setter: Ident,
+    /// The constant naming the field.
+    pub token: TokenStream,
+    /// The type its value reads back as.
+    pub rust_type: syn::Type,
+    /// The documentation above the reader.
+    pub documentation: String,
+}
+
+/// One enum over a token property's `allowedTokens`.
+pub struct RustEnum {
+    /// The type's name, as the configuration spelled it.
+    pub name: Ident,
+    /// What it is, and where its values came from.
+    pub documentation: String,
+    /// Its values, in the order the source property lists them.
+    pub variants: Vec<RustVariant>,
+    /// The variant `Default` returns, where one was asked for.
+    pub default: Option<Ident>,
+    /// The class and property it was built from, which read back as it.
+    pub source: (String, String),
+}
+
+/// One value a token enum admits.
+pub struct RustVariant {
+    /// The variant's name.
+    pub name: Ident,
+    /// The `tokens::` constant holding the value, or the value itself where the
+    /// library minted no constant for it.
+    pub constant: TokenStream,
+    /// The token it stands for, for its documentation.
+    pub value: String,
+}
+
+/// One token constant.
+pub struct Constant {
+    /// The constant's name.
+    pub name: Ident,
+    /// The string it holds.
+    pub value: String,
+    /// What it is for.
+    pub documentation: String,
+}
+
+/// One schema as Rust: what it is, and every name and path that follows.
+pub struct RustClass {
+    /// The view type's name.
+    pub name: Ident,
+    /// What the schema is. The shape of its view, the root that view answers
+    /// to and the constant it reports itself as all follow from this.
+    pub kind: usd::SchemaKind,
+    /// The trait this class's own accessors live on, and so where every one of
+    /// them is written: as that trait's defaults, or on the view itself when
+    /// this is `None`. An applied API schema is never inherited from, so its
+    /// accessors are inherent and it has no trait.
+    pub accessor_trait: Option<AccessorTrait>,
+    /// The traits carrying the accessors it inherits, which are those of the
+    /// classes it is built on, nearest first.
+    pub inherited: Vec<syn::Path>,
+    /// The `tokens::` constant naming the schema.
+    pub constant: TokenStream,
+    /// The schema's documentation, converted, where it wrote any.
+    pub documentation: Option<String>,
+    /// The accessors it emits, in property order. Where they go is one
+    /// decision for the class, which [`accessor_trait`](Self::accessor_trait)
+    /// carries: they are that trait's defaults, or inherent when it has none.
+    pub accessors: Vec<RustAccessor>,
+    /// The API schemas whose properties it offers as its own, each as the
+    /// method that views a prim through it.
+    pub reflected: Vec<Reflected>,
+    /// How its instances name their properties, for a multiple-apply schema:
+    /// what a property path of one looks like, and so how one is read back
+    /// out of a path.
+    pub instancing: Option<Instancing>,
+}
+
+/// What a multiple-apply schema's instances call their properties.
+pub struct Instancing {
+    /// The namespace every instance's properties live under, which is the
+    /// first component of each of their paths.
+    pub prefix: String,
+    /// The base names the schema declares, each being what follows the
+    /// instance name in one of its property paths. The identity property
+    /// contributes the empty name, having nothing after it.
+    pub base_names: Vec<String>,
+}
+
+/// The trait a class's own accessors live on.
+///
+/// The two travel together because neither means anything without the other: a
+/// class with no trait of its own has nothing to derive one from either.
+pub struct AccessorTrait {
+    /// What the trait is called.
+    pub name: Ident,
+    /// The trait it derives from, which is the nearest ancestor's, or a schema
+    /// root where no ancestor carries accessors.
+    pub parent: syn::Path,
+}
+
+/// An API schema a class reflects: its properties read as the class's own, and
+/// the view itself is one method away.
+pub struct Reflected {
+    /// What the method that views the prim through the schema is called.
+    pub accessor: Ident,
+    /// The view it returns: a name of this module, or the path to one another
+    /// library's module declares.
+    pub view: syn::Path,
+}
+
+/// One property's accessor pair.
+pub struct RustAccessor {
+    /// The method that reaches the property.
+    pub getter: Ident,
+    /// The method that authors it.
+    pub creator: Ident,
+    /// The method handing back its declaration unauthored, for a caller
+    /// writing a value in the same edit.
+    pub builder: Ident,
+    /// The methods reading its value as the type it is declared with, where
+    /// they are emitted: for an attribute of a type that holds a value, whose
+    /// reader the library does not write by hand.
+    pub typed: Option<TypedRead>,
+    /// Whether the library writes the reader by hand, so only the creator is
+    /// emitted and the reader's name is left reserved.
+    pub custom_get: bool,
+    /// What names the property: the constant the library minted for it, or the
+    /// name itself where it minted none.
+    pub token: TokenStream,
+    /// Whether that name is a template, which the view fills in with the
+    /// instance name it was applied under. Only a multiple-apply schema's
+    /// properties are, every instance of one naming its own property.
+    pub instanced: bool,
+    /// Whether the property holds a value, and what type it is declared with.
+    pub kind: PropertyKind,
+    /// Whether the creator authors `custom`.
+    pub custom: bool,
+    /// Whether the creator authors `uniform`.
+    pub uniform: bool,
+    /// The documentation above the reader.
+    pub documentation: String,
+}
+
+/// An attribute's value, read as the type it is declared with.
+pub struct TypedRead {
+    /// The method reading it at the default time.
+    pub value: Ident,
+    /// The method reading it at a given time, for an attribute that is not
+    /// uniform and so may hold samples.
+    pub value_at: Option<Ident>,
+    /// The type it reads back as.
+    pub ty: syn::Type,
+}
+
+/// What a property is, which decides what its accessors return and how its
+/// creator declares it.
+pub enum PropertyKind {
+    /// An attribute, declared with the value type it holds.
+    Attribute {
+        /// The `sdf::ValueTypeName` constant its creator declares it with.
+        type_constant: syn::Path,
+    },
+    /// A relationship, which holds targets rather than a value and so is
+    /// declared with no type at all.
+    Relationship,
+}
+
+/// Every name a library's classes generate, settled once.
+///
+/// Which accessors a class emits, what they are called, where a caller reaches
+/// them and what upstream calls them are one set of facts. Everything that
+/// needs them reads them here: the view and trait that are emitted, the check
+/// that no two names collide, and the documentation that links them. Working
+/// them out twice is how documentation comes to name a method that was never
+/// emitted.
+type Inventory<'a> = BTreeMap<&'a tf::Token, ClassNames<'a>>;
+
+/// The token enum each configured property reads back as, by the class and
+/// property that sourced it.
+type Sourced<'a> = BTreeMap<(&'a str, &'a str), &'a Ident>;
+
+/// Where each placed library's views live, by library: the Rust path that
+/// reaches them, or the spelling the configuration gave that does not read as
+/// one. A library never placed is absent, which is what
+/// [`Violation::UnknownLibrary`] is for.
+type Placed<'a> = BTreeMap<&'a str, Result<syn::Path, &'a str>>;
+
+/// What one class generates.
+struct ClassNames<'a> {
+    /// The class it names, for a diagnostic to point at.
+    class: &'a Class,
+    /// The view type's name.
+    view: String,
+    /// What upstream calls the same class: its library's prefix and that name.
+    qualified: String,
+    /// Where a caller reaches its accessors: the trait they live on, or the
+    /// view itself for an applied API schema, which has none. Spelled from the
+    /// module the documentation is written in, so a class of another library
+    /// carries the path to it.
+    qualifier: String,
+    /// The accessors it emits, in property order.
+    accessors: Vec<AccessorNames<'a>>,
+}
+
+/// One property's accessor pair, under every name it answers to.
+struct AccessorNames<'a> {
+    /// The property they reach.
+    property: &'a Property,
+    /// The method that reads it.
+    getter: String,
+    /// The method that authors it.
+    creator: String,
+    /// The method handing back its declaration unauthored.
+    builder: String,
+    /// The methods reading its value at the default time and at a given time,
+    /// where the property has them.
+    value: Option<String>,
+    value_at: Option<String>,
+    /// What upstream calls the pair, less the `Get` or `Create` it opens with:
+    /// `ExtentAttr` for `GetExtentAttr()`.
+    cpp: String,
+}
+
+/// Every name the library's classes generate.
+///
+/// A root generates nothing, being the core's own trait, and a property an
+/// ancestor already offers an accessor for generates nothing either: the
+/// ancestor's is what a caller reaches.
+fn inventory(model: &Library) -> Inventory<'_> {
+    model
+        .classes
+        .iter()
+        .filter(|class| !is_root(&class.identifier))
+        .map(|class| (&class.identifier, ClassNames::of(class, None)))
+        .collect()
+}
+
+impl<'a> ClassNames<'a> {
+    /// The names `class` generates, reached through `home` where it is a class
+    /// of another library's module.
+    fn of(class: &'a Class, home: Option<&syn::Path>) -> Self {
+        let view = class.metadata.class_name.clone();
+        // An applied API schema writes its accessors on the view, there being
+        // no trait to derive from; everything else puts them on its trait.
+        let qualifier = match class.kind.is_applied_api() {
+            true => view.clone(),
+            false => trait_name(&view),
+        };
+        let qualifier = match home {
+            Some(home) => super::within(home, &qualifier),
+            None => qualifier,
+        };
+
+        let accessors = class
+            .local_properties()
+            .filter(|property| offers(class, property))
+            .filter_map(|property| {
+                let accessor = named(property.api_name(), &property.shape)?;
+                let suffix = match property.shape.spec_type {
+                    sdf::SpecType::Relationship => "Rel",
+                    _ => "Attr",
+                };
+                Some(AccessorNames {
+                    property,
+                    cpp: format!("{}{suffix}", names::proper_case(property.api_name()?)),
+                    getter: accessor.getter,
+                    creator: accessor.creator,
+                    builder: accessor.builder,
+                    value: accessor.value,
+                    value_at: accessor.value_at,
+                })
+            })
+            .collect();
+
+        ClassNames {
+            class,
+            qualified: class.upstream_name.clone(),
+            view,
+            qualifier,
+            accessors,
+        }
+    }
+
+    /// Every accessor this class emits, as the C++ names upstream calls it by
+    /// and the Markdown that links it here.
+    ///
+    /// Each is paired under its bare name and under the class-qualified ones
+    /// upstream also writes, so a reference naming the class it means is
+    /// answered by that class.
+    fn links(&self) -> Vec<(String, String)> {
+        let mut links = Vec::new();
+        for accessor in &self.accessors {
+            // A reader the library writes by hand is no method of this crate's,
+            // so only the creator is paired for it.
+            let methods = iter::once(("Create", &accessor.creator))
+                .chain((!accessor.property.api.custom_get).then_some(("Get", &accessor.getter)));
+
+            for (verb, method) in methods {
+                let cpp = format!("{verb}{}", accessor.cpp);
+                let markdown = doc::link(method, Some(&format!("{}::{method}", self.qualifier)));
+                links.push((format!("{}::{cpp}", self.qualified), markdown.clone()));
+                links.push((format!("{}::{cpp}", self.view), markdown.clone()));
+                links.push((cpp, markdown));
+            }
+        }
+        links
+    }
+}
+
+/// Lowers a library to Rust, resolving every name it will mint.
+pub fn library(model: &Library, externs: &Externs, enums: &[TokenEnum]) -> Result<RustLibrary, Error> {
+    let tokens = constants(model)?;
+    let by_value = by_value(&tokens);
+    let enums = lower_enums(model, enums, &by_value)?;
+    // The property each enum was built from reads back as that enum, the
+    // configuration having said its tokens are those values.
+    let sourced: Sourced<'_> = enums
+        .iter()
+        .map(|lowered| ((lowered.source.0.as_str(), lowered.source.1.as_str()), &lowered.name))
+        .collect();
+
+    // Every name the library mints, settled before anything is checked or
+    // lowered against it, and one symbol table built from it.
+    let inventory = inventory(model);
+    check_class_names(&inventory, &enums)?;
+    let placed = placed(externs, model);
+    let library = library_symbols(&inventory, model, &placed);
+    let classes = model
+        .classes
+        .iter()
+        .filter(|class| !is_root(&class.identifier))
+        .map(|class| lower_class(class, model, &placed, &by_value, &sourced, &inventory, &library))
+        .collect::<Result<_, _>>()?;
+    let metadata = lower_metadata(model, &by_value)?;
+
+    Ok(RustLibrary {
+        library: model.name.clone(),
+        tokens,
+        enums,
+        classes,
+        metadata,
+    })
+}
+
+/// The traits reading and writing the library's metadata fields, one per kind
+/// of handle a field applies to, in the order prims, attributes,
+/// relationships, stage.
+fn lower_metadata(model: &Library, by_value: &BTreeMap<&str, &Ident>) -> Result<Vec<MetadataTrait>, Error> {
+    let kinds = [
+        (
+            usd::MetadataTargets::PRIMS,
+            super::items::PRIM_METADATA,
+            "prims",
+            "Prim",
+        ),
+        (
+            usd::MetadataTargets::ATTRIBUTES,
+            super::items::ATTRIBUTE_METADATA,
+            "attributes",
+            "Attribute",
+        ),
+        (
+            usd::MetadataTargets::RELATIONSHIPS,
+            super::items::RELATIONSHIP_METADATA,
+            "relationships",
+            "Relationship",
+        ),
+        (
+            usd::MetadataTargets::LAYERS,
+            super::items::STAGE_METADATA,
+            "a stage",
+            "Stage",
+        ),
+    ];
+    let mut traits = Vec::new();
+    for (target, name, what, handle) in kinds {
+        let stage = target == usd::MetadataTargets::LAYERS;
+        let mut methods: BTreeMap<String, &tf::Token> = BTreeMap::new();
+        let mut fields = Vec::new();
+        for field in model
+            .metadata
+            .iter()
+            .filter(|field| field.applies_to.intersects(target))
+        {
+            let origin = format!("the {} metadata field `{}`", model.name, field.name);
+            let getter = names::method_name(field.name.as_str());
+            let setter = format!("set_{}", names::snake_case(field.name.as_str()));
+            for method in [&getter, &setter] {
+                if let Some(first) = methods.insert(method.clone(), &field.name) {
+                    return Err(Error::MetadataMethodCollision {
+                        library: model.name.clone(),
+                        method: method.clone(),
+                        first: first.to_string(),
+                        second: field.name.to_string(),
+                    });
+                }
+            }
+
+            let mut documentation = match &field.documentation {
+                Some(text) => format!("{}\n\n", doc::to_markdown(text, &doc::Symbols::default())),
+                None => String::new(),
+            };
+            documentation.push_str(&doc::wrap(&format!(
+                "The `{}` metadata field, declared `{}`.",
+                field.name,
+                field.type_name.as_str()
+            )));
+            if let Some(value) = &field.fallback
+                && let Ok(text) = usda::TextWriter::value_to_string(value)
+            {
+                // A stage falls back to the declared default; a prim or a
+                // property falls back only to what its schema declares, as C++
+                // `GetMetadata` does, and leaves the default to the caller.
+                let fallback = match stage {
+                    true => format!("Where no layer authors it, the stage reads `{text}`."),
+                    false => format!(
+                        "Its declared default, `{text}`, is not applied: like C++ `GetMetadata`, this reads what \
+                         a layer authors or the schema declares, and `None` otherwise."
+                    ),
+                };
+                documentation.push_str(&format!("\n\n{}", doc::wrap(&fallback)));
+            }
+
+            fields.push(MetadataAccessor {
+                getter: identifier(&getter, &origin)?,
+                setter: identifier(&setter, &origin)?,
+                token: constant_of(by_value, &field.name),
+                rust_type: field
+                    .type_name
+                    .kind()
+                    .and_then(types::rust_type)
+                    .unwrap_or_else(|| syn::parse_quote! { ::openusd::vt::Value }),
+                documentation,
+            });
+        }
+        if fields.is_empty() {
+            continue;
+        }
+
+        let handle = Ident::new(handle, Span::call_site());
+        traits.push(MetadataTrait {
+            name: Ident::new(name, Span::call_site()),
+            documentation: doc::wrap(&format!(
+                "The metadata fields the `{}` library registers for {what}.",
+                model.name
+            )),
+            handle: syn::parse_quote! { ::openusd::usd::#handle },
+            stage,
+            fields,
+        });
+    }
+    Ok(traits)
+}
+
+/// The tokens alone, for a library that gets no views.
+///
+/// A separate request rather than a flag on [`library`], because it is held to
+/// different rules: what a Rust name would collide with, or which type has no
+/// constant to declare it, says nothing about a library whose API is written by
+/// hand. Asking for one or the other says which set applies.
+pub fn tokens(model: &Library, enums: &[TokenEnum]) -> Result<RustLibrary, Error> {
+    let tokens = constants(model)?;
+    let enums = lower_enums(model, enums, &by_value(&tokens))?;
+    Ok(RustLibrary {
+        library: model.name.clone(),
+        tokens,
+        enums,
+        classes: Vec::new(),
+        metadata: Vec::new(),
+    })
+}
+
+/// The constant each token value is emitted as, which is how a lowered value
+/// names the constant that holds it.
+pub(super) fn by_value(tokens: &[Constant]) -> BTreeMap<&str, &Ident> {
+    tokens
+        .iter()
+        .map(|constant| (constant.value.as_str(), &constant.name))
+        .collect()
+}
+
+/// The enums the configuration asked this library for, each resolved against
+/// the property it named.
+///
+/// An enum exists because the configuration named one, and its variants come
+/// from the single property that configuration pointed at.
+fn lower_enums(
+    model: &Library,
+    enums: &[TokenEnum],
+    by_value: &BTreeMap<&str, &Ident>,
+) -> Result<Vec<RustEnum>, Error> {
+    let mut minted: BTreeSet<&str> = BTreeSet::new();
+    let mut lowered = Vec::new();
+
+    for declared in enums.iter().filter(|declared| declared.library == model.name) {
+        let name = declared.name.as_str();
+        // What the configuration alone decides is settled here, where the name
+        // it chose is in hand; what the schema decides is resolved below.
+        let resolved = if !names::is_rust_identifier(name) {
+            Err(TokenEnumError::InvalidName)
+        } else if super::items::ALL.contains(&name) {
+            Err(TokenEnumError::ReservedName)
+        } else if !minted.insert(name) {
+            Err(TokenEnumError::Duplicate)
+        } else {
+            lower_enum(model, declared, by_value)
+        };
+        lowered.push(resolved.map_err(|cause| Error::TokenEnum {
+            name: name.to_owned(),
+            cause,
+        })?);
+    }
+    Ok(lowered)
+}
+
+/// One configured enum, resolved against the property it sources.
+fn lower_enum(
+    model: &Library,
+    declared: &TokenEnum,
+    by_value: &BTreeMap<&str, &Ident>,
+) -> Result<RustEnum, TokenEnumError> {
+    let (class_name, property_name) = declared.source()?;
+    let class = model
+        .classes
+        .iter()
+        .find(|class| class.identifier.as_str() == class_name)
+        .ok_or_else(|| TokenEnumError::UnknownClass {
+            class: class_name.to_owned(),
+        })?;
+    let property = class
+        .properties
+        .iter()
+        .find(|property| property.name.as_str() == property_name)
+        .ok_or_else(|| TokenEnumError::UnknownProperty {
+            class: class_name.to_owned(),
+            property: property_name.to_owned(),
+        })?;
+
+    let allowed = property.allowed_tokens();
+    if allowed.is_empty() {
+        return Err(TokenEnumError::NoAllowedTokens {
+            class: class_name.to_owned(),
+            property: property_name.to_owned(),
+        });
+    }
+
+    // An override for a token the property does not admit would read as a
+    // decision and do nothing, so it is a mistake rather than dead
+    // configuration.
+    if let Some(token) = declared
+        .variants
+        .keys()
+        .find(|token| !allowed.iter().any(|allowed| allowed.as_str() == token.as_str()))
+    {
+        return Err(TokenEnumError::UnknownVariantToken { token: token.clone() });
+    }
+
+    let variants = variants(declared, &allowed, by_value)?;
+    // A variant carries the token it stands for, so the fallback is looked up
+    // by value.
+    let mut default = None;
+    if declared.default {
+        let fallback = property
+            .fallback()
+            .and_then(vt::Value::try_as_token_ref)
+            .ok_or_else(|| TokenEnumError::NoFallback {
+                class: class_name.to_owned(),
+                property: property_name.to_owned(),
+            })?;
+        let named = variants
+            .iter()
+            .find(|variant| variant.value == fallback.as_str())
+            .ok_or_else(|| TokenEnumError::UnknownFallback {
+                token: fallback.to_string(),
+            })?;
+        default = Some(named.name.clone());
+    }
+
+    Ok(RustEnum {
+        source: (class_name.to_owned(), property_name.to_owned()),
+        name: Ident::new(&declared.name, Span::call_site()),
+        documentation: enum_documentation(class_name, property_name, property),
+        variants,
+        default,
+    })
+}
+
+/// A token enum's documentation: what the schema wrote about the property its
+/// values come from, then what the type is.
+///
+/// The schema's own text carries no symbol table here — a library's symbols are
+/// built from an inventory of classes, which a library getting no views has
+/// none of — so a reference it makes to another schema reads as the text it was
+/// written as.
+fn enum_documentation(class: &str, property: &str, source: &Property) -> String {
+    let declared = doc::wrap(&format!(
+        "The values `{class}.{property}` admits, as a Rust type. \
+         Read and written as the tokens themselves."
+    ));
+    match source.documentation() {
+        Some(text) => format!("{}\n\n{declared}", doc::to_markdown(text, &doc::Symbols::default())),
+        None => declared,
+    }
+}
+
+/// A variant per allowed token, named by the configuration or by casing.
+///
+/// Order follows the property's `allowedTokens`, so a library mints the same
+/// enum on every run, while membership is compared by value: two spellings of
+/// one set are one set however they were listed.
+fn variants(
+    declared: &TokenEnum,
+    allowed: &[tf::Token],
+    by_value: &BTreeMap<&str, &Ident>,
+) -> Result<Vec<RustVariant>, TokenEnumError> {
+    let mut minted: BTreeMap<String, String> = BTreeMap::new();
+    let mut variants = Vec::with_capacity(allowed.len());
+
+    for token in allowed {
+        let value = token.as_str();
+        let spelled = declared.variants.get(value);
+        let name = spelled.cloned().unwrap_or_else(|| names::proper_case(value));
+        if !names::is_rust_identifier(&name) {
+            return Err(match spelled {
+                Some(_) => TokenEnumError::InvalidVariant {
+                    token: value.to_owned(),
+                    variant: name,
+                },
+                None => TokenEnumError::UnnameableToken {
+                    token: value.to_owned(),
+                },
+            });
+        }
+        // A suffixed variant is a name nobody chose, sitting in a public API;
+        // the caller is asked for one instead.
+        if let Some(first) = minted.insert(name.clone(), value.to_owned()) {
+            return Err(TokenEnumError::VariantCollision {
+                first,
+                second: value.to_owned(),
+                variant: name,
+            });
+        }
+
+        variants.push(RustVariant {
+            name: Ident::new(&name, Span::call_site()),
+            constant: constant_of(by_value, token),
+            value: value.to_owned(),
+        });
+    }
+    Ok(variants)
+}
+
+/// The constant each token is emitted as.
+///
+/// Two identifiers can reach one screaming-snake name: `points` and the schema
+/// `Points` both reach `POINTS`, a pair upstream writes on purpose and keeps
+/// apart by case, which a Rust constant cannot. The first one there keeps the
+/// name and the next takes a trailing underscore, as a token landing on a
+/// reserved word does. The order is the one [`Library::tokens`] fixed —
+/// properties by name, schema identifiers last — so a library mints the same
+/// constants on every run, and each says in its own documentation what it
+/// holds.
+fn constants(model: &Library) -> Result<Vec<Constant>, Error> {
+    let mut minted: BTreeSet<String> = BTreeSet::new();
+    let mut constants = Vec::new();
+
+    for token in model.tokens()? {
+        let mut name = names::screaming_snake(&token.id);
+        while !minted.insert(name.clone()) {
+            name.push('_');
+        }
+
+        let origin = format!("token `{}`", token.id);
+        constants.push(Constant {
+            name: identifier(&name, &origin)?,
+            documentation: doc::wrap(&format!("`\"{}\"`: {}.", token.value, token.documentation.join(", "))),
+            value: token.value,
+        });
+    }
+    Ok(constants)
+}
+
+/// Two schemas of one library reaching one Rust name.
+///
+/// The scope is this module: two libraries may each have a `Sphere`, and
+/// nothing stops them, since a consumer includes each in a module of its own.
+fn check_class_names(inventory: &Inventory<'_>, enums: &[RustEnum]) -> Result<(), Error> {
+    // The names the file takes for itself, which a schema may not also take:
+    // `SCHEMAS` is a value, and so is a view's tuple-struct constructor, so a
+    // schema of that name would collide with it. Read from where the emitter
+    // writes them, so renaming one cannot leave this stale.
+    let mut seen: BTreeMap<String, &str> = super::items::ALL
+        .map(|name| (name.to_owned(), "the generated file"))
+        .into();
+    // A configured enum mints a type into the same module, so it is one of the
+    // names a schema may not also take. Two enums reaching one name, and an
+    // enum reaching one of the file's own items, are both refused where the
+    // enum is lowered, so nothing here displaces an earlier entry.
+    for generated in enums {
+        seen.insert(generated.name.to_string(), "a token enum");
+    }
+    for names in inventory.values() {
+        let identifier = names.class.identifier.as_str();
+
+        // A class brings the trait its own accessors live on, except an applied
+        // API schema, which has none: a class called `FooSchema` collides with
+        // `Foo`'s trait, but never with `FooAPI`. The two are one name for such
+        // a schema, which is what `qualifier` being the view says.
+        let mut minted = vec![names.view.clone()];
+        if names.qualifier != names.view {
+            minted.push(names.qualifier.clone());
+        }
+        for minted in minted {
+            if let Some(first) = seen.insert(minted.clone(), identifier)
+                && first != identifier
+            {
+                return Err(names.class.violation(Violation::RustNameCollision {
+                    name: minted,
+                    first: first.to_owned(),
+                    second: identifier.to_owned(),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One schema's names, paths and accessors.
+fn lower_class(
+    class: &Class,
+    model: &Library,
+    placed: &Placed<'_>,
+    by_value: &BTreeMap<&str, &Ident>,
+    sourced: &Sourced<'_>,
+    inventory: &Inventory<'_>,
+    library: &doc::Symbols<'_>,
+) -> Result<RustClass, Error> {
+    let reflections = class.reflections(model);
+    check_methods(class, model, &reflections)?;
+
+    for property in class.local_properties().filter(|property| !offers(class, property)) {
+        // The ancestor's accessor is what a caller reaches, and it is generated
+        // where the ancestor is: a hand-written reader here would never be
+        // called, so the schema is told rather than quietly ignored.
+        if property.api.custom_get {
+            return Err(property.violation(Violation::CustomGetWithoutAccessor {
+                property: property.name.clone(),
+            }));
+        }
+    }
+    // Documentation on a class means that class's property, so its own chain
+    // answers first and nearest wins. An ancestor of another library is named
+    // through the module its views live in, where the configuration placed it.
+    let elsewhere: BTreeMap<&tf::Token, ClassNames<'_>> = class
+        .bases
+        .iter()
+        .filter(|base| base.library != model.name)
+        .filter_map(|base| {
+            let Some(Ok(home)) = placed.get(base.library.as_str()) else {
+                return None;
+            };
+            let ancestor = model.find(&base.identifier)?;
+            Some((&base.identifier, ClassNames::of(ancestor, Some(home))))
+        })
+        .collect();
+    let chain = iter::once(&class.identifier).chain(class.bases.iter().map(|base| &base.identifier));
+    let owners = chain.filter_map(|owner| inventory.get(owner).or_else(|| elsewhere.get(owner)));
+    let links = class_symbols(owners, library);
+    let mine = inventory.get(&class.identifier).expect("a class of this library");
+    let accessors = mine
+        .accessors
+        .iter()
+        .map(|accessor| lower_accessor(class, accessor, by_value, sourced, &links))
+        .collect::<Result<_, _>>()?;
+
+    // Each base contributes the trait a view derives its accessors from, the
+    // first of them being the supertrait of this class's own trait. A root
+    // contributes none, being what the chain ends at.
+    let inherited = class
+        .bases
+        .iter()
+        .map(|base| base_trait(class, base, model, placed))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parent = match (class.bases.first(), inherited.first()) {
+        (_, Some(Some(path))) => path.clone(),
+        (Some(base), _) => root_trait(&base.identifier),
+        (None, _) => syn::parse_quote! { ::openusd::usd::SchemaBase },
+    };
+
+    // The root the view answers to, then every ancestor whose accessors it
+    // inherits.
+    let inherited: Vec<syn::Path> = inherited.into_iter().flatten().collect();
+
+    // What a class reflects reads as its own: the properties of an API schema
+    // that every prim of this type carries anyway. A reflected accessor goes
+    // wherever the rest of them go, nothing marking it apart. A schema of this
+    // library is in the inventory; one of another library is named through the
+    // module its views live in, and one of this library that is not generated
+    // has no view anywhere to name.
+    let mut accessors: Vec<RustAccessor> = accessors;
+    let mut reflected = Vec::new();
+    for reflection in &reflections {
+        let Reflection::Taken { schema, properties, .. } = reflection else {
+            continue;
+        };
+        let origin = schema.origin.describe();
+        let elsewhere;
+        let (theirs, home) = match inventory.get(&schema.identifier) {
+            Some(theirs) => (theirs, None),
+            None if schema.library == model.name => {
+                return Err(class.violation(Violation::Ungenerated {
+                    class: schema.identifier.clone(),
+                }));
+            }
+            None => {
+                let home = reached(class, placed, &schema.library, &schema.identifier)?;
+                elsewhere = ClassNames::of(schema, Some(&home));
+                (&elsewhere, Some(home))
+            }
+        };
+
+        let links = class_symbols(iter::once(theirs), library);
+        let taken = theirs.accessors.iter().filter(|accessor| {
+            properties
+                .iter()
+                .any(|property| property.name == accessor.property.name)
+        });
+        for accessor in taken {
+            accessors.push(lower_accessor(schema, accessor, by_value, sourced, &links)?);
+        }
+
+        let view = identifier(&schema.metadata.class_name, &origin)?;
+        reflected.push(Reflected {
+            accessor: identifier(&names::snake_case(&schema.metadata.class_name), &origin)?,
+            view: match &home {
+                Some(home) => syn::parse_quote! { #home::#view },
+                None => syn::parse_quote! { #view },
+            },
+        });
+    }
+
+    let origin = class.origin.describe();
+    Ok(RustClass {
+        name: identifier(&mine.view, &origin)?,
+        kind: class.kind,
+        accessor_trait: match class.kind.is_applied_api() {
+            true => None,
+            false => Some(AccessorTrait {
+                name: identifier(&mine.qualifier, &origin)?,
+                parent,
+            }),
+        },
+        inherited,
+        constant: constant_of(by_value, &class.identifier),
+        documentation: class
+            .documentation
+            .as_deref()
+            .map(|text| doc::to_markdown(text, &links)),
+        accessors,
+        reflected,
+        instancing: instancing(class),
+    })
+}
+
+/// How `class`'s instances name their properties, where it is a multiple-apply
+/// schema that declares any.
+fn instancing(class: &Class) -> Option<Instancing> {
+    let prefix = class.metadata.property_namespace_prefix.as_ref()?;
+    class.kind.is_multiple_apply().then(|| Instancing {
+        prefix: prefix.to_string(),
+        base_names: class
+            .local_properties()
+            .map(|property| usd::SchemaRegistry::name_template_base(property.schematics_name.as_str()).to_string())
+            .collect(),
+    })
+}
+
+/// One property's accessor pair, named and typed.
+fn lower_accessor(
+    class: &Class,
+    accessor: &AccessorNames<'_>,
+    by_value: &BTreeMap<&str, &Ident>,
+    sourced: &Sourced<'_>,
+    symbols: &doc::Symbols<'_>,
+) -> Result<RustAccessor, Error> {
+    let property = accessor.property;
+    let origin = property.origin.describe();
+    let kind = match property.shape.spec_type {
+        sdf::SpecType::Relationship => PropertyKind::Relationship,
+        _ => PropertyKind::Attribute {
+            type_constant: value_type(property)?,
+        },
+    };
+
+    // A typed read is a reader too, so a library writing the reader by hand
+    // writes that as well; a type holding no value has nothing to read.
+    let ty = match sourced.get(&(class.identifier.as_str(), property.name.as_str())) {
+        Some(name) => Some(syn::parse_quote! { #name }),
+        None => property
+            .type_name()
+            .and_then(|name| name.kind())
+            .and_then(types::rust_type),
+    };
+    let typed = match (&accessor.value, ty) {
+        (Some(value), Some(ty)) if !property.api.custom_get => Some(TypedRead {
+            value: identifier(value, &origin)?,
+            value_at: accessor
+                .value_at
+                .as_deref()
+                .map(|value_at| identifier(value_at, &origin))
+                .transpose()?,
+            ty,
+        }),
+        _ => None,
+    };
+    Ok(RustAccessor {
+        getter: identifier(&accessor.getter, &origin)?,
+        creator: identifier(&accessor.creator, &origin)?,
+        builder: identifier(&accessor.builder, &origin)?,
+        typed,
+        custom_get: property.api.custom_get,
+        token: constant_of(by_value, &property.schematics_name),
+        instanced: class.kind.is_multiple_apply(),
+        kind,
+        custom: property.shape.custom,
+        uniform: property.shape.variability == sdf::Variability::Uniform
+            && property.shape.spec_type != sdf::SpecType::Relationship,
+        documentation: documentation(property, symbols),
+    })
+}
+
+/// Whether a class emits an accessor for one of its own properties.
+///
+/// A property redeclared to change a fallback contributes none: the accessor is
+/// the ancestor's, and two of one name in a chain make every call ambiguous. An
+/// applied API schema is never inherited from, so nothing of its can shadow.
+fn offers(class: &Class, property: &Property) -> bool {
+    class.kind.is_applied_api() || !shadows_an_ancestor(class, property)
+}
+/// Reads the path of every placed library the stack holds, keeping a spelling
+/// Rust cannot read as it was given.
+///
+/// The configuration says so as text, read once here before any class asks for
+/// a path. The configuration names every library a consumer has, so one outside
+/// this stack is none of this library's business, and an unreadable spelling is
+/// reported only where a base or a reflected schema reaches for that library,
+/// against the class reaching, by [`reached`]; a documentation link reaches for
+/// nothing and simply goes unwritten.
+fn placed<'a>(externs: &'a Externs, model: &Library) -> Placed<'a> {
+    externs
+        .iter()
+        .filter(|(library, _)| model.foreign.iter().any(|foreign| &foreign.library == *library))
+        .map(|(library, text)| (library.as_str(), syn::parse_str(text).map_err(|_| text.as_str())))
+        .collect()
+}
+
+/// The path to `library`'s views, which `class` reaches for to name `named`
+/// there: a base it derives from, or a schema it reflects.
+fn reached(class: &Class, placed: &Placed<'_>, library: &str, named: &tf::Token) -> Result<syn::Path, Error> {
+    match placed.get(library) {
+        Some(Ok(path)) => Ok(path.clone()),
+        Some(Err(text)) => Err(class.violation(Violation::UnreadableLibraryPath {
+            library: library.to_owned(),
+            path: (*text).to_owned(),
+        })),
+        None => Err(class.violation(Violation::UnknownLibrary {
+            library: library.to_owned(),
+            class: named.clone(),
+        })),
+    }
+}
+
+/// The `sdf::ValueTypeName` constant an attribute is declared with.
+///
+/// A legacy spelling the core reads but names no constant for — `Transform`,
+/// `PointIndex` — is a type validation admits, since a stage resolves it, and
+/// one no creator could declare. It is refused here, where what the generated
+/// code needs is known.
+fn value_type(property: &Property) -> Result<syn::Path, Error> {
+    let named = property.type_name().and_then(|name| name.constant_ident());
+    let Some(constant) = named else {
+        return Err(property.violation(Violation::UnnameableType {
+            property: property.name.clone(),
+            type_name: property.type_name().map(|name| name.as_token()).unwrap_or_default(),
+        }));
+    };
+
+    let constant = Ident::new(constant, Span::call_site());
+    Ok(syn::parse_quote! { ::openusd::sdf::ValueTypeName::#constant })
+}
+
+/// The `tokens::` constant holding a value.
+///
+/// Every property name and every schema identifier reached the token set, so a
+/// value that did not is one nothing declared: it is named by its own string,
+/// which is still what the schematics recorded.
+pub(super) fn constant_of(by_value: &BTreeMap<&str, &Ident>, value: &tf::Token) -> TokenStream {
+    if let Some(name) = by_value.get(value.as_str()) {
+        let tokens = super::ident(super::items::TOKENS);
+        return quote! { #tokens::#name };
+    }
+    let literal = value.as_str();
+    quote! { #literal }
+}
+
+/// An identifier, checked before it is made.
+///
+/// A schema names its own class and accessors, through `className` and
+/// `apiName`, and a name Rust would not take — one that is no identifier at
+/// all, or a word Rust has reserved — has to be reported against the schema
+/// that wrote it rather than left to panic where it is written out.
+pub(super) fn identifier(name: &str, origin: &str) -> Result<Ident, Error> {
+    if !names::is_rust_identifier(name) {
+        return Err(Error::Definition {
+            origin: origin.to_owned(),
+            violation: Violation::NotAnIdentifier { name: name.to_owned() },
+        });
+    }
+    Ok(Ident::new(name, Span::call_site()))
+}
+
+/// The methods one property contributes.
+struct Accessor {
+    getter: String,
+    creator: String,
+    builder: String,
+    value: Option<String>,
+    value_at: Option<String>,
+}
+
+/// The methods an accessor of `api_name` contributes to a property of `shape`.
+///
+/// An attribute is also read by value, at the default time and, unless it is
+/// uniform and so holds no samples, at a given time. Those names are minted
+/// whatever the attribute's type, so which names a property takes does not
+/// hang on whether its type holds a value. A value read that would take a name
+/// every view already has is not minted: the view's own method keeps the name,
+/// as C++ keeps `GetName` beside a `name` property's `GetNameAttr`, and the
+/// property is read through its attribute.
+fn named(api_name: Option<&str>, shape: &Shape) -> Option<Accessor> {
+    let api_name = api_name?;
+    let suffix = match shape.spec_type {
+        sdf::SpecType::Relationship => "rel",
+        _ => "attr",
+    };
+    // The suffix is what keeps a method clear of a Rust keyword, so no escaping
+    // rule is needed on top of it.
+    let snake = names::snake_case(api_name);
+    let getter = format!("{snake}_{suffix}");
+    let value = names::method_name(api_name);
+    let attribute = shape.spec_type != sdf::SpecType::Relationship && !VIEW_METHODS.contains(&value.as_str());
+    Some(Accessor {
+        creator: format!("create_{getter}"),
+        builder: format!("{getter}_builder"),
+        getter,
+        value: attribute.then_some(value),
+        value_at: (attribute && shape.variability != sdf::Variability::Uniform).then(|| format!("{snake}_at")),
+    })
+}
+
+impl Accessor {
+    /// Every method name the accessor mints.
+    fn methods(self) -> impl Iterator<Item = String> {
+        [self.getter, self.creator, self.builder]
+            .into_iter()
+            .chain(self.value)
+            .chain(self.value_at)
+    }
+}
+
+/// Every method name a view reaches a property by, readers and authors alike.
+///
+/// One pair per class along the chain that named it: each emits its own
+/// accessors unless a nearer one already offers them, so together they are what
+/// a caller can write. A reader the library writes by hand still occupies its
+/// name, so it counts here too.
+fn offered(property: &Property) -> impl Iterator<Item = String> {
+    property
+        .sites
+        .iter()
+        .filter_map(|site| named(site.api_name.as_deref(), &property.shape))
+        .flat_map(Accessor::methods)
+}
+
+/// Every method name the schemas a class takes mint on it — each taken
+/// property's accessors, and the method that views the prim through the schema
+/// — each with the schema it came from.
+fn reflected_methods<'r>(reflections: &'r [Reflection<'r>]) -> impl Iterator<Item = (String, &'r tf::Token)> + 'r {
+    reflections
+        .iter()
+        .filter_map(|reflection| match reflection {
+            Reflection::Taken { schema, properties, .. } => Some((schema, properties)),
+            _ => None,
+        })
+        .flat_map(|(schema, properties)| {
+            properties
+                .iter()
+                .filter_map(|property| named(property.api_name(), &property.shape))
+                .flat_map(Accessor::methods)
+                .chain(iter::once(names::snake_case(&schema.metadata.class_name)))
+                .map(move |method| (method, &schema.identifier))
+        })
+}
+
+/// Whether a redeclaration would offer a method an ancestor's trait already
+/// offers, which every call through the chain would then find twice.
+///
+/// A class redeclaring a property to change its fallback keeps the ancestor's
+/// accessor: the two mean the same method, and a supertrait already carries it.
+/// A redeclaration that renames it is a different method and is emitted, unless
+/// a class between them renamed it the same way — which is why every ancestor
+/// site is compared and not only the one that introduced the property.
+fn shadows_an_ancestor(class: &Class, property: &Property) -> bool {
+    let Some(mine) = named(property.api_name(), &property.shape) else {
+        return false;
+    };
+    property
+        .sites
+        .iter()
+        .filter(|site| site.class != class.identifier)
+        .filter_map(|site| named(site.api_name.as_deref(), &property.shape))
+        .any(|theirs| theirs.getter == mine.getter)
+}
+
+/// Two properties reaching one method name, counting every ancestor's and every
+/// schema the class or an ancestor reflects.
+///
+/// A view's methods arrive through a chain of traits, and two supertraits
+/// offering one method make every call ambiguous — as do two methods of one name
+/// in a single trait. Readers and authors share the namespace, so a property
+/// whose reader is called `create_size_attr` collides with `size`'s author. A
+/// reflected schema's accessors land among the class's own, as does the method
+/// that views the prim through it, so they are held to the same rule with the
+/// schema named as the second party; what an ancestor this library holds
+/// reflects arrives through its trait, so those names are taken first.
+fn check_methods(class: &Class, model: &Library, reflections: &[Reflection<'_>]) -> Result<(), Error> {
+    let mut seen: BTreeMap<String, &tf::Token> = BTreeMap::new();
+    for property in &class.properties {
+        for method in offered(property) {
+            if let Some(first) = seen.insert(method.clone(), &property.name)
+                && first != &property.name
+            {
+                return Err(property.violation(Violation::MethodCollision {
+                    method,
+                    first: first.clone(),
+                    second: property.name.clone(),
+                }));
+            }
+        }
+    }
+
+    for base in &class.bases {
+        let Some(ancestor) = model.find(&base.identifier) else {
+            continue;
+        };
+        let theirs = ancestor.reflections(model);
+        for (method, _) in reflected_methods(&theirs) {
+            if let Some(first) = seen.insert(method.clone(), &ancestor.identifier) {
+                return Err(class.violation(Violation::MethodCollision {
+                    method,
+                    first: first.clone(),
+                    second: ancestor.identifier.clone(),
+                }));
+            }
+        }
+    }
+    for (method, schema) in reflected_methods(reflections) {
+        if let Some(first) = seen.insert(method.clone(), schema) {
+            return Err(class.violation(Violation::MethodCollision {
+                method,
+                first: first.clone(),
+                second: schema.clone(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// What the C++ names a library's documentation mentions point at here.
+///
+/// Upstream's prose names upstream's API — `GetExtentAttr()`, `UsdGeomMesh` —
+/// and the reader of the generated crate has neither. What this library emits
+/// for those is known from the [`Inventory`], and where another library's
+/// classes live from what the configuration placed, so the two are paired and
+/// the documentation reads as links to the Rust that answers.
+///
+/// This is the half that holds for the whole library: the classes it declares
+/// and the classes other libraries in the stack declare, under both spellings
+/// upstream writes them, and the accessors that one class alone declares. A
+/// name several classes declare is left to [`class_symbols`], which answers it
+/// against the class being documented.
+fn library_symbols(inventory: &Inventory<'_>, model: &Library, placed: &Placed<'_>) -> doc::Symbols<'static> {
+    let mut symbols = doc::Symbols::default();
+
+    // A name is paired only where one class declares it; `None` marks one that
+    // several do, which stays here so a later class cannot revive it.
+    let mut accessors: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for class in inventory.values() {
+        for (cpp, markdown) in class.links() {
+            accessors
+                .entry(cpp)
+                .and_modify(|found| *found = None)
+                .or_insert(Some(markdown));
+        }
+    }
+    for (cpp, markdown) in accessors {
+        if let Some(markdown) = markdown {
+            symbols.insert(cpp, markdown);
+        }
+    }
+
+    // Upstream names a class by its library's prefix and its class name; the
+    // same class is that class name alone here. Both spellings appear in its
+    // prose, the bare one far more often.
+    for class in inventory.values() {
+        // A view is named where the documentation is, so its own name reaches
+        // it and the link needs no path.
+        let view = &class.view;
+        let link = doc::link(view, None);
+
+        symbols.insert(class.qualified.clone(), link.clone());
+        if coined(view) {
+            symbols.insert(view.clone(), link);
+        }
+    }
+
+    // A class of another library is named the same way, and reaches its view
+    // where the configuration placed the library; one whose library was not
+    // placed, or not readably, is left as it was written. Its bare name is
+    // paired only where it names one class across the stack: a class of this
+    // library keeps the name, having been paired first, and a name two foreign
+    // libraries share — the core's `ModelAPI` and `usdGeom`'s `GeomModelAPI`,
+    // which takes the class name `ModelAPI` — names neither.
+    let mut shared: BTreeMap<&str, usize> = BTreeMap::new();
+    for foreign in &model.foreign {
+        *shared.entry(foreign.class_name.as_str()).or_default() += 1;
+    }
+    for foreign in &model.foreign {
+        let Some(Ok(home)) = placed.get(foreign.library.as_str()) else {
+            continue;
+        };
+        let link = doc::link(&foreign.class_name, Some(&super::within(home, &foreign.class_name)));
+
+        symbols.insert(foreign.upstream_name.clone(), link.clone());
+        if coined(&foreign.class_name) && shared[foreign.class_name.as_str()] == 1 {
+            symbols.insert(foreign.class_name.clone(), link);
+        }
+    }
+    symbols
+}
+
+/// Whether a class name is a coined one, which an interior capital is what
+/// makes it: upstream writes `PointInstancer` meaning the schema, but `Curves`
+/// for a RIB statement and for what Maya calls a NURBS curve, and a word that
+/// is ordinary English is ordinary English as often as it is a class. Only a
+/// coined name is paired bare.
+fn coined(name: &str) -> bool {
+    name.chars().skip(1).any(char::is_uppercase)
+}
+
+/// What those names point at when the documentation is one class's own, given
+/// the classes whose accessors answer for it, nearest first.
+///
+/// A method name alone is ambiguous across a library: four of `usdGeom`'s
+/// shapes declare a `radius`. Documentation on a class means that class's
+/// property, so the `owners` answer first and nearest wins; what is left falls
+/// through to the library, which pairs only unambiguous names.
+// TODO(perf): every class re-pairs the names its chain declares, which
+// `library_symbols` has already read once from the same inventory. The pairs are
+// a pure function of the class, so they could be built per class in one pass, or
+// built in parallel.
+fn class_symbols<'a, 'i>(
+    owners: impl Iterator<Item = &'i ClassNames<'i>>,
+    library: &'a doc::Symbols<'a>,
+) -> doc::Symbols<'a> {
+    let mut symbols = doc::Symbols::layered(library);
+    for owner in owners {
+        for (cpp, markdown) in owner.links() {
+            symbols.insert(cpp, markdown);
+        }
+    }
+    symbols
+}
+
+/// The trait a class's accessors live on.
+///
+/// The schema's own name belongs to the view a prim is read through, so the
+/// trait behind it takes the `Schema` suffix — `Mesh` and `MeshSchema`,
+/// `Gprim` and `GprimSchema` — whether the schema is one a prim can be or a
+/// base of ones it can.
+fn trait_name(class_name: &str) -> String {
+    format!("{class_name}Schema")
+}
+
+/// The trait a base contributes to a view that derives from it, or `None` where
+/// the base is one of the roots, which have no accessors and are named directly.
+fn base_trait(class: &Class, base: &Base, model: &Library, placed: &Placed<'_>) -> Result<Option<syn::Path>, Error> {
+    if is_root(&base.identifier) {
+        return Ok(None);
+    }
+
+    let origin = class.origin.describe();
+    let inherited = identifier(&trait_name(&base.class_name), &origin)?;
+    if base.library == model.name {
+        // A base of this library that this run does not generate — one a
+        // sublayer declares without a `/GLOBAL` of its own — has no trait for a
+        // view to derive from, so naming it would name nothing.
+        return match base.generated {
+            true => Ok(Some(syn::parse_quote! { #inherited })),
+            false => Err(class.violation(Violation::Ungenerated {
+                class: base.identifier.clone(),
+            })),
+        };
+    }
+
+    let path = reached(class, placed, &base.library, &base.identifier)?;
+    Ok(Some(syn::parse_quote! { #path::#inherited }))
+}
+
+/// The names every view has before any property gives it one: the methods of
+/// `usd::SchemaBase`, which every view implements, and the functions the
+/// emitter writes on a view itself — its constructors, and a multiple-apply
+/// view's instance `name` and lookups. A second method of one of these names
+/// is a duplicate definition where it lands on the view, and an ambiguous call
+/// where it lands on a trait a caller has in scope.
+const VIEW_METHODS: &[&str] = &[
+    "prim",
+    "path",
+    "stage",
+    "is_concrete",
+    "is_typed",
+    "is_api",
+    "is_applied_api",
+    "is_multiple_apply",
+    "from_prim",
+    "from_prim_unchecked",
+    "get",
+    "define",
+    "apply",
+    "can_apply",
+    "name",
+    "all",
+    "owns_property",
+    "instance_at_path",
+    "is_property_base_name",
+];
+
+/// The root trait a view answers to: a prim type and a base of prim types are
+/// typed schemas, and everything else here is something applied to a prim.
+///
+/// Every kind names its own side of that split, so a kind added later cannot
+/// take one by default.
+pub(super) fn schema_root(kind: usd::SchemaKind) -> syn::Path {
+    match kind {
+        usd::SchemaKind::ConcreteTyped | usd::SchemaKind::AbstractTyped => {
+            syn::parse_quote! { ::openusd::usd::Typed }
+        }
+        usd::SchemaKind::AbstractBase
+        | usd::SchemaKind::NonAppliedApi
+        | usd::SchemaKind::SingleApplyApi
+        | usd::SchemaKind::MultipleApplyApi => syn::parse_quote! { ::openusd::usd::APISchemaBase },
+    }
+}
+
+/// The `usd::SchemaKind` constant a view reports itself as, and a declaration
+/// records its kind as.
+pub(super) fn kind_constant(kind: usd::SchemaKind) -> syn::Path {
+    let variant = Ident::new(
+        match kind {
+            usd::SchemaKind::AbstractBase => "AbstractBase",
+            usd::SchemaKind::AbstractTyped => "AbstractTyped",
+            usd::SchemaKind::ConcreteTyped => "ConcreteTyped",
+            usd::SchemaKind::NonAppliedApi => "NonAppliedApi",
+            usd::SchemaKind::SingleApplyApi => "SingleApplyApi",
+            usd::SchemaKind::MultipleApplyApi => "MultipleApplyApi",
+        },
+        Span::call_site(),
+    );
+    syn::parse_quote! { ::openusd::usd::SchemaKind::#variant }
+}
+
+/// The core trait one of the schema roots stands for.
+///
+/// Asked of the schema family, as [`is_root`] is, so the name that reaches here
+/// answers as the root it spells: a class deriving from a versioned `Typed`
+/// reaches [`Typed`](openusd::usd::Typed) like any other.
+fn root_trait(name: &tf::Token) -> syn::Path {
+    let (family, _) = usd::SchemaRegistry::parse_family_and_version(name);
+    match family.as_str() {
+        TYPED => syn::parse_quote! { ::openusd::usd::Typed },
+        API_SCHEMA_BASE => syn::parse_quote! { ::openusd::usd::APISchemaBase },
+        _ => syn::parse_quote! { ::openusd::usd::SchemaBase },
+    }
+}
+
+/// A property's documentation: what the schema said, then what the property is.
+fn documentation(property: &Property, symbols: &doc::Symbols<'_>) -> String {
+    // What the schema wrote arrives wrapped, from `to_markdown`; the sentence
+    // about the declaration is this crate's own and is wrapped here, so every
+    // line of a doc comment holds to one width.
+    let declared = doc::wrap(&declaration(property));
+    match property.documentation() {
+        Some(text) => format!("{}\n\n{declared}", doc::to_markdown(text, symbols)),
+        None => declared,
+    }
+}
+
+/// A property as a schema author would write it, then what it reads back as.
+fn declaration(property: &Property) -> String {
+    let mut text = format!("Declared `{}`.", declared_as(property));
+
+    text.push_str(&allowed_values(&property.allowed_tokens()));
+    text
+}
+
+/// The sentence listing the values a property admits, with its leading space,
+/// or nothing where it admits any.
+pub(super) fn allowed_values(allowed: &[tf::Token]) -> String {
+    if allowed.is_empty() {
+        return String::new();
+    }
+    // An allowed value can be the empty string, which upstream `usdRender`
+    // writes; an empty code span is no spelling of it, so it reads as the two
+    // quotes a schema author would write.
+    let listed: Vec<String> = allowed
+        .iter()
+        .map(|token| match token.as_str().is_empty() {
+            true => "`\"\"`".to_owned(),
+            false => format!("`{token}`"),
+        })
+        .collect();
+    format!(" One of {}.", listed.join(", "))
+}
+
+/// The property's declaration as USD writes one, e.g. `uniform token mode = "a"`.
+///
+/// Assembled from what the model says rather than read back out of a layer, with
+/// the fallback rendered by the `usda` writer so the one value a reader has to
+/// trust is spelled the way every USD file spells it.
+fn declared_as(property: &Property) -> String {
+    let mut text = String::new();
+    if property.shape.custom {
+        text.push_str("custom ");
+    }
+    if property.shape.variability == sdf::Variability::Uniform
+        && property.shape.spec_type != sdf::SpecType::Relationship
+    {
+        text.push_str("uniform ");
+    }
+
+    if property.shape.spec_type == sdf::SpecType::Relationship {
+        text.push_str("rel ");
+    } else {
+        let spelling = property
+            .type_name()
+            .map_or_else(|| "token".to_owned(), |name| name.serialization_name().to_string());
+        text.push_str(&spelling);
+        text.push(' ');
+    }
+    text.push_str(property.schematics_name.as_str());
+
+    if let Some(fallback) = property.fallback()
+        && let Ok(value) = usda::TextWriter::value_to_string(fallback)
+    {
+        text.push_str(&format!(" = {value}"));
+    }
+    text
+}

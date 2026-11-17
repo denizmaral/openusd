@@ -1,0 +1,5693 @@
+//! Layer DAG: the loaded layers and their sublayer structure.
+//!
+//! [`LayerGraph`] owns every [`sdf::Layer`] a stage depends on and the sublayer
+//! edges between them, keyed by the stable [`LayerId`]. It is the Rust
+//! analog of C++ `PcpLayerStack` for the layer-ownership half of composition;
+//! the composition index itself lives in [`IndexCache`](super::index_cache::IndexCache).
+//!
+//! Holding layers here (rather than inside the cache) lets a [`Stage`] borrow
+//! the layer data and the composition index independently. Composition reads
+//! the graph through a shared `&LayerGraph` parameter, so every per-prim build
+//! stays a pure function of `(graph, context, cached indices)`.
+//!
+//! A composed sublayer stack (the depth-first pre-order walk of a root's sublayer
+//! edges, with offsets composed) is interned in the
+//! [`LayerStackRegistry`](super::layer_stack::LayerStackRegistry) of the
+//! [`layer_stack`](super::layer_stack) module and addressed by a [`LayerStackId`];
+//! only composition roots get an instance, so a sublayer-only layer participates
+//! through its root's members rather than its own stack. The edges are always
+//! derived from each layer's `subLayers` metadata by
+//! [`recompute_sublayers`](LayerGraph::recompute_sublayers): both an ordinary
+//! `subLayers` authoring edit and the public
+//! [`Stage::insert_layer`](crate::usd::Stage::insert_layer) /
+//! [`remove_layer`](crate::usd::Stage::remove_layer) route through it, so
+//! editing `subLayers` updates the edges and the metadata stays the single
+//! source of truth — no DFS on every query, and no edge that fails to persist on
+//! save.
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::Hash;
+use std::mem;
+use std::ops::Deref;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use crate::ar::ResolvedPath;
+use crate::sdf::expr;
+use crate::sdf::schema::FieldKey;
+use crate::sdf::{self, LayerOffset, Path, RelocateList};
+use crate::tf;
+use crate::vt::Value;
+
+use super::compose_site::{EvaluatedExpression, evaluate_expression};
+use super::diagnostics::Diagnostics;
+use super::layer_stack::{ExprVarId, LayerStackId, LayerStackRegistry, StackMarks, StackVarsDelta, VarsSource};
+use super::mapping::MapFunction;
+use super::prim_index::Demand;
+use super::relocates::{analyze_relocate_occurrences, chain_through_relocates, validate_layer_relocates};
+use super::{CompositionDiagnostic, ExpressionContext, effective_time_codes_per_second};
+
+/// A cheap, `Copy` handle identifying a layer within a `LayerGraph`.
+///
+/// Graph-assigned (interned) as layers are added, not derived from content, so
+/// it is unique by construction — no hashing and no collision. It is opaque:
+/// resolve it back to an identifier with
+/// [`Stage::layer_identifier`](crate::usd::Stage::layer_identifier). Authoring
+/// callers address layers by identifier string instead; this handle is what
+/// composition introspection (the [`PrimIndex`](super::PrimIndex) nodes) hands
+/// back.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct LayerId(u32);
+
+impl LayerId {
+    /// A sentinel never assigned to a real layer, for degenerate fallbacks (an
+    /// empty layer stack's synthetic root, an unresolvable edit target).
+    pub(crate) const INVALID: LayerId = LayerId(u32::MAX);
+
+    /// Wraps a raw graph-assigned index. Only [`LayerGraph`] mints ids in
+    /// production; tests use it to build synthetic handles.
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Whether this names a real layer rather than [`INVALID`](Self::INVALID).
+    pub(crate) const fn is_valid(self) -> bool {
+        self.0 != Self::INVALID.0
+    }
+}
+
+/// Stable identity of a stage's root layer stack, by composition input.
+///
+/// The Rust analog of C++ `PcpLayerStackIdentifier`, which keys a
+/// `PcpLayerStack` by `(rootLayer, sessionLayer, pathResolverContext)`. Two
+/// stages opened from the same root and session under a resolver with the same
+/// [`identity`](crate::ar::Resolver::identity) are the same composition input,
+/// so their identifiers compare equal. Used to tag a stage-bound
+/// [`EditTarget`](crate::usd::EditTarget) so one built against a stage's
+/// composition is rejected by an unrelated stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerStackIdentifier {
+    /// Canonical identifier of the root layer.
+    pub root_layer: String,
+    /// Canonical identifier of the strongest session layer, if any.
+    pub session_layer: Option<String>,
+    /// The resolver's [`identity`](crate::ar::Resolver::identity) token — the
+    /// configuration the stack's asset paths resolve under.
+    pub resolver: String,
+}
+
+/// A composed layer stack by value — the transferable counterpart of the
+/// graph-local `LayerStackId`, the value form of C++ `PcpLayerStackIdentifier`
+/// with its recursive `expressionVariablesOverrideSource`. An arc-based edit
+/// target carries one so the stack resolves by content on whichever equal-input
+/// stage installs it, where the numeric handles differ. Total over every stack,
+/// the root included, so capture and resolve sites need no root special case.
+/// Captured by `LayerGraph::stack_identity` and resolved by
+/// `LayerGraph::resolve_stack_identity`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StackIdentity {
+    /// The stage root layer stack.
+    Root,
+    /// A reference/payload target stack: the target root layer's canonical
+    /// identifier plus its variable source chain — each element the canonical
+    /// identifier of a source stack's target root, ordered outermost (seeded by
+    /// the stage root stack) first, with an empty chain meaning the root
+    /// source.
+    Target {
+        /// Canonical identifier of the target root layer.
+        root: String,
+        /// Canonical identifiers of the variable source chain's target roots,
+        /// outermost first.
+        source_chain: Vec<String>,
+    },
+}
+
+/// A layer's resolved sublayer edges in declared order: each child paired with
+/// the effective layer offset for that hop (the authored `subLayerOffset` with
+/// the time-codes-per-second retiming folded in, per spec 10.3.1.1 / 12.3.2).
+type SublayerEdges = Vec<(LayerId, LayerOffset)>;
+
+/// A single layer in the [`LayerGraph`].
+pub(crate) struct LayerNode {
+    /// The stage's subscription to the layer's commits, ended before the
+    /// handle is released (fields drop in declaration order).
+    subscription: Option<sdf::Subscription>,
+    /// The loaded layer, held in the registry's store. Composition reads its
+    /// content through a [`LayerView`]; the graph's own maintenance borrows
+    /// the store directly.
+    handle: sdf::LayerHandle,
+    /// This layer's context-free [`SublayerEdges`]: its `subLayers` resolved against
+    /// the empty expression-variable set, so literal sublayers resolve and `${VAR}`
+    /// sublayers drop out. Shared by every stack with no expression sublayer, where
+    /// the members are context-independent; a stack with an expression sublayer
+    /// re-resolves its subtree against the stack's variables in
+    /// [`compose_stack_edges`](LayerGraph::compose_stack_edges) instead, so these are
+    /// not duplicated per stack instance.
+    pub children: SublayerEdges,
+    /// Whether this layer authors at least one expression-valued (`${VAR}`)
+    /// `subLayers` entry — a purely local property of its own `subLayers`, not its
+    /// composed subtree. Recomputed by
+    /// [`build_sublayer_edges`](LayerGraph::build_sublayer_edges), it lets
+    /// [`has_expr_sublayer`](LayerGraph::has_expr_sublayer) decide whether a stack's
+    /// members depend on the expression-variable context by reading a bool per
+    /// member rather than re-decoding `subLayers`.
+    pub has_expr_sublayer: bool,
+    /// The structurally valid authored `layerRelocates` pairs `(source, target)`
+    /// in this layer's own namespace. Stack queries apply duplicate-source and
+    /// conflict rules for the ambient layer stack. Empty when the layer authors
+    /// none.
+    pub relocates: RelocateList,
+}
+
+/// The layers [`LayerGraph::remove_layers`] took out of the graph, held until
+/// the caller drops this with every composition borrow released: each node's
+/// subscription ends, then its handle drops, and the registry frees the layer
+/// at its next sweep unless something else holds it. A freed layer's sinks
+/// drop with it, and a sink's drop may reach the stage.
+pub(crate) struct DepartedLayers {
+    /// The identifiers that named the layers, every spelling included.
+    pub(crate) identifiers: Vec<String>,
+    /// The nodes, held so no read of the store frees a layer early.
+    _nodes: Vec<LayerNode>,
+}
+
+impl LayerNode {
+    /// A node holding `handle`, with no edges and no relocates. The sublayer
+    /// edges, expression-sublayer flag, and relocates are filled in by
+    /// [`LayerGraph::recompute_sublayers`].
+    fn new(handle: sdf::LayerHandle) -> Self {
+        Self {
+            subscription: None,
+            handle,
+            children: Vec::new(),
+            has_expr_sublayer: false,
+            relocates: Vec::new(),
+        }
+    }
+}
+
+/// The loaded layers and their sublayer DAG.
+///
+/// Corresponds to a simplified C++ `PcpLayerStack`: it owns the layers but not
+/// the composed prim indices. Composition queries reach a layer by its
+/// [`LayerId`] in O(1).
+pub(crate) struct LayerGraph {
+    /// Every layer, keyed by id.
+    nodes: HashMap<LayerId, LayerNode>,
+    /// Exact `identifier → id` index, so a layer is resolved by its canonical
+    /// identifier (the public authoring surface) in O(1), and a re-added
+    /// identifier collapses onto its existing id.
+    by_identifier: HashMap<String, LayerId>,
+    /// `real path → id` for every layer whose resolved location differs from
+    /// its identifier — one found through a resolver search directory keeps
+    /// the search path as its identifier — so the layer also answers to the
+    /// spelling its file has (C++ `Sdf_LayerRegistry`'s by-real-path index,
+    /// consulted by `SdfLayer::Find` after the identifier). The first layer
+    /// interned at a real path keeps it.
+    by_real_path: HashMap<String, LayerId>,
+    /// Next id to mint. Monotonic for the life of the graph, so a removed id is
+    /// never reused for a different layer within a session.
+    next_id: u32,
+    /// All layer ids in collection order. Iteration order is deterministic, so
+    /// identifier listing and sublayer-stack composition are stable. The
+    /// first [`session_layer_count`](Self::session_layer_count) entries are the
+    /// session layers collected at open, in strength order; the session root is
+    /// `order[0]`. Root-stack membership derives from a sublayer walk rooted
+    /// there, not from this prefix, so a session sublayer loaded at runtime
+    /// composes without joining it.
+    order: Vec<LayerId>,
+    /// Number of open-time session layers at the front of [`order`](Self::order).
+    session_layer_count: usize,
+    /// The root layer's id (the first non-session layer), if any.
+    root: Option<LayerId>,
+    /// The muted layers that are loaded, by id — the muted set proper, excluded
+    /// when materializing the stacks (C++ `PcpLayerStack::_BuildLayerStack`). A
+    /// muted layer and its whole sublayer subtree are pruned from every stack,
+    /// and a layer reclamation frees them; one freed stays muted through
+    /// [`pending_mutes`](Self::pending_mutes). Keyed by identity, so
+    /// every spelling of one layer — its identifier, or the real path of one
+    /// found through a search directory — mutes, unmutes and reads as the same
+    /// entry. Never holds the root layer, which cannot be muted ("would lead to
+    /// empty layer stacks"). Empty by default, leaving composition unchanged.
+    muted: HashSet<LayerId>,
+    /// Canonical identifiers muted while no loaded layer answers to them (C++
+    /// `Pcp_MutedLayers` keeps every request as a string; here a request that
+    /// names a loaded layer goes straight into [`muted`](Self::muted)). A path
+    /// is reduced to this canonical form by
+    /// [`canonical_muted_id`](Self::canonical_muted_id), anchored against the
+    /// root layer, so a not-yet-loaded reference/payload target
+    /// matches the identifier it will be interned under, and the entry moves to
+    /// `muted` the moment such a layer is interned
+    /// ([`resolve_muted_ids`](Self::resolve_muted_ids)).
+    pending_mutes: HashSet<String>,
+    /// Every other spelling of each muted layer that left the graph, its
+    /// other registered identifiers and its real path, to the identifier its
+    /// mute is kept under in [`pending_mutes`](Self::pending_mutes), so each
+    /// still reads as the same mute.
+    freed_aliases: HashMap<String, String>,
+    /// Whether any node keeps structurally valid authored relocates. The indexer
+    /// reads this to gate its relocate passes without rescanning.
+    has_relocates: bool,
+    /// The diagnostics this graph owns outright — see [`GraphDiagnostics`].
+    /// The per-stack sublayer buckets are not here: they belong to
+    /// [`SublayerState`], which replaces a stack's diagnostics and its pending
+    /// demands together.
+    diagnostics: GraphDiagnostics,
+    /// Loads layers: the resolver that anchors relative asset paths (its
+    /// [`identity`](crate::ar::Resolver::identity) is the resolver component
+    /// of a stack's
+    /// [`LayerStackIdentifier`](super::LayerStackIdentifier)) and the format
+    /// registry.
+    /// Composition opens a reference/payload target on demand through it.
+    registry: sdf::LayerRegistry,
+    /// The registry's store, which holds every layer the graph's nodes name,
+    /// shared with every stage on the registry. Held so a [`view`](Self::view)
+    /// can borrow it for as long as it borrows the graph.
+    store: Rc<sdf::LayerStore>,
+    /// Anchored asset paths whose on-demand open failed, each mapped to what
+    /// went wrong ([`LoadFailure`]). Consulted at the reference/payload demand
+    /// point so a target that cannot be opened is reported
+    /// [`MalformedLayer`](CompositionDiagnostic::MalformedLayer) once (with the arc's site
+    /// context and the failure's reason) rather than re-demanded every pass —
+    /// without it the demanding prim's index would never cache — and at
+    /// sublayer-demand derivation
+    /// ([`file_stack_discoveries`](Self::file_stack_discoveries)), which
+    /// regenerates a failed entry's per-referrer diagnostic instead of a
+    /// demand. Written only at the stage's load barrier through `&mut self`;
+    /// read during composition, and cleared when an edit changes the layers so
+    /// a now-readable asset is retried.
+    failed_loads: HashMap<String, LoadFailure>,
+    /// Every composed layer stack against this graph — the stage root stack, plus
+    /// each reference/payload target's stack under whatever variable sources have
+    /// reached it (see [`LayerStackRegistry`]). The graph composes a stack's members
+    /// (it owns the layers) through [`build_stack_members`](Self::build_stack_members)
+    /// and hands them to the registry, which owns the storage and interning. A
+    /// [`LayerStackId`] is an index into it.
+    stacks: LayerStackRegistry,
+    /// The sublayer-resolution subsystem: what the `subLayers` walks derive and
+    /// carry beyond the composed edges themselves (see [`SublayerState`]).
+    sublayers: SublayerState,
+    /// The sublayer-DAG-root stacks minted once at finalize
+    /// ([`mint_eager_target_stacks`](Self::mint_eager_target_stacks)),
+    /// permanently marked in every sweep: their layers stay open for the
+    /// graph's life and nothing else re-mints them.
+    eager_stacks: Vec<LayerStackId>,
+    /// Whether a stack sweep removed a stack, or a clip set released a
+    /// layer ([`mark_reclaim_due`](Self::mark_reclaim_due)), since the layers
+    /// were last reclaimed.
+    reclaim_due: bool,
+    /// The layers the last reclaim kept only for a pin that can lapse
+    /// ([`Reclaimable::lapsing`]): a reclaim is due once one lapses.
+    lapsing: Vec<LayerId>,
+    /// The layers the graph holds only for value clips, which take no part in
+    /// composition: no stack holds one, its `subLayers` are not resolved, and
+    /// its relocates are neither validated nor reported. A layer joins this
+    /// set when a clip opens it ([`join_clip`](Self::join_clip)) or when a
+    /// reclaim finds composition no longer uses it while a clip set reads it
+    /// ([`remove_layers`](Self::remove_layers)). It leaves when a composition
+    /// join reaches it ([`ensure_layer`](Self::ensure_layer)), which wires it
+    /// like a layer newly loaded, or when it leaves the graph.
+    clip_only: HashSet<LayerId>,
+}
+
+/// The diagnostic buckets a [`LayerGraph`] replaces on its own rebuilds.
+///
+/// Two buckets rather than one because they refresh independently: an edge
+/// rebuild replaces the cycles, a relocate recompute replaces the relocates,
+/// and a relocate-only edit must not disturb the other. Sublayer diagnostics
+/// are absent by the same reasoning — theirs is a *per-stack* lifetime that
+/// [`SublayerState`] refreshes alongside that stack's pending demands.
+#[derive(Debug, Default)]
+struct GraphDiagnostics {
+    /// Sublayer cycles reachable from the root layer, replaced wholesale by
+    /// [`build_sublayer_edges`](LayerGraph::build_sublayer_edges) on every edge
+    /// rebuild so a fixed cycle stops being reported.
+    cycles: Diagnostics,
+    /// Validated-relocate diagnostics, replaced wholesale by
+    /// [`recompute_relocates`](LayerGraph::recompute_relocates) on every
+    /// relocate rebuild.
+    relocates: Diagnostics,
+}
+
+impl GraphDiagnostics {
+    /// Both buckets, cycles first. A cycle is why a relocate went unvalidated
+    /// far more often than the reverse, so it reads first.
+    fn iter(&self) -> impl Iterator<Item = &CompositionDiagnostic> {
+        self.cycles.iter().chain(&self.relocates)
+    }
+}
+
+/// The [`LayerGraph`]'s sublayer-resolution subsystem: everything the
+/// `subLayers` walks derive beyond the composed edges themselves — the shared
+/// path-resolution memo, the context-free misses, the pending load demands,
+/// and the per-stack diagnostics. One invariant ties the mutable pieces
+/// together: a stack's re-resolution supersedes its earlier discoveries
+/// ([`replace_stack`](Self::replace_stack)), so demands and diagnostics always
+/// reflect each stack's latest rebuild.
+#[derive(Default)]
+struct SublayerState {
+    /// Whether any node authors an expression-valued (`${VAR}`) `subLayers` entry.
+    /// A false value lets [`LayerGraph::has_expr_sublayer`] short-circuit to
+    /// `false` for the overwhelmingly common stage with no expression sublayers,
+    /// so `LayerGraph::build_stack_members` never scans a stack for them.
+    /// Recomputed with the per-node flags by
+    /// `LayerGraph::recompute_expr_sublayer_flags`.
+    any_expr: bool,
+    /// Memoized sublayer-path resolution, `parent layer → (authored sub-path →
+    /// resolved identifier)`, keyed by the entry's authored spelling (`./x` and
+    /// `x` are different entries: the resolver anchors the first and treats the
+    /// second as a search path). `LayerGraph::resolve_edges` anchors each
+    /// relative `subLayers` entry against its parent through the resolver — a
+    /// filesystem canonicalize — and re-runs the whole walk on every
+    /// `LayerGraph::build_sublayer_edges`, i.e. every `subLayers` edit. Only a
+    /// stable identifier is memoized — an absolute one naming an interned
+    /// layer — so it is computed once and reused, and looked up live with
+    /// [`LayerGraph::id_of`], which misses once the layer leaves the graph. A
+    /// search-path or unresolved entry is never memoized: its identifier
+    /// follows the filesystem beside its parent, so
+    /// `LayerGraph::resolve_sublayer` derives it afresh on every rebuild, as
+    /// C++ `_BuildLayerStack` derives every entry.
+    resolution: HashMap<LayerId, HashMap<String, String>>,
+    /// Sublayer entries that resolved to no loaded layer under the empty
+    /// context, keyed by the authoring parent — the table a stack on the
+    /// context-free `collect_plain` fast path consults to record load demands
+    /// without re-decoding `subLayers` (its edges are exactly the context-free
+    /// ones). Replaced by [`set_plain_misses`](Self::set_plain_misses) for the
+    /// parents each edge build re-resolves; a stack with an expression
+    /// sublayer records its unresolved entries directly from its contextual
+    /// re-resolution instead.
+    // TODO(perf): a permanently missing literal keeps this table non-empty, so
+    // every plain-stack rebuild re-scans its members to regenerate the
+    // diagnostic; a per-parent presence flag on `LayerNode` would shortcut
+    // stacks with no unresolved entries.
+    unresolved_plain: HashMap<LayerId, Vec<String>>,
+    /// Parents with a context-free `subLayers` entry that resolved through the
+    /// bare in-memory fallback. A layer joining under the entry's anchored
+    /// identifier takes it over. With the parents in
+    /// [`unresolved_plain`](Self::unresolved_plain), these are the layers whose
+    /// edges a join can change ([`LayerGraph::wire_joined`]).
+    fallback_plain: HashSet<LayerId>,
+    /// Stacks whose last composition met an entry naming no layer interned
+    /// under its anchored identifier: unresolved, or resolved through the bare
+    /// in-memory fallback. A joining layer can extend such a stack without
+    /// changing any context-free edge (a `${VAR}`-selected entry).
+    /// [`LayerGraph::wire_joined`] recomposes them.
+    unsettled: HashSet<LayerStackId>,
+    /// The [`SublayerDemand`]s the last stack recompose or mint discovered,
+    /// awaiting the stage's load barrier
+    /// ([`LayerGraph::take_sublayer_demands`]). A plain `Vec` mutated through
+    /// `&mut self`, like the cache's pending arc demands; each stack's entries
+    /// reflect its latest rebuild ([`replace_stack`](Self::replace_stack)).
+    pending_demands: Vec<SublayerDemand>,
+    /// Per-stack sublayer diagnostics: `${VAR}` expression failures
+    /// ([`CompositionDiagnostic::InvalidExpression`] with the sublayer context) and the
+    /// per-referrer load failures of unresolved entries
+    /// ([`CompositionDiagnostic::UnresolvedSublayer`] / [`CompositionDiagnostic::MalformedSublayer`]). Each
+    /// stack's bucket is replaced on its contextual re-resolution — load
+    /// failures re-derived from `LayerGraph::failed_loads` — so a fixed
+    /// expression or a removed entry stops being reported; the load barrier
+    /// appends a freshly discovered failure between rebuilds
+    /// ([`record_error`](Self::record_error)). Keyed by stack in mint order, so
+    /// the [`diagnostics`](Self::diagnostics) listing is deterministic.
+    errors: BTreeMap<LayerStackId, Diagnostics>,
+}
+
+impl SublayerState {
+    /// Replaces `stack`'s discoveries — its pending demands and its error
+    /// bucket — with a fresh re-resolution's. The supersession invariant: a
+    /// stale demand or diagnostic could name an entry a mute or edit just
+    /// removed, so both always reflect the stack's latest rebuild.
+    fn replace_stack(&mut self, stack: LayerStackId, demands: Vec<SublayerDemand>, errors: Diagnostics) {
+        self.pending_demands.retain(|demand| demand.stack != stack);
+        self.pending_demands.extend(demands);
+        if errors.is_empty() {
+            self.errors.remove(&stack);
+        } else {
+            self.errors.insert(stack, errors);
+        }
+    }
+
+    /// Appends a diagnostic to `stack`'s bucket — the load barrier's channel
+    /// for a failure discovered between rebuilds; the stack's next
+    /// re-resolution re-derives or drops it
+    /// ([`replace_stack`](Self::replace_stack)).
+    fn record_error(&mut self, stack: LayerStackId, error: CompositionDiagnostic) {
+        self.errors.entry(stack).or_default().report(error);
+    }
+
+    /// Marks the stack of every pending demand live for a sweep: the load
+    /// barrier is about to read those stacks' variables, so a demanded stack
+    /// always survives the sweep it is marked for.
+    fn mark_demanded(&self, marks: &mut StackMarks) {
+        for demand in &self.pending_demands {
+            marks.mark(demand.stack);
+        }
+    }
+
+    /// Drops the diagnostic buckets of stacks a sweep removed, so
+    /// [`diagnostics`](Self::diagnostics) and the failure requeue never
+    /// resurrect a reclaimed stack.
+    fn retire_stacks(&mut self, removed: &[LayerStackId]) {
+        for id in removed {
+            self.errors.remove(id);
+            self.unsettled.remove(id);
+        }
+    }
+
+    /// Drops what the sublayer resolution recorded for the parents in `dead`,
+    /// layers leaving the graph. A memoized identifier naming a departed layer
+    /// is looked up live, so it reads as unresolved.
+    fn forget(&mut self, dead: &HashSet<LayerId>) {
+        self.resolution.retain(|parent, _| !dead.contains(parent));
+        self.unresolved_plain.retain(|parent, _| !dead.contains(parent));
+        self.fallback_plain.retain(|parent| !dead.contains(parent));
+    }
+
+    /// Drains the pending demands for the stage's load barrier.
+    fn take_demands(&mut self) -> Vec<SublayerDemand> {
+        mem::take(&mut self.pending_demands)
+    }
+
+    /// Replaces the context-free unresolved and fallback-resolved entries of
+    /// `parents` — every parent when `None` — with those one edge build's
+    /// `sink` recorded for them.
+    fn set_plain_misses(&mut self, parents: Option<&HashSet<LayerId>>, sink: EdgeSink) {
+        match parents {
+            None => {
+                self.unresolved_plain.clear();
+                self.fallback_plain.clear();
+            }
+            Some(parents) => {
+                self.unresolved_plain.retain(|parent, _| !parents.contains(parent));
+                self.fallback_plain.retain(|parent| !parents.contains(parent));
+            }
+        }
+        for (parent, evaluated) in sink.demands {
+            self.unresolved_plain.entry(parent).or_default().push(evaluated);
+        }
+        self.fallback_plain.extend(sink.fallbacks);
+    }
+
+    /// Every per-stack diagnostic, in stack mint order.
+    fn diagnostics(&self) -> impl Iterator<Item = &CompositionDiagnostic> {
+        self.errors.values().flatten()
+    }
+}
+
+/// What a reclaim found ([`LayerGraph::unused_layers`]).
+pub(crate) struct Reclaimable {
+    /// The layers nothing keeps, to leave the graph.
+    pub(crate) unused: HashSet<LayerId>,
+    /// The layers composition no longer uses that value clips read, to take
+    /// out of composition ([`LayerGraph::remove_layers`]).
+    pub(crate) demoted: HashSet<LayerId>,
+    /// Whether the next reclaim runs whether or not a sweep removes a stack.
+    pub(crate) retry: bool,
+    /// The layers kept only for a pin that can lapse: one in `pins`, or one
+    /// with unsaved edits.
+    pub(crate) lapsing: Vec<LayerId>,
+}
+
+/// Which layers a reclaim ([`LayerGraph::unused_layers`]) may free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Reclaim {
+    /// Every layer nothing keeps.
+    Unused,
+    /// Only the muted layers still in the graph, and the sublayers only they
+    /// brought in.
+    Muted,
+}
+
+/// What a [`mute_layer`](LayerGraph::mute_layer) or
+/// [`unmute_layer`](LayerGraph::unmute_layer) actually changed, returned only
+/// when the muted set changed.
+pub(crate) struct MuteChange {
+    /// The identity whose muted state toggled: a loaded layer's interned
+    /// identifier, or the canonical identifier a not-yet-loaded layer is muted
+    /// under. The stage notifies it, not the spelling the caller passed, so a
+    /// listener mirroring the muted set stays in sync (C++ reports the canonical
+    /// id it toggled).
+    pub(crate) changed: String,
+    /// The stacks whose cached prim indices the change can invalidate: those
+    /// holding a layer of the [`mute_fanout`](LayerGraph::mute_fanout), or one
+    /// whose relocate pairs the toggle changed, before or after the toggle.
+    /// Muting a stack's root empties the stack. Its prims are found through the
+    /// stacks that held the root before the recompose, as C++
+    /// `PcpChanges::_DidMuteLayer` looks up the layer stacks using the muted
+    /// layer before they are recomposed.
+    pub(crate) stacks: BTreeSet<LayerStackId>,
+}
+
+/// The layer stack a reference/payload arc to an external target should compose
+/// against, the result of [`LayerGraph::external_stack_id`]. Centralizes the
+/// stack-selection decision so the indexer and the load barrier do not each
+/// re-encode it.
+pub(crate) enum ExternalStack {
+    /// The stack is composed and ready; compose the arc against this handle.
+    Ready(LayerStackId),
+    /// No instance exists yet for this `(target, source)`; the arc must record a
+    /// [`Demand`](super::Demand) so the load barrier mints it (and opens any
+    /// `${VAR}` sublayers the context resolves), after which the query re-runs.
+    Demand,
+}
+
+/// A composed stack's unresolved `subLayers` entry — `${VAR}`-selected or
+/// literal — naming a layer not yet in the graph. Recorded while a stack's
+/// members are composed (a [`rebuild_sublayer_stacks`](LayerGraph::rebuild_sublayer_stacks)
+/// pass or a mint) and drained by the stage's load barrier
+/// ([`take_sublayer_demands`](LayerGraph::take_sublayer_demands)), which opens
+/// the layer under the demanding stack's composed expression variables and
+/// recomposes — the sublayer analog of a reference/payload [`Demand`].
+#[derive(Debug, Clone)]
+pub(crate) struct SublayerDemand {
+    /// The layer whose `subLayers` entry did not resolve: the anchor for the
+    /// entry's relative path, and the referrer diagnostics name.
+    pub(crate) parent: LayerId,
+    /// The stack the entry composes into. Its composed expression variables are
+    /// the context the demanded layer's own sublayers resolve under, and the
+    /// barrier dedups open attempts per `(identifier, stack)`.
+    pub(crate) stack: LayerStackId,
+    /// The entry's evaluated asset path (the authored path for a literal).
+    pub(crate) evaluated: String,
+}
+
+/// What [`LayerGraph::recompute_sublayers`] found: the layers whose composed
+/// state shifted (the cache-eviction scope) and the per-stack composed
+/// expression-variable changes the rebuild emitted. Change processing
+/// (`pcp::Changes::apply`) consumes both; the mute and load paths use only
+/// [`affected`](Self::affected) — a mute's blanket fanout already covers any
+/// variable shift, and a load never changes a stack's composed variables (they
+/// read only the root layer and seed, both already present).
+pub(crate) struct SublayerRecompute {
+    /// The layers whose composed edges or relocate pairs changed, unioned with
+    /// the edited set.
+    pub(crate) affected: HashSet<LayerId>,
+    /// The stacks whose composed expression variables (or their source)
+    /// changed, in dependency order.
+    pub(crate) vars_deltas: Vec<StackVarsDelta>,
+}
+
+/// Why a prior on-demand open of an asset failed, memoized in
+/// [`failed_loads`](LayerGraph::failed_loads) so composition stops retrying
+/// the asset and every referrer's diagnostic can be re-derived from it. An
+/// [`Unreadable`](Self::Unreadable) failure is terminal until a retry, a
+/// reload, or an edit that composes a prim naming the asset again clears
+/// it; an
+/// [`Unresolved`](Self::Unresolved) one blocks nothing once the asset
+/// resolves again (the file has since appeared).
+#[derive(Debug, Clone)]
+pub(crate) enum LoadFailure {
+    /// The asset path did not resolve to a physical location.
+    Unresolved,
+    /// It resolved but could not be read or parsed, with what went wrong,
+    /// shared by every referrer the failure is reported to.
+    Unreadable(Arc<sdf::layer_registry::LoadError>),
+}
+
+impl LoadFailure {
+    /// The per-referrer sublayer diagnostic for this failure: the entry
+    /// `asset_path`, authored by `introduced_by`, names an asset that did not
+    /// resolve or could not be read.
+    pub(crate) fn sublayer_error(&self, asset_path: &str, introduced_by: &str) -> CompositionDiagnostic {
+        match self {
+            LoadFailure::Unresolved => CompositionDiagnostic::UnresolvedSublayer {
+                asset_path: asset_path.to_string(),
+                introduced_by: introduced_by.to_string(),
+            },
+            LoadFailure::Unreadable(error) => CompositionDiagnostic::MalformedSublayer {
+                asset_path: asset_path.to_string(),
+                introduced_by: introduced_by.to_string(),
+                reason: tf::error_chain(&**error),
+            },
+        }
+    }
+}
+
+/// Which layers an edge rebuild ([`LayerGraph::build_sublayer_edges`])
+/// re-resolves, and which stacks it recomposes.
+#[derive(Clone, Copy)]
+enum EdgeScope<'a> {
+    /// Every layer and every stack.
+    All,
+    /// Every layer, and the stacks reaching either a layer whose edges changed
+    /// or one of these layers, whose `subLayers` or `expressionVariables` were
+    /// authored.
+    Edited(&'a HashSet<LayerId>),
+    /// These layers, which just joined the graph, and the parents whose
+    /// entries a join can take over ([`SublayerState::unresolved_plain`],
+    /// [`SublayerState::fallback_plain`]). The stacks it recomposes are those
+    /// reaching a joined layer or a layer whose edges changed, and those a join
+    /// can extend ([`SublayerState::unsettled`]).
+    Joined(&'a HashSet<LayerId>),
+}
+
+/// What a sublayer-edge resolution pass discovers beyond the edges themselves,
+/// tagged by the authoring parent so the consumer can drop what a muted branch
+/// keeps out of the composed stack. The default sink records demands only —
+/// the shape the context-free pass wants, whose empty context legitimately
+/// fails every expression and must record neither the failures nor their names
+/// as dependencies.
+#[derive(Default)]
+struct EdgeSink {
+    /// Unresolved entries as `(parent, evaluated path)`.
+    demands: Vec<(LayerId, String)>,
+    /// Parents of entries that resolved through the bare in-memory fallback.
+    fallbacks: Vec<LayerId>,
+    /// The buckets only a stack's contextual re-resolution fills, or `None` to
+    /// skip recording them.
+    contextual: Option<ContextualSink>,
+}
+
+/// The [`EdgeSink`] buckets a stack's contextual re-resolution fills beyond
+/// the load demands: `${VAR}` evaluation diagnostics and the variable names
+/// those evaluations read — successes and failures alike, an undefined name
+/// being a dependency too.
+#[derive(Default)]
+struct ContextualSink {
+    /// Expression diagnostics as `(parent, diagnostic)`. Tagged staging state:
+    /// the key is needed until `drain` keeps only the entries whose parent
+    /// composes into the stack's members, which is where they become a
+    /// [`Diagnostics`].
+    diagnostics: Vec<(LayerId, CompositionDiagnostic)>,
+    /// Variable names the `${VAR}` evaluations requested, as `(parent, name)`.
+    used_vars: Vec<(LayerId, String)>,
+}
+
+impl EdgeSink {
+    /// A sink for a stack's contextual re-resolution: demands, diagnostics, and
+    /// used variable names.
+    fn contextual() -> Self {
+        Self {
+            demands: Vec::new(),
+            fallbacks: Vec::new(),
+            contextual: Some(ContextualSink::default()),
+        }
+    }
+
+    /// Splits the sink into stack-stamped demands, bare diagnostics, and the
+    /// deduplicated used-variable names, keeping only entries whose parent
+    /// composes into `members`.
+    fn drain(
+        self,
+        stack: LayerStackId,
+        members: &HashSet<LayerId>,
+    ) -> (Vec<SublayerDemand>, Diagnostics, HashSet<String>) {
+        let demands = self
+            .demands
+            .into_iter()
+            .filter(|(parent, _)| members.contains(parent))
+            .map(|(parent, evaluated)| SublayerDemand {
+                parent,
+                stack,
+                evaluated,
+            })
+            .collect();
+        let ContextualSink { diagnostics, used_vars } = self.contextual.unwrap_or_default();
+        let errors = diagnostics
+            .into_iter()
+            .filter(|(parent, _)| members.contains(parent))
+            .map(|(_, diagnostic)| diagnostic)
+            .collect();
+        let used_vars = used_vars
+            .into_iter()
+            .filter(|(parent, _)| members.contains(parent))
+            .map(|(_, name)| name)
+            .collect();
+        (demands, errors, used_vars)
+    }
+}
+
+impl LayerGraph {
+    /// Builds the graph from collected layers in strength order (session layers
+    /// first, then the root layer and the rest). The recoverable layer-stack
+    /// errors it detects (sublayer cycles, invalid relocates) are stored on the
+    /// graph and read back through [`errors`](Self::errors).
+    /// An empty graph that opens layers through `registry`. Layers join via
+    /// [`ensure_layer`](Self::ensure_layer); [`finalize`](Self::finalize) wires
+    /// the sublayer DAG once they are all added. The stage builds a graph this way
+    /// so it can attach a change sink to each layer as it joins;
+    /// [`from_layers`](Self::from_layers) is the all-at-once convenience.
+    pub(crate) fn new(registry: sdf::LayerRegistry) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            by_identifier: HashMap::new(),
+            by_real_path: HashMap::new(),
+            next_id: 0,
+            order: Vec::new(),
+            session_layer_count: 0,
+            root: None,
+            pending_mutes: HashSet::new(),
+            freed_aliases: HashMap::new(),
+            muted: HashSet::new(),
+            has_relocates: false,
+            diagnostics: GraphDiagnostics::default(),
+            store: registry.store(),
+            registry,
+            failed_loads: HashMap::new(),
+            stacks: LayerStackRegistry::default(),
+            sublayers: SublayerState::default(),
+            eager_stacks: Vec::new(),
+            reclaim_due: false,
+            lapsing: Vec::new(),
+            clip_only: HashSet::new(),
+        }
+    }
+
+    /// Set the session/root layers and wire the sublayer DAG from each layer's
+    /// authored `subLayers` metadata (resolving relocates), after the layers have
+    /// been added. `root` is the stage root layer's id and `session_layer_count`
+    /// the number of distinct session layers at the front of the collection. The
+    /// post-add half of construction, shared by [`from_layers`](Self::from_layers)
+    /// and the stage builder, which adds layers one at a time.
+    ///
+    /// `session_count` counts only the distinct session-region layers that
+    /// survive into [`order`](Self::order), so [`session_layers`](Self::session_layers)
+    /// (which slices the prefix) never over-reads when the caller passed duplicate
+    /// identifiers (the same dependency reached through both the session and root
+    /// collections). `root` is captured at the original root slot rather than
+    /// derived from `order`, so a root identifier that already appeared in the
+    /// session collection still points at the right layer.
+    pub(crate) fn finalize(&mut self, session_layer_count: usize, root: Option<LayerId>) {
+        self.session_layer_count = session_layer_count;
+        self.root = root;
+        // A full pass returns no scoped set; finalize re-resolves every stack.
+        // The first composition's vars deltas are discarded too — nothing is
+        // cached yet, so there is nothing to invalidate against them.
+        let _ = self.build_sublayer_edges(EdgeScope::All);
+        self.mint_eager_target_stacks();
+        self.recompute_relocates();
+    }
+
+    /// Adds the layer `handle` names as a node, minting a fresh [`LayerId`]
+    /// and recording it in [`by_identifier`](Self::by_identifier) and
+    /// [`order`](Self::order). Returns `(id, fresh)`: an identifier already
+    /// present is left untouched (its existing node, children, and relocates
+    /// survive) and reported as not fresh, so a re-added layer collapses onto
+    /// its existing id. Callers key one-time per-layer setup (e.g. subscribing
+    /// the stage's recorder) off `fresh` so a re-added identifier is not set
+    /// up twice. A layer held only for value clips joins composition here
+    /// ([`clip_only`](Self::clip_only)) and is reported fresh, so the caller
+    /// wires it as a layer newly loaded; it is subscribed already
+    /// ([`is_subscribed`](Self::is_subscribed)).
+    ///
+    /// The node must exist before a `subLayers` edit naming its asset path is
+    /// rebuilt, so that [`build_sublayer_edges`](Self::build_sublayer_edges)'s
+    /// [`find_relative`](Self::find_relative) resolves the path to it.
+    pub(crate) fn ensure_layer(&mut self, layer: sdf::LoadedLayer) -> (LayerId, bool) {
+        let sdf::LoadedLayer {
+            identifier: requested,
+            handle,
+        } = layer;
+        debug_assert_eq!(
+            self.registry.in_memory_identifier(&requested),
+            requested,
+            "a layer joins the graph under its canonical identifier"
+        );
+        if let Some(&id) = self.by_identifier.get(&requested) {
+            return (id, self.clip_only.remove(&id));
+        }
+        // A second identifier for a file already interned names that layer (C++
+        // `Sdf_LayerRegistry::_Layers::Insert` collides on real path): the new
+        // identifier becomes an alias of the existing id. The registry may hand
+        // back a layer it holds under another spelling of the requested file,
+        // which the graph may already name.
+        let identifier = handle.identifier();
+        let real_path = handle
+            .anchor_location()
+            .and_then(|real_path| real_path.to_str())
+            .filter(|real_path| *real_path != identifier);
+        let existing = self
+            .by_identifier
+            .get(identifier)
+            .copied()
+            .or_else(|| self.id_of(real_path?));
+        if let Some(id) = existing {
+            self.by_identifier.insert(requested, id);
+            return (id, self.clip_only.remove(&id));
+        }
+        let id = LayerId::from_raw(self.next_id);
+        self.next_id += 1;
+        if let Some(real_path) = real_path {
+            self.by_real_path.entry(real_path.to_owned()).or_insert(id);
+        }
+        if requested != identifier {
+            self.by_identifier.insert(identifier.to_owned(), id);
+        }
+        self.by_identifier.insert(requested, id);
+        self.nodes.insert(id, LayerNode::new(handle));
+        self.order.push(id);
+        (id, true)
+    }
+
+    /// Resolves the `subLayers` of the layers `scope` names (every layer,
+    /// except for a join) into [`LayerNode::children`], the context-free edges,
+    /// folding the per-hop time-codes-per-second retiming into each edge
+    /// offset, then recomposes the stacks `scope` names. Replaces
+    /// [`cycles`](GraphDiagnostics::cycles) with the
+    /// sublayer-cycle errors reachable from the root layer (C++
+    /// `PcpErrorSublayerCycle`).
+    ///
+    /// A layer stack's expression variables come from its root layer, not its
+    /// sublayers (C++ `PcpExpressionVariables`), so `children` carry no
+    /// expression-variable context: each layer's `subLayers` resolve independently
+    /// against the empty variable set, a literal sublayer resolving and an
+    /// expression (`${VAR}`) sublayer dropping out. Expression sublayers are
+    /// resolved per-stack against the stack's variables in
+    /// [`compose_stack_edges`](Self::compose_stack_edges); the shared context-free
+    /// `children` feed only the stacks that have none.
+    ///
+    /// Returns the affected layer set for an edit (the layers whose composed
+    /// edges changed, unioned with the edited ones) so the caller can scope
+    /// cache eviction to the same stacks the re-resolution touched — `None` for
+    /// a full pass or a join — together with the [`StackVarsDelta`]s the stack
+    /// rebuild emitted.
+    fn build_sublayer_edges(&mut self, scope: EdgeScope<'_>) -> (Option<HashSet<LayerId>>, Vec<StackVarsDelta>) {
+        // The layers whose edges this pass re-resolves, every layer when `None`.
+        // A join changes another layer's edges only through an entry that names
+        // no layer under its anchored identifier. Beside the joined layers, the
+        // parents of such entries re-resolve.
+        let resolved: Option<HashSet<LayerId>> = match scope {
+            EdgeScope::All | EdgeScope::Edited(_) => None,
+            EdgeScope::Joined(joined) => Some(
+                joined
+                    .iter()
+                    .chain(self.sublayers.unresolved_plain.keys())
+                    .chain(&self.sublayers.fallback_plain)
+                    .copied()
+                    .collect(),
+            ),
+        };
+        // Refresh the expression-sublayer flags first, so the stack rebuild below
+        // reads them through `has_expr_sublayer` for its `collect_plain` fast-path
+        // gate. A join leaves every other layer's `subLayers` unchanged.
+        match scope {
+            EdgeScope::All | EdgeScope::Edited(_) => self.recompute_expr_sublayer_flags(None),
+            EdgeScope::Joined(joined) => self.recompute_expr_sublayer_flags(Some(joined)),
+        }
+        // Edges are resolved into a side buffer so the immutable `resolve_edges`
+        // borrow does not clash with the per-node mutation that applies them.
+        let mut all_edges: Vec<(LayerId, SublayerEdges)> = Vec::new();
+        // Take the resolution cache out so `resolve_edges` (which borrows `self`
+        // immutably) can fill it; it carries forward across rebuilds, so a
+        // `subLayers` edit only resolves paths it has not seen before.
+        let mut resolution = mem::take(&mut self.sublayers.resolution);
+
+        // Each layer's context-free edges depend only on its own `subLayers`
+        // resolved against the empty variable set, so one per-layer pass builds them
+        // all. The sink collects the entries that resolved to no loaded layer,
+        // which become the per-parent table plain stacks consult for load
+        // demands ([`SublayerState::unresolved_plain`]), and the parents resolved
+        // through the bare fallback.
+        let empty = HashMap::new();
+        let mut plain_sink = EdgeSink::default();
+        for &id in &self.order {
+            // A layer held only for value clips composes nothing, its sublayers
+            // included.
+            if self.clip_only.contains(&id) || resolved.as_ref().is_some_and(|resolved| !resolved.contains(&id)) {
+                continue;
+            }
+            let edges = self.resolve_edges(id, &empty, &mut resolution, Some(&mut plain_sink));
+            all_edges.push((id, edges));
+        }
+        self.sublayers.resolution = resolution;
+        self.sublayers.set_plain_misses(resolved.as_ref(), plain_sink);
+
+        // Apply the composed edges. A full pass (`None`, at finalize or after a load
+        // that can extend a stack with a newly opened member) re-resolves every
+        // stack, so the edges are assigned outright. For an edit, the layers whose
+        // composed edges actually changed — folded together with the authored layers
+        // (`edited`) — scope the stack re-resolution to the affected instances: the
+        // edge diff catches a layer whose own `subLayers` resolution changed, while
+        // `edited` catches an authored `${VAR}` sublayer or `expressionVariables` edit
+        // that shifts a stack's members without changing its plain edges.
+        let affected = match scope {
+            EdgeScope::All => {
+                for (id, edges) in all_edges {
+                    self.nodes.get_mut(&id).expect("edge source exists").children = edges;
+                }
+                None
+            }
+            EdgeScope::Edited(touched) | EdgeScope::Joined(touched) => {
+                let mut changed: HashSet<LayerId> = HashSet::new();
+                for (id, edges) in all_edges {
+                    let node = self.nodes.get_mut(&id).expect("edge source exists");
+                    if node.children != edges {
+                        node.children = edges;
+                        changed.insert(id);
+                    }
+                }
+                changed.extend(touched);
+                Some(changed)
+            }
+        };
+
+        // A join also recomposes the stacks it can extend without changing a
+        // context-free edge.
+        let unsettled = match scope {
+            EdgeScope::Joined(_) => self.sublayers.unsettled.clone(),
+            EdgeScope::All | EdgeScope::Edited(_) => HashSet::new(),
+        };
+        let vars_deltas = self.rebuild_sublayer_stacks(affected.as_ref(), &unsettled);
+        self.recompute_cycle_diagnostics();
+        match scope {
+            EdgeScope::Joined(_) => (None, vars_deltas),
+            EdgeScope::All | EdgeScope::Edited(_) => (affected, vars_deltas),
+        }
+    }
+
+    /// Resolves `id`'s `subLayers` into `(child, effective offset)` edges,
+    /// evaluating each expression (`${VAR}`) path against `context` — the stack's
+    /// single expression-variable set, or the empty set for the shared context-free
+    /// [`LayerNode::children`]. Reads only `id`'s own `subLayers`/`subLayerOffsets`;
+    /// `id`'s own `expressionVariables` do not contribute — only the stack root's do
+    /// (C++ `PcpExpressionVariables`), and the caller has already folded them into
+    /// `context`. `sink`, when given, receives what the resolution drops: entries
+    /// that resolved to no loaded layer (load-demand candidates), the parent of
+    /// each entry resolved through the bare in-memory fallback, and — when it
+    /// carries the contextual buckets — `${VAR}` evaluation diagnostics and the
+    /// variable names those evaluations read.
+    fn resolve_edges(
+        &self,
+        id: LayerId,
+        context: &HashMap<String, Value>,
+        resolution: &mut HashMap<LayerId, HashMap<String, String>>,
+        mut sink: Option<&mut EdgeSink>,
+    ) -> SublayerEdges {
+        let root_path = Path::abs_root();
+        let view = self.read_view();
+        let layer = view.layer(id);
+        let Ok(Value::StringVec(sub_paths)) = layer
+            .data()
+            .field(&root_path, FieldKey::SubLayers.as_str())
+            .map(|v| v.into_owned())
+        else {
+            return Vec::new();
+        };
+        let offsets: Vec<LayerOffset> = layer
+            .data()
+            .field(&root_path, FieldKey::SubLayerOffsets.as_str())
+            .ok()
+            .and_then(|v| match v.into_owned() {
+                Value::LayerOffsetVec(v) => Some(v),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let parent_tcps = effective_time_codes_per_second(layer);
+        let mut edges = Vec::with_capacity(sub_paths.len());
+        for (i, sub_path) in sub_paths.into_iter().enumerate() {
+            let sub_path = if expr::is_expression(&sub_path) {
+                // Evaluate through the shared expression seam, recording — when
+                // the sink carries the contextual buckets — a failure as an
+                // `InvalidExpression` diagnostic with the sublayer context (C++
+                // `_BuildLayerStack`) and the variable names the evaluation
+                // read. A successful expression-language `None` selects no
+                // sublayer and stays silent; either outcome resolves to no edge.
+                let mut expr_errors = Diagnostics::default();
+                let mut expr_used = HashSet::new();
+                let record = sink.as_deref_mut().is_some_and(|s| s.contextual.is_some());
+                let outcome = evaluate_expression(
+                    &sub_path,
+                    context,
+                    ExpressionContext::Sublayer,
+                    layer.identifier(),
+                    &root_path,
+                    record.then_some(&mut expr_errors),
+                    record.then_some(&mut expr_used),
+                );
+                if let Some(contextual) = sink.as_deref_mut().and_then(|s| s.contextual.as_mut()) {
+                    contextual
+                        .diagnostics
+                        .extend(expr_errors.into_iter().map(|diagnostic| (id, diagnostic)));
+                    contextual
+                        .used_vars
+                        .extend(expr_used.into_iter().map(|name| (id, name)));
+                }
+                match outcome {
+                    EvaluatedExpression::Value(resolved) => resolved,
+                    EvaluatedExpression::None | EvaluatedExpression::Failed => continue,
+                }
+            } else {
+                sub_path
+            };
+            let Ok((sub_id, anchored)) = self.resolve_sublayer(id, &sub_path, resolution) else {
+                // No loaded layer at the entry's anchored (or bare) identifier:
+                // record a load-demand candidate for the stacks whose members
+                // include `id`, so the stage's load barrier can open it. An
+                // empty entry names nothing to open and stays skipped.
+                if !sub_path.is_empty()
+                    && let Some(sink) = sink.as_deref_mut()
+                {
+                    sink.demands.push((id, sub_path));
+                }
+                continue;
+            };
+            if !anchored && let Some(sink) = sink.as_deref_mut() {
+                sink.fallbacks.push(id);
+            }
+            let ratio = parent_tcps / effective_time_codes_per_second(view.layer(sub_id));
+            let effective = offsets
+                .get(i)
+                .copied()
+                .unwrap_or_default()
+                .sanitized()
+                .concatenate(&LayerOffset::scale_only(ratio));
+            edges.push((sub_id, effective));
+        }
+        edges
+    }
+
+    /// Resolves an authored `subLayers` entry `sub_path` against its parent layer
+    /// `parent` to the interned sublayer (the memoizing form of
+    /// [`find_relative`](Self::find_relative) for the per-rebuild
+    /// [`resolve_edges`](Self::resolve_edges) walk), or `Err` with the anchored
+    /// canonical identifier the entry would intern under. The anchored
+    /// identifier — the asset USD resolves the relative entry to — is tried
+    /// first; only when no layer is interned there does it fall back to the bare
+    /// authored string, so a filesystem-backed parent never resolves to an
+    /// unrelated layer interned under the bare string, while an in-memory layer
+    /// keyed under that literal name (no filesystem anchor) still resolves. The
+    /// resolver receives the authored spelling, so a leading `./` keeps its
+    /// file-relative meaning; the bare fallback looks up the resolver's
+    /// [`in_memory_identifier`](crate::ar::Resolver::in_memory_identifier)
+    /// for it. The sublayer is paired with whether its anchored identifier
+    /// matched.
+    ///
+    /// An identifier is memoized in `cache` once it is stable — made from an
+    /// entry the resolver does not call
+    /// [context dependent](crate::ar::Resolver::is_context_dependent_path), and
+    /// naming an interned layer, looked up live — so the resolver's
+    /// filesystem canonicalize runs once per such `(parent, sub_path)`. A
+    /// search-path or unresolved entry is anchored afresh on every rebuild, as
+    /// C++ `_BuildLayerStack` derives every entry: its identifier follows the
+    /// filesystem beside its parent (see [`SublayerState::resolution`]).
+    fn resolve_sublayer(
+        &self,
+        parent: LayerId,
+        sub_path: &str,
+        cache: &mut HashMap<LayerId, HashMap<String, String>>,
+    ) -> Result<(LayerId, bool), String> {
+        if let Some(anchored) = cache.get(&parent).and_then(|paths| paths.get(sub_path)) {
+            return self
+                .anchored_or_bare(anchored, sub_path)
+                .ok_or_else(|| anchored.clone());
+        }
+        let anchored = self.read_view().absolute_path(parent, sub_path);
+        let Some(resolved) = self.anchored_or_bare(&anchored, sub_path) else {
+            return Err(anchored);
+        };
+        if !self.registry.is_context_dependent_path(sub_path) {
+            cache.entry(parent).or_default().insert(sub_path.to_string(), anchored);
+        }
+        Ok(resolved)
+    }
+
+    /// Replaces [`cycles`](GraphDiagnostics::cycles) with the sublayer cycles
+    /// reachable from the root layer through non-muted edges. Run after an edge
+    /// rebuild and after a mute change, since muting a layer breaks any cycle
+    /// running through it.
+    fn recompute_cycle_diagnostics(&mut self) {
+        let mut errors = Diagnostics::default();
+        // Detect over the same edges the root stack's members are built from,
+        // one scan per region root — the session root's subtree and the root
+        // layer's: a region with an expression sublayer resolves against the
+        // stack's single variable set — the root instance's stored composed
+        // variables, which `rebuild_sublayer_stacks` refreshed just before this
+        // runs — so a `${VAR}` sublayer pointing back at an ancestor is caught;
+        // otherwise the context-free `children` are the region's edges.
+        //
+        // TODO(perf): a stage with an expression sublayer recomputes the stack
+        // edges here after `rebuild_sublayer_stacks` already resolved them for
+        // the members; threading the edge map through both would remove the
+        // duplication.
+        let region_roots: Vec<LayerId> = self
+            .session_layers()
+            .first()
+            .copied()
+            .into_iter()
+            .chain(self.root)
+            .collect();
+        for root in region_roots {
+            let mut ancestors: HashSet<LayerId> = HashSet::new();
+            if self.has_expr_sublayer(root) {
+                let mut resolution = mem::take(&mut self.sublayers.resolution);
+                let stack_vars = self.stacks.expression_variables(LayerStackId::ROOT);
+                let edges = self.compose_stack_edges(root, stack_vars, &mut resolution, None);
+                self.sublayers.resolution = resolution;
+                self.detect_cycles(
+                    root,
+                    |id| edges.get(&id).map_or(&[][..], |e| e.as_slice()),
+                    &mut ancestors,
+                    &mut errors,
+                );
+            } else {
+                let nodes = &self.nodes;
+                self.detect_cycles(
+                    root,
+                    |id| nodes.get(&id).map_or(&[][..], |n| n.children.as_slice()),
+                    &mut ancestors,
+                    &mut errors,
+                );
+            }
+        }
+        // A sublayer reached twice off-path (a diamond), or from both region
+        // roots, reaches the same cycle twice; the `(root_layer, seen_layer)`
+        // pair is the whole diagnostic, so it is reported once.
+        self.diagnostics.cycles = errors;
+    }
+
+    /// Refreshes the registry's composed stacks from the current edges. Run after
+    /// any edge mutation so [`layer_stack`](Self::layer_stack) and its callers read
+    /// up-to-date members, keeping every [`LayerStackId`] stable so a handle held by
+    /// a surviving prim index stays valid.
+    ///
+    /// The stage root stack (registry instance 0) and every already-interned target
+    /// stack — plain and contextual — are re-resolved in place. A reference/payload
+    /// target a `subLayers` edit cannot have minted yet is left for the demand path
+    /// ([`intern_external`](Self::intern_external)). Work stays proportional to the
+    /// composed stacks rather than the sum over every layer (O(n²) for a deep
+    /// chain): a sublayer-only layer participates through its root's stack, never its
+    /// own.
+    ///
+    /// With `affected`, the stacks in `unsettled` rebuild as well.
+    ///
+    /// Returns one [`StackVarsDelta`] per stack whose composed expression
+    /// variables (or their source) changed, in ascending stack order — dependency
+    /// order, so a consumer processing them in sequence sees a source's delta
+    /// before the deltas it cascaded into (the C++ step-5 propagation to stacks
+    /// whose override source resolves here).
+    fn rebuild_sublayer_stacks(
+        &mut self,
+        affected: Option<&HashSet<LayerId>>,
+        unsettled: &HashSet<LayerStackId>,
+    ) -> Vec<StackVarsDelta> {
+        // Re-resolve the muted identifiers to ids first, so a layer muted before
+        // it was loaded takes effect the moment a later edit interns it and
+        // rebuilds the stacks.
+        self.resolve_muted_ids();
+
+        // One delta per stack whose composed expression variables (or their
+        // source) changed this pass — the return value, and the membership the
+        // targets loop consults to cascade: a stack seeds from its key source's
+        // referent, so a change there must rebuild it even when the edit touched
+        // none of its own layers. A source referent always precedes the stacks
+        // keyed by it, so the single ascending-index pass below reads every seed
+        // after its referent was refreshed.
+        let mut vars_deltas: Vec<StackVarsDelta> = Vec::new();
+
+        // The stage root stack (session layers at identity offset minus a muted
+        // session subtree, then the root layer and its sublayers) is rebuilt on a
+        // full pass, or when an edited layer is one of its members — an edit
+        // elsewhere leaves it unchanged. A not-yet-built root (finalize) always
+        // rebuilds.
+        let rebuild_root = match affected {
+            None => true,
+            Some(affected) => {
+                unsettled.contains(&LayerStackId::ROOT)
+                    || self
+                        .stacks
+                        .member_set(LayerStackId::ROOT)
+                        .is_none_or(|members| !members.is_disjoint(affected))
+            }
+        };
+        if rebuild_root {
+            // Both regions of the stage root stack — the session root's sublayer
+            // subtree and the root layer's — expand against the stack's single
+            // composed expression-variable context (C++ `PcpExpressionVariables`):
+            // the root layer's own variables overlaid by the session root's own,
+            // the session winning, a muted session root contributing none. The
+            // root layer itself is never muted (the Stage API rejects it). Each
+            // region is a member walk from its region root, so a runtime
+            // `subLayers` edit or `${VAR}` re-selection re-resolves session
+            // membership exactly like root membership, and an unresolved entry
+            // in either region files a load demand through the sink.
+            let session_vars = self.session_expression_variables();
+            let stack_vars = match self.root {
+                Some(root) => self.composed_stack_vars(root, &session_vars),
+                None => session_vars,
+            };
+            let mut sink = EdgeSink::contextual();
+            let mut resolution = mem::take(&mut self.sublayers.resolution);
+            let mut root_members: Vec<(LayerId, LayerOffset)> = Vec::new();
+            if let Some(&session_root) = self.session_layers().first() {
+                root_members.extend(self.stack_members_uncached(
+                    session_root,
+                    &stack_vars,
+                    &mut resolution,
+                    Some(&mut sink),
+                ));
+            }
+            if let Some(root) = self.root {
+                root_members.extend(self.stack_members_uncached(root, &stack_vars, &mut resolution, Some(&mut sink)));
+            }
+            self.sublayers.resolution = resolution;
+            if let Some(delta) = self.stacks.set_root(root_members, stack_vars) {
+                vars_deltas.push(delta);
+            }
+            self.file_stack_discoveries(LayerStackId::ROOT, sink);
+        }
+
+        // Re-resolve each already-interned target stack whose composition an
+        // edited layer can reach; a full pass (`None`) re-resolves them all. A
+        // target rebuilds when an edited layer is its target root (checked
+        // explicitly because a muted root's member set is empty — disjoint from
+        // everything — while its layer data still feeds the stack's composed
+        // variables), a member, or when its seed shifted: its key source's
+        // referent changed this pass. The seed is read live from that referent,
+        // already refreshed by this pass's ascending order.
+        for (id, root, source) in self.stacks.targets() {
+            let rebuild = match affected {
+                None => true,
+                Some(affected) => {
+                    unsettled.contains(&id)
+                        || affected.contains(&root)
+                        || self
+                            .stacks
+                            .member_set(id)
+                            .is_some_and(|members| !members.is_disjoint(affected))
+                        || vars_deltas.iter().any(|delta| delta.stack == source.referent())
+                }
+            };
+            if !rebuild {
+                continue;
+            }
+            let seed_vars = self.stacks.expression_variables(source.referent()).clone();
+            let mut sink = EdgeSink::contextual();
+            let (members, expr_vars) = self.build_stack_members(root, &seed_vars, Some(&mut sink));
+            if let Some(delta) = self.stacks.set_composed(id, members, expr_vars) {
+                vars_deltas.push(delta);
+            }
+            self.file_stack_discoveries(id, sink);
+        }
+        vars_deltas
+    }
+
+    /// Classifies one stack composition's [`EdgeSink`] discoveries and files
+    /// them into the sublayer subsystem
+    /// ([`SublayerState::replace_stack`], which supersedes the stack's earlier
+    /// demands and diagnostics). Each unresolved entry becomes one of three
+    /// things: nothing when its target is muted (membership pruning would
+    /// drop the opened layer right back out — the sublayer analog of the
+    /// indexer's muted-arc-target check; an unmute rebuilds the stack, which
+    /// re-derives the entry), a regenerated per-referrer
+    /// diagnostic when its identifier already failed to open (the barrier
+    /// would refuse it; a retry, or a `subLayers` or `expressionVariables`
+    /// edit, clears the
+    /// failure and the next rebuild demands again), or a demand. A resolve
+    /// failure holds only while the
+    /// asset stays unresolvable: once the resolver finds it again, the entry
+    /// demands rather than reporting — the sublayer analog of the arc demand
+    /// gate's retry.
+    fn file_stack_discoveries(&mut self, stack: LayerStackId, sink: EdgeSink) {
+        // A stack with an entry naming no layer under its anchored identifier
+        // stays open to a join ([`SublayerState::unsettled`]), unless the entry
+        // names a muted layer, which joins no stack.
+        let mut unsettled = !sink.fallbacks.is_empty();
+        let members = self.stacks.member_set(stack).expect("a filed stack is minted");
+        let (demands, mut errors, used_vars) = sink.drain(stack, members);
+        // The names this composition's `${VAR}` entries read replace the stack's
+        // recorded sublayer dependencies, superseding a fixed or removed entry's.
+        self.stacks.set_sublayer_var_deps(stack, used_vars);
+        let muted = self.has_muted_layers();
+        let mut pending = Vec::new();
+        // Canonical identifiers already reported for a parent this pass, so a
+        // second authored spelling of one entry reports once, like open-time
+        // collection.
+        let mut seen: HashSet<(LayerId, String)> = HashSet::new();
+        for demand in demands {
+            if muted
+                && self
+                    .muted_asset_id(&demand.evaluated, self.anchor_location(Some(demand.parent)))
+                    .is_some()
+            {
+                continue;
+            }
+            unsettled = true;
+            if !self.failed_loads.is_empty() {
+                // An unresolved entry's identifier is derived afresh each
+                // rebuild (nothing memoizes it): under the resolver's
+                // look-here-first rule it is the bare search path until the
+                // asset appears beside its parent, and the anchored one from
+                // then on (C++ `_BuildLayerStack` derives every entry per
+                // rebuild). A recorded resolve failure is retried once the
+                // resolver finds the asset; any other failure is regenerated
+                // per referrer.
+                let anchored = self.read_view().absolute_path(demand.parent, &demand.evaluated);
+                match self.failed_loads.get(&anchored) {
+                    Some(LoadFailure::Unresolved) if self.registry.resolve(&anchored).is_some() => {
+                        self.failed_loads.remove(&anchored);
+                    }
+                    Some(failure) => {
+                        if seen.insert((demand.parent, anchored.clone())) {
+                            errors.report(failure.sublayer_error(&demand.evaluated, self.identifier(demand.parent)));
+                        }
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+            pending.push(demand);
+        }
+        if unsettled {
+            self.sublayers.unsettled.insert(stack);
+        } else {
+            self.sublayers.unsettled.remove(&stack);
+        }
+        self.sublayers.replace_stack(stack, pending, errors);
+    }
+
+    /// Appends a sublayer diagnostic to `stack`'s bucket
+    /// ([`SublayerState::record_error`]) — the load barrier's channel for a
+    /// failure discovered between rebuilds.
+    pub(crate) fn record_sublayer_error(&mut self, stack: LayerStackId, error: CompositionDiagnostic) {
+        self.sublayers.record_error(stack, error);
+    }
+
+    /// Drains the pending [`SublayerDemand`]s the last recompose or mint
+    /// discovered. The stage's load barrier resolves them
+    /// (`StageComposition::resolve_sublayer_demands`), opening each demanded
+    /// layer under its stack's composed variables and recomposing.
+    pub(crate) fn take_sublayer_demands(&mut self) -> Vec<SublayerDemand> {
+        self.sublayers.take_demands()
+    }
+
+    /// The sublayer load-failure diagnostics re-derived as fresh
+    /// [`SublayerDemand`]s, for the stage's load barrier after a retry
+    /// clears the failure memo ([`clear_failed_loads`](Self::clear_failed_loads),
+    /// [`retry_failed_sublayers`](Self::retry_failed_sublayers)): a
+    /// bucket's unresolved or malformed sublayer entry carries exactly its
+    /// demand's ingredients, so a repaired asset reloads even when the edit
+    /// itself rebuilds no stack. A retry that fails re-records the identical
+    /// diagnostic, so requeueing is idempotent.
+    pub(crate) fn requeue_failed_sublayers(&self) -> Vec<SublayerDemand> {
+        let mut demands = Vec::new();
+        for (&stack, bucket) in &self.sublayers.errors {
+            for error in bucket {
+                let (asset_path, introduced_by) = match error {
+                    CompositionDiagnostic::UnresolvedSublayer {
+                        asset_path,
+                        introduced_by,
+                    }
+                    | CompositionDiagnostic::MalformedSublayer {
+                        asset_path,
+                        introduced_by,
+                        ..
+                    } => (asset_path, introduced_by),
+                    _ => continue,
+                };
+                let Some(parent) = self.id_of(introduced_by) else {
+                    continue;
+                };
+                demands.push(SublayerDemand {
+                    parent,
+                    stack,
+                    evaluated: asset_path.clone(),
+                });
+            }
+        }
+        demands
+    }
+
+    /// Whether enough registry churn accumulated since the last sweep for
+    /// another to be worthwhile ([`LayerStackRegistry::ripe_for_sweep`]) —
+    /// the creation-churn half of the stage's sweep trigger, polled at the
+    /// edit seams before [`sweep_stacks`](Self::sweep_stacks).
+    pub(crate) fn sweep_ripe(&self) -> bool {
+        self.stacks.ripe_for_sweep()
+    }
+
+    /// Removes every layer-stack instance `marks` did not reach — extended
+    /// here with the stacks pending sublayer demands reference and the
+    /// eagerly minted sublayer-DAG roots whose root is not muted, and closed over variable-source
+    /// ancestry by the registry ([`LayerStackRegistry::sweep`]) — and retires
+    /// the removed stacks' sublayer diagnostics with them, so
+    /// [`errors`](Self::errors) and
+    /// [`requeue_failed_sublayers`](Self::requeue_failed_sublayers) never
+    /// resurrect a reclaimed stack. The next arc deriving a reclaimed key
+    /// composes a fresh instance through the ordinary demand path, re-deriving
+    /// its diagnostics if the problem still exists.
+    pub(crate) fn sweep_stacks(&mut self, mut marks: StackMarks) {
+        self.sublayers.mark_demanded(&mut marks);
+        // An eager stack whose root is muted composes nothing. It is left
+        // unmarked, and the next arc to it mints it again through the demand
+        // path.
+        let (stacks, muted) = (&self.stacks, &self.muted);
+        self.eager_stacks
+            .retain(|&id| stacks.target_key(id).is_none_or(|(root, _)| !muted.contains(&root)));
+        for &id in &self.eager_stacks {
+            marks.mark(id);
+        }
+        let removed = self.stacks.sweep(marks);
+        self.sublayers.retire_stacks(&removed);
+        self.reclaim_due |= !removed.is_empty();
+    }
+
+    /// Makes a [`Reclaim::Unused`] reclaim due: a layer something released
+    /// may now be unused.
+    pub(crate) fn mark_reclaim_due(&mut self) {
+        self.reclaim_due = true;
+    }
+
+    /// Whether a `reclaim` may find a layer to free: a stack sweep removed a
+    /// stack since the layers were last reclaimed
+    /// ([`remove_layers`](Self::remove_layers)), or the last reclaim kept a
+    /// layer it may free later; or, for [`Reclaim::Muted`], a loaded layer is
+    /// muted. A pin the last reclaim kept a layer for can lapse too
+    /// ([`lapsed`](Self::lapsed)).
+    pub(crate) fn reclaim_due(&self, reclaim: Reclaim) -> bool {
+        match reclaim {
+            Reclaim::Unused => self.reclaim_due,
+            Reclaim::Muted => !self.muted.is_empty(),
+        }
+    }
+
+    /// Whether a layer the last reclaim kept only for a pin is neither in
+    /// `pins` nor has unsaved edits any more, so a reclaim may free it. The
+    /// pins are asked for only when such a layer exists.
+    pub(crate) fn lapsed(&self, pins: &impl Deref<Target = HashSet<LayerId>>) -> bool {
+        if self.lapsing.is_empty() {
+            return false;
+        }
+        let (pins, view) = (&**pins, self.read_view());
+        let lapsed = |id: &LayerId| self.nodes.contains_key(id) && !pins.contains(id) && !view.layer(*id).is_dirty();
+        self.lapsing.iter().any(lapsed)
+    }
+
+    /// The layers no live layer stack holds and nothing else keeps, for the
+    /// caller to drop with [`remove_layers`](Self::remove_layers)
+    /// once the stage's observers have heard of them. Kept are the root and
+    /// session layers, the members of every stack the last
+    /// [`sweep_stacks`](Self::sweep_stacks) left, the root of every target
+    /// stack, the parents of pending sublayer demands, the layers in `kept`
+    /// and `pins`, a layer with unsaved edits or no file to read it from
+    /// again, and every unmuted sublayer beneath one of those other than a
+    /// session layer or a target stack's root. A
+    /// [`Reclaim::Muted`] returns only those among the muted layers and their
+    /// sublayers.
+    ///
+    /// A layer in `clips`, which value clips read, is never unused: when
+    /// nothing above keeps it for composition, it is returned to be demoted
+    /// to clips only ([`remove_layers`](Self::remove_layers)), pinned or not.
+    ///
+    /// Also returns, for [`remove_layers`](Self::remove_layers), the layers
+    /// kept only for a pin that can lapse, one in `pins` or one with unsaved
+    /// edits, and whether to retry at the next reclaim: a
+    /// [`Reclaim::Muted`] left out an unused layer.
+    pub(crate) fn unused_layers(
+        &self,
+        mut kept: HashSet<LayerId>,
+        clips: &HashSet<LayerId>,
+        pins: &HashSet<LayerId>,
+        reclaim: Reclaim,
+    ) -> Reclaimable {
+        kept.extend(self.stacks.member_layers());
+        kept.extend(self.root);
+        kept.extend(self.sublayers.pending_demands.iter().map(|demand| demand.parent));
+        let seeds = kept.iter().copied().collect();
+        // The stage owns its session layers, muted or not. A contributing
+        // session layer's sublayers are root-stack members already.
+        kept.extend(self.session_layers());
+        // A live target stack is keyed by its root, which stays though muted:
+        // the stack composes nothing from it.
+        kept.extend(self.stacks.targets().into_iter().map(|(_, root, _)| root));
+        self.keep_sublayers(&mut kept, seeds);
+        let mut demoted: HashSet<LayerId> = clips
+            .iter()
+            .copied()
+            .filter(|id| !kept.contains(id) && !self.clip_only.contains(id))
+            .collect();
+        // Only a layer nothing else keeps is read for whether it could be
+        // read back: one with unsaved edits, or with no file to read it from.
+        let view = self.read_view();
+        let mut lapsing = Vec::new();
+        let pinned: Vec<LayerId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| !kept.contains(id) && !clips.contains(id))
+            .filter(|id| {
+                let layer = view.layer(*id);
+                let lapses = pins.contains(id) || layer.is_dirty();
+                if lapses {
+                    lapsing.push(*id);
+                }
+                lapses || !layer.is_rereadable()
+            })
+            .collect();
+        let mut retry = false;
+        kept.extend(&pinned);
+        self.keep_sublayers(&mut kept, pinned);
+        // A clip layer stays for its clip after the walk, which reaches past
+        // it to the sublayers of a pinned parent.
+        kept.extend(clips);
+        let mut unused: HashSet<LayerId> = self.order.iter().copied().filter(|id| !kept.contains(id)).collect();
+        if reclaim == Reclaim::Muted {
+            // Every muted layer is a seed. The walk skips a muted child, which is
+            // a seed of its own.
+            let mut reach = self.muted.clone();
+            self.keep_sublayers(&mut reach, self.muted.iter().copied().collect());
+            let all = unused.len() + demoted.len();
+            unused.retain(|id| reach.contains(id));
+            demoted.retain(|id| reach.contains(id));
+            // A layer the mute did not prune leaves, or leaves composition, at
+            // a later reclaim.
+            retry |= unused.len() + demoted.len() < all;
+        }
+        Reclaimable {
+            unused,
+            demoted,
+            retry,
+            lapsing,
+        }
+    }
+
+    /// Adds to `kept` every sublayer, transitively, of the layers in `walk`.
+    fn keep_sublayers(&self, kept: &mut HashSet<LayerId>, mut walk: Vec<LayerId>) {
+        while let Some(id) = walk.pop() {
+            for &(child, _) in self.nodes.get(&id).map_or(&[][..], |node| &node.children) {
+                // A muted sublayer contributes nothing to its parent's stack.
+                if !self.muted.contains(&child) && kept.insert(child) {
+                    walk.push(child);
+                }
+            }
+        }
+    }
+
+    /// Takes the layers in `dead` out of the graph, every spelling of their
+    /// identifiers with them, and returns them as [`DepartedLayers`] with the
+    /// identifiers that named them. Takes the layers in `demoted`, which
+    /// composition no longer uses but a clip set still reads, out of
+    /// composition ([`clip_only`](Self::clip_only)): each keeps its node and
+    /// drops its sublayer edges and relocates until a composition join
+    /// promotes it again. With `retry`, the next reclaim runs whether or not a
+    /// sweep removes a stack; one runs too once a layer in `lapsing` lapses
+    /// ([`reclaim_due`](Self::reclaim_due)).
+    pub(crate) fn remove_layers(
+        &mut self,
+        Reclaimable {
+            unused: dead,
+            demoted,
+            retry,
+            lapsing,
+        }: &Reclaimable,
+    ) -> DepartedLayers {
+        self.reclaim_due = *retry;
+        self.lapsing.clone_from(lapsing);
+        let mut identifiers = Vec::new();
+        if dead.is_empty() && demoted.is_empty() {
+            return DepartedLayers {
+                identifiers,
+                _nodes: Vec::new(),
+            };
+        }
+        // Every spelling that named each departing muted layer, its identifiers
+        // and its real path.
+        let mut spellings: HashMap<LayerId, Vec<String>> = HashMap::new();
+        let muted = &self.muted;
+        self.by_identifier.retain(|identifier, id| {
+            let keep = !dead.contains(id);
+            if !keep {
+                identifiers.push(identifier.clone());
+                if muted.contains(id) {
+                    spellings.entry(*id).or_default().push(identifier.clone());
+                }
+            }
+            keep
+        });
+        self.by_real_path.retain(|real_path, id| {
+            let keep = !dead.contains(id);
+            if !keep && muted.contains(id) {
+                spellings.entry(*id).or_default().push(real_path.clone());
+            }
+            keep
+        });
+        self.order.retain(|id| !dead.contains(id));
+        self.clip_only.retain(|id| !dead.contains(id));
+        // A muted layer leaving the graph stays muted under its identifier and
+        // answers to every other spelling that named it.
+        for id in dead {
+            if !self.muted.remove(id) {
+                continue;
+            }
+            let identifier = self.identity(*id);
+            for spelling in spellings.remove(id).into_iter().flatten() {
+                if spelling != identifier {
+                    self.freed_aliases.insert(spelling, identifier.clone());
+                }
+            }
+            self.pending_mutes.insert(identifier);
+        }
+        // The parents of a departing or demoted layer re-resolve their
+        // `subLayers` once it is gone from composition: the entry reads as
+        // unresolved, which a mute leaves out of the stack and the next stack
+        // to use it demands again, joining it to composition.
+        // TODO(perf): this scans every node's edges; an index of each layer's
+        // parents would name them directly.
+        let leaving = |id: &LayerId| dead.contains(id) || demoted.contains(id);
+        let parents: HashSet<LayerId> = self
+            .nodes
+            .iter()
+            .filter(|(id, node)| !leaving(id) && node.children.iter().any(|(child, _)| leaving(child)))
+            .map(|(&id, _)| id)
+            .collect();
+        let (mut relocates, mut expr) = (false, false);
+        for &id in demoted {
+            if !self.clip_only.insert(id) {
+                continue;
+            }
+            let node = self.nodes.get_mut(&id).expect("a demoted layer is in the graph");
+            node.children = SublayerEdges::default();
+            relocates |= !node.relocates.is_empty();
+            expr |= mem::take(&mut node.has_expr_sublayer);
+            self.sublayers.unresolved_plain.remove(&id);
+            self.sublayers.fallback_plain.remove(&id);
+        }
+        let mut nodes = Vec::new();
+        for id in dead {
+            if let Some(node) = self.nodes.remove(id) {
+                relocates |= !node.relocates.is_empty();
+                expr |= node.has_expr_sublayer;
+                nodes.push(node);
+            }
+        }
+        if expr {
+            self.sublayers.any_expr = self.nodes.values().any(|node| node.has_expr_sublayer);
+        }
+        self.sublayers.forget(dead);
+        // A departed or demoted layer's relocate errors leave the diagnostics
+        // with it, those of a layer whose every relocate is invalid included.
+        if !parents.is_empty() {
+            // Re-resolving the edges recomputes the relocates too. A kept
+            // parent keeps every unmuted child unless it is muted itself (a
+            // session layer or a target stack's root stays muted), so the
+            // child that leaves contributes to no composed stack, and the
+            // rebuild changes none: the mute filter drops the demand it files.
+            // TODO(perf): this re-resolves every layer's edges, rebuilds the
+            // stacks reaching the parents and revalidates every relocate, where
+            // only the parents' edges changed, and `apply_mute` has just
+            // rebuilt every stack.
+            self.recompute_sublayers(Some(&parents));
+        } else if relocates || !self.diagnostics.relocates.is_empty() {
+            // TODO(perf): this revalidates every layer's relocates; a departed
+            // layer retracts only its own diagnostics and pairs.
+            self.recompute_relocates();
+        }
+        DepartedLayers {
+            identifiers,
+            _nodes: nodes,
+        }
+    }
+
+    /// Mints a root-sourced stack instance for every sublayer-DAG root that lacks
+    /// one — a reference/payload target interned eagerly by `from_layers` rather
+    /// than through the demand path. The stacks are keyed `{root, Root}` and
+    /// seeded by the root stack's composed variables: a stack whose variable
+    /// source is the root composes under the root stack's set (C++
+    /// `PcpLayerStackIdentifier` with no explicit override source), so a
+    /// var-authoring stage root reaches into every such target. Run once at
+    /// [`finalize`](Self::finalize): a production target loads after finalize and
+    /// is minted by [`intern_external`](Self::intern_external) under its own
+    /// context, so it never reaches here, and an edit-time recompose never
+    /// re-mints a never-queried instance for a contextual-only target. The
+    /// minted ids are recorded as permanent sweep marks
+    /// ([`sweep_stacks`](Self::sweep_stacks)): the layers stay open for the
+    /// graph's life, and this one-shot mint is the only holder of their
+    /// composed view and its open-time diagnostics.
+    fn mint_eager_target_stacks(&mut self) {
+        let sublayered: HashSet<LayerId> = self
+            .order
+            .iter()
+            .flat_map(|&id| self.nodes[&id].children.iter().map(|&(child, _)| child))
+            .collect();
+        let dag_roots: Vec<LayerId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&id| !sublayered.contains(&id) && Some(id) != self.root)
+            .collect();
+        for root in dag_roots {
+            let (id, _) = self.intern_target_stack(root, VarsSource::Root);
+            self.eager_stacks.push(id);
+        }
+    }
+
+    /// Depth-first cycle scan recording [`CompositionDiagnostic::SublayerCycle`] for any edge
+    /// that re-enters a layer already on the path from the root. Runs on an
+    /// explicit work stack so a deep chain does not overflow the native stack; an
+    /// `Exit` frame pops the layer back out of the `ancestors` path after its
+    /// subtree. `children_of` supplies a layer's resolved edges — the shared
+    /// context-free [`LayerNode::children`], or a stack's expression-resolved edges
+    /// — and a sublayer diamond re-scans off-path rather than looking like a cycle.
+    fn detect_cycles<'e>(
+        &self,
+        root: LayerId,
+        children_of: impl Fn(LayerId) -> &'e [(LayerId, LayerOffset)],
+        ancestors: &mut HashSet<LayerId>,
+        errors: &mut Diagnostics,
+    ) {
+        enum Step {
+            Enter(LayerId),
+            Exit(LayerId),
+        }
+        let mut work = vec![Step::Enter(root)];
+        while let Some(step) = work.pop() {
+            let id = match step {
+                Step::Exit(id) => {
+                    ancestors.remove(&id);
+                    continue;
+                }
+                Step::Enter(id) => id,
+            };
+            ancestors.insert(id);
+            work.push(Step::Exit(id));
+            // Iterate forward to record cycle errors in declared order, gathering
+            // the non-cycle children; they are pushed reversed so they pop in
+            // declared order.
+            let mut to_visit = Vec::new();
+            for &(child, _) in children_of(id) {
+                // A muted child is pruned from every stack, so a cycle through it
+                // never composes and is not reported.
+                if self.is_muted(child) {
+                    continue;
+                }
+                if ancestors.contains(&child) {
+                    errors.report(CompositionDiagnostic::SublayerCycle {
+                        root_layer: self.nodes[&id].handle.identifier().to_string(),
+                        seen_layer: self.nodes[&child].handle.identifier().to_string(),
+                    });
+                    continue;
+                }
+                to_visit.push(child);
+            }
+            for &child in to_visit.iter().rev() {
+                work.push(Step::Enter(child));
+            }
+        }
+    }
+
+    /// Read-only access to a layer node.
+    pub(crate) fn get(&self, id: LayerId) -> Option<&LayerNode> {
+        self.nodes.get(&id)
+    }
+
+    /// The layer with the given id, as a handle. Panics if the id is unknown.
+    pub(crate) fn handle(&self, id: LayerId) -> &sdf::LayerHandle {
+        &self.nodes[&id].handle
+    }
+
+    /// Hold `subscription` to the layer `id`'s commits for as long as the
+    /// layer is in the graph.
+    pub(crate) fn subscribe(&mut self, id: LayerId, subscription: sdf::Subscription) {
+        self.nodes.get_mut(&id).expect("the layer is in the graph").subscription = Some(subscription);
+    }
+
+    /// Whether the stage's recorder is subscribed to the layer `id`.
+    pub(crate) fn is_subscribed(&self, id: LayerId) -> bool {
+        self.nodes[&id].subscription.is_some()
+    }
+
+    /// The store that holds every layer this graph's nodes name.
+    pub(crate) fn store(&self) -> &Rc<sdf::LayerStore> {
+        &self.store
+    }
+
+    /// The layers named by `ids`, in `ids` order, skipping any id with no live
+    /// layer and any id named before (a layer a stack includes twice): the
+    /// handles a batched edit commits through, all-or-nothing.
+    pub(crate) fn handles(&self, ids: &[LayerId]) -> Vec<(LayerId, &sdf::LayerHandle)> {
+        let mut seen = HashSet::new();
+        ids.iter()
+            .filter(|id| seen.insert(**id))
+            .filter_map(|id| self.nodes.get(id).map(|node| (*id, &node.handle)))
+            .collect()
+    }
+
+    /// Borrow the layers' content for a query. Fails with
+    /// [`LayerError::Busy`](sdf::LayerError::Busy) while an edit holds them.
+    pub(crate) fn view(&self) -> Result<LayerView<'_>, sdf::LayerError> {
+        Ok(LayerView {
+            graph: GraphBorrow::Plain(self),
+            store: self.store.read()?,
+        })
+    }
+
+    /// A [`view`](Self::view) for the graph's own maintenance and for change
+    /// processing, which run between edits of the graph's layers: an
+    /// operation that reaches here began by taking a checked `view`, and
+    /// nothing it runs edits a layer.
+    pub(crate) fn read_view(&self) -> LayerView<'_> {
+        LayerView {
+            graph: GraphBorrow::Plain(self),
+            store: maintenance_read(&self.store),
+        }
+    }
+
+    /// The identifier of the layer with the given id. Panics if unknown.
+    pub(crate) fn identifier(&self, id: LayerId) -> &str {
+        self.nodes[&id].handle.identifier()
+    }
+
+    /// The identifier of the layer with the given id, or `None` when the id
+    /// names no layer in this graph — the presence-checking counterpart of
+    /// [`identifier`](Self::identifier), for a caller holding an id that may
+    /// have outlived its layer.
+    pub(crate) fn try_identifier(&self, id: LayerId) -> Option<&str> {
+        self.nodes.get(&id).map(|node| node.handle.identifier())
+    }
+
+    /// Every identifier and real path that names one of the layers `ids`
+    /// ([`id_of`](Self::id_of) answers to each).
+    pub(crate) fn spellings<'a>(&'a self, ids: &'a HashSet<LayerId>) -> impl Iterator<Item = &'a str> {
+        self.by_identifier
+            .iter()
+            .chain(&self.by_real_path)
+            .filter(|(_, id)| ids.contains(id))
+            .map(|(spelling, _)| spelling.as_str())
+    }
+
+    /// The registry that opens reference/payload targets on demand.
+    pub(crate) fn layer_registry(&self) -> &sdf::LayerRegistry {
+        &self.registry
+    }
+
+    /// The location that anchors the relative asset paths authored in the layer
+    /// `anchor`: its resolved real path, recorded when the loader opened it.
+    /// Returns `None` when there is no anchor layer or it is anonymous (no
+    /// resolvable location, C++ `SdfLayer::GetRealPath` is empty).
+    pub(crate) fn anchor_location(&self, anchor: Option<LayerId>) -> Option<&ResolvedPath> {
+        self.nodes[&anchor?].handle.anchor_location()
+    }
+
+    /// Records that an on-demand open of `asset_path` failed, so composition
+    /// stops demanding it and reports it — [`MalformedLayer`](CompositionDiagnostic::MalformedLayer)
+    /// at a reference/payload arc, a per-referrer sublayer diagnostic at each
+    /// stack rebuild. Called from the stage's load barriers.
+    pub(crate) fn mark_load_failed(&mut self, asset_path: &str, failure: LoadFailure) {
+        self.failed_loads.insert(asset_path.to_string(), failure);
+    }
+
+    /// Forgets each recorded resolve failure whose asset the resolver now
+    /// finds, returning whether there was one.
+    pub(crate) fn forget_resolvable_failures(&mut self) -> HashSet<String> {
+        let registry = &self.registry;
+        let resolvable: HashSet<String> = self
+            .failed_loads
+            .iter()
+            .filter(|(asset_path, failure)| {
+                matches!(failure, LoadFailure::Unresolved) && registry.resolve(asset_path).is_some()
+            })
+            .map(|(asset_path, _)| asset_path.clone())
+            .collect();
+        self.failed_loads
+            .retain(|asset_path, _| !resolvable.contains(asset_path));
+        resolvable
+    }
+
+    /// The layer stack a reference/payload arc to external `root` should compose
+    /// against, given the arc-carrying stack `context`. Every target stack is
+    /// keyed by the source of the arc-carrying stack's composed expression
+    /// variables (C++ `primIndex.cpp` builds the target identifier from
+    /// `GetExpressionVariables().GetSource()`), so this is a plain
+    /// `(root, source)` lookup on its interned id. Read-only: the indexer runs
+    /// against `&LayerGraph` and cannot mint, so a not-yet-built stack returns
+    /// [`ExternalStack::Demand`] for the load barrier to resolve through
+    /// [`intern_external`](Self::intern_external).
+    pub(crate) fn external_stack_id(&self, root: LayerId, context: LayerStackId) -> ExternalStack {
+        self.resolve_target_stack(root, self.stacks.vars_source(context))
+    }
+
+    /// The `(root, source)` resolve policy shared by the read path
+    /// ([`external_stack_id`](Self::external_stack_id)) and the mint path
+    /// ([`intern_target_stack`](Self::intern_target_stack)): collapse to the
+    /// root stack when the identity is the root stack's own
+    /// ([`collapses_to_root`](Self::collapses_to_root)), else the interned
+    /// `(root, source)` instance, else [`ExternalStack::Demand`]. A key whose
+    /// instance a sweep reclaimed simply misses the lookup, so it demands and
+    /// re-mints like a key never composed — `${VAR}`-selected sublayers
+    /// reopened by the barrier and all.
+    fn resolve_target_stack(&self, root: LayerId, source: VarsSource) -> ExternalStack {
+        if self.collapses_to_root(root, source) {
+            return ExternalStack::Ready(LayerStackId::ROOT);
+        }
+        match self.stacks.lookup_target(root, source) {
+            Some(id) => ExternalStack::Ready(id),
+            None => ExternalStack::Demand,
+        }
+    }
+
+    /// Whether an arc to `root` under the variable source `source` composes
+    /// against the stage root stack itself — pure key equality with the root
+    /// stack's identity (C++ `PcpLayerStackIdentifier` with the root's null
+    /// override source): the target is the stage root layer, no session layers
+    /// separate the two, and the variables' source is the root. A carried
+    /// [`VarsSource::Instance`] — a back-reference through a stack that authored
+    /// its own variables — instead mints a contextual instance rooted at the
+    /// stage root layer, keeping the outer variables in force.
+    fn collapses_to_root(&self, root: LayerId, source: VarsSource) -> bool {
+        self.session_layer_count == 0 && self.root == Some(root) && source == VarsSource::Root
+    }
+
+    /// Builds and interns the layer stack for a reference/payload arc to `root`
+    /// demanded under the context of the stack `context` (the `&mut self`
+    /// counterpart to [`external_stack_id`](Self::external_stack_id)), returning
+    /// its handle and whether a new instance was created so the load barrier can
+    /// drive a re-run. Idempotent. Called from the load barrier once the target
+    /// and the sublayers its context resolves have been interned.
+    pub(crate) fn intern_external(&mut self, root: LayerId, context: LayerStackId) -> (LayerStackId, bool) {
+        self.intern_target_stack(root, self.stacks.vars_source(context))
+    }
+
+    /// Whether the load barrier must (re)open `root`'s sublayers for a
+    /// reference/payload demanded under the context of the stack `context`: the
+    /// inherited context selects a contextual stack that is not yet built, so its
+    /// `${VAR}` sublayers — possibly nested below a literal sublayer an earlier
+    /// context left unopened — need loading. A context-free arc, a target with no
+    /// `${VAR}` sublayer (a keying-only demand the barrier interns without
+    /// reloading), or a context already built needs no reopen.
+    ///
+    /// The stage's own root layer is never reopened: its stack is already loaded,
+    /// and the layer may be in-memory or carry unsaved edits a disk re-read would
+    /// discard. A back-reference to it interns from the loaded graph, and any
+    /// `${VAR}` sublayer its carried context newly selects loads through the
+    /// mint's [`SublayerDemand`]s instead.
+    //
+    // TODO: retire this whole-tree reopen in favor of `SublayerDemand` coverage —
+    // the demand-driven loader opens a context's unresolved selections
+    // individually (nested-below-literal ones converge across recompose rounds),
+    // which should make the reload redundant once that coverage is proven.
+    pub(crate) fn needs_contextual_open(&self, root: LayerId, context: LayerStackId) -> bool {
+        self.root != Some(root)
+            && !self.stacks.expression_variables(context).is_empty()
+            && self.has_expr_sublayer(root)
+            && matches!(self.external_stack_id(root, context), ExternalStack::Demand)
+    }
+
+    /// The value identity of the stack `id`, for capture into an arc-based edit
+    /// target: the root stack as [`StackIdentity::Root`], a target stack as its
+    /// root's identifier plus its variable source chain's identifiers, walked
+    /// key source by key source down to the root stack and reversed to
+    /// outermost-first.
+    pub(crate) fn stack_identity(&self, id: LayerStackId) -> StackIdentity {
+        let Some((root, mut source)) = self.stacks.target_key(id) else {
+            return StackIdentity::Root;
+        };
+        let mut chain = Vec::new();
+        while let VarsSource::Instance(referent) = source {
+            let (referent_root, next) = self
+                .stacks
+                .target_key(referent)
+                .expect("a canonical source referent is a target stack");
+            chain.push(referent_root);
+            source = next;
+        }
+        chain.reverse();
+        StackIdentity::Target {
+            root: self.identifier(root).to_string(),
+            source_chain: self.identifiers_of(chain),
+        }
+    }
+
+    /// Resolves a captured [`StackIdentity`] to a stack handle on this graph,
+    /// walking the source chain outside-in so the same content derives the same
+    /// source-keyed identities the capturing graph held — including on a
+    /// different stage with equal composition inputs, where the numeric handles
+    /// number differently.
+    ///
+    /// Read-only, like the arc path: the first chain element whose layer is not
+    /// loaded or whose stack is not yet composed comes back as `Err` with the
+    /// [`Demand`] the load barrier must satisfy, and the caller re-runs the
+    /// walk after each load until it resolves or loading stops progressing.
+    /// Minting is left to the barrier so a `${VAR}`-selected sublayer the
+    /// context resolves is opened before the stack is interned (the barrier's
+    /// contextual-open check), and a walk that ultimately fails interns
+    /// nothing.
+    pub(crate) fn resolve_stack_identity(&self, identity: &StackIdentity) -> Result<LayerStackId, Demand> {
+        let StackIdentity::Target { root, source_chain } = identity else {
+            return Ok(LayerStackId::ROOT);
+        };
+        let mut context = LayerStackId::ROOT;
+        for identifier in source_chain.iter().chain([root]) {
+            let stack = self
+                .id_of(identifier)
+                .map(|layer| self.external_stack_id(layer, context));
+            let Some(ExternalStack::Ready(id)) = stack else {
+                return Err(Demand {
+                    asset_path: identifier.clone(),
+                    context,
+                    recheck: false,
+                });
+            };
+            context = id;
+        }
+        Ok(context)
+    }
+
+    /// The single mint policy for an external target stack: resolve through the
+    /// shared policy ([`resolve_target_stack`](Self::resolve_target_stack)) and,
+    /// on [`ExternalStack::Demand`], compose the members and variables under the
+    /// source referent's composed set and intern a fresh instance. Distinct
+    /// sources to the same target intern distinct instances even when their
+    /// composed maps and members are equal — the source is the identity, so
+    /// sharing would collapse sites C++ keeps apart.
+    fn intern_target_stack(&mut self, root: LayerId, source: VarsSource) -> (LayerStackId, bool) {
+        if let ExternalStack::Ready(id) = self.resolve_target_stack(root, source) {
+            return (id, false);
+        }
+        let seed_vars = self.stacks.expression_variables(source.referent()).clone();
+        // A mint can itself discover unloaded selections — a `${VAR}` sublayer
+        // the fresh context resolves to a layer nothing else has opened — so it
+        // files demands like a rebuild does.
+        let mut sink = EdgeSink::contextual();
+        let (members, expr_vars) = self.build_stack_members(root, &seed_vars, Some(&mut sink));
+        let id = self.stacks.intern_target(root, source, members, expr_vars);
+        self.file_stack_discoveries(id, sink);
+        (id, true)
+    }
+
+    /// Whether any layer in `root`'s plain sublayer subtree authors an
+    /// expression-valued `${VAR}` `subLayers` entry — the only sublayer whose
+    /// resolution depends on the expression-variable context inherited across a
+    /// reference/payload arc. The load barrier reads this to decide whether a
+    /// demanded context must (re)open the target's sublayers
+    /// ([`needs_contextual_open`](Self::needs_contextual_open)), and
+    /// [`stack_members_uncached`](Self::stack_members_uncached) to gate a stack
+    /// onto the context-free `collect_plain` fast path. The whole subtree is
+    /// scanned so an expression sublayer nested below the target root — under a
+    /// literal sublayer — is still caught.
+    ///
+    /// The walk reads the current [`LayerNode::children`] rather than a registry
+    /// stack's interned members: those members can predate the edit driving a stack
+    /// rebuild (they are replaced only after every stack is recomposed), so scanning
+    /// them would miss a freshly added expression branch and wrongly gate the stack
+    /// onto `collect_plain`. The children (and the per-node flags) are already
+    /// rebuilt by [`build_sublayer_edges`](Self::build_sublayer_edges) before the
+    /// rebuild reads this. Muted layers (and any subtree reached only through them)
+    /// are skipped, matching the composed members: an expression sublayer that
+    /// mutes out contributes nothing, so a demand for a target that only reaches
+    /// one skips the reopen. [`SublayerState::any_expr`] short-circuits the
+    /// common stage with no expression sublayer at all to `O(1)`.
+    //
+    // TODO(perf): this runs a fresh subtree walk (allocating a work stack + visited
+    // set) per empty-seed stack rebuilt in `rebuild_sublayer_stacks` once any layer
+    // authors an expression sublayer. A transitive per-node "subtree authors one"
+    // flag computed with the local flags would make it an `O(1)` field read.
+    pub(crate) fn has_expr_sublayer(&self, root: LayerId) -> bool {
+        if !self.sublayers.any_expr {
+            return false;
+        }
+        let mut work = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(id) = work.pop() {
+            if self.is_muted(id) || !visited.insert(id) {
+                continue;
+            }
+            let Some(node) = self.nodes.get(&id) else { continue };
+            if node.has_expr_sublayer {
+                return true;
+            }
+            work.extend(node.children.iter().map(|&(child, _)| child));
+        }
+        false
+    }
+
+    /// Recomputes the exact [`LayerNode::has_expr_sublayer`] flags and their
+    /// graph-level union [`SublayerState::any_expr`] from each
+    /// layer's own `subLayers`. Run on every edge rebuild so an edit that adds or
+    /// removes the last expression `subLayers` entry is reflected exactly. With
+    /// `only`, refreshes just those layers' flags and folds them into the union,
+    /// for layers that joined with every other layer's `subLayers` unchanged.
+    //
+    // TODO(perf): this re-decodes each layer's `subLayers`, which `resolve_edges`
+    // already decodes (and already runs `is_expression` over) in the same
+    // `build_sublayer_edges` pass. Returning the flag from `resolve_edges` and
+    // folding it in as `children` are applied would drop this second decode.
+    fn recompute_expr_sublayer_flags(&mut self, only: Option<&HashSet<LayerId>>) {
+        let root_path = Path::abs_root();
+        let store = Rc::clone(&self.store);
+        let content = maintenance_read(&store);
+        let has_expr = |node: &LayerNode| {
+            matches!(
+                content.layer(&node.handle).data().try_field(&root_path, FieldKey::SubLayers.as_str()),
+                Ok(Some(subs)) if matches!(&*subs, Value::StringVec(paths) if paths.iter().any(|p| expr::is_expression(p)))
+            )
+        };
+        match only {
+            None => {
+                let mut any = false;
+                for (id, node) in &mut self.nodes {
+                    node.has_expr_sublayer = !self.clip_only.contains(id) && has_expr(node);
+                    any |= node.has_expr_sublayer;
+                }
+                self.sublayers.any_expr = any;
+            }
+            Some(only) => {
+                for id in only {
+                    let node = self.nodes.get_mut(id).expect("a refreshed layer is live");
+                    node.has_expr_sublayer = has_expr(node);
+                    self.sublayers.any_expr |= node.has_expr_sublayer;
+                }
+            }
+        }
+    }
+
+    /// The cached composer for a rebuild: composes the stack's expression
+    /// variables ([`composed_stack_vars`](Self::composed_stack_vars)), then
+    /// expands members against them via the [`stack_members_uncached`] policy
+    /// with the graph's shared sublayer-resolution cache threaded through, so a
+    /// `subLayers` edit only re-canonicalizes paths it has not seen before.
+    /// Returns both so the caller stores them on the stack instance together.
+    /// Read-only queries call [`stack_members_uncached`] directly with a scratch
+    /// cache ([`sublayer_stack`]).
+    ///
+    /// [`stack_members_uncached`]: Self::stack_members_uncached
+    /// [`sublayer_stack`]: Self::sublayer_stack
+    fn build_stack_members(
+        &mut self,
+        root: LayerId,
+        seed_vars: &HashMap<String, Value>,
+        sink: Option<&mut EdgeSink>,
+    ) -> (Vec<(LayerId, LayerOffset)>, HashMap<String, Value>) {
+        let stack_vars = self.composed_stack_vars(root, seed_vars);
+        let mut resolution = mem::take(&mut self.sublayers.resolution);
+        let members = self.stack_members_uncached(root, &stack_vars, &mut resolution, sink);
+        self.sublayers.resolution = resolution;
+        (members, stack_vars)
+    }
+
+    /// The composed expression variables of a stack rooted at `root` under
+    /// `seed_vars`: the root layer's own `expressionVariables` overlaid by the
+    /// seed, the seed winning (C++ `PcpExpressionVariables`). The loader
+    /// validated the `expressionVariables` read at open time; this
+    /// composition-time read of the same already-loaded layer cannot abort, so
+    /// an unreadable field degrades to no variables.
+    fn composed_stack_vars(&self, root: LayerId, seed_vars: &HashMap<String, Value>) -> HashMap<String, Value> {
+        expr::stack_variables(self.read_view().layer(root).data(), seed_vars).unwrap_or_default()
+    }
+
+    /// The single member-expansion policy for every "stack rooted at `root` under
+    /// the composed variables `stack_vars`" query, cached
+    /// ([`build_stack_members`](Self::build_stack_members)) or on demand
+    /// ([`sublayer_stack`](Self::sublayer_stack)): resolves `root`'s subtree and
+    /// composes offsets, pruning muted layers, sharing [`collect_sublayers`].
+    ///
+    /// A stack with no expression sublayer ([`has_expr_sublayer`](Self::has_expr_sublayer)
+    /// false) walks the shared context-free [`LayerNode::children`], resolved once
+    /// per `subLayers` edit. A stack with one re-resolves its subtree against
+    /// `stack_vars` ([`compose_stack_edges`](Self::compose_stack_edges)) so every
+    /// `${VAR}` sublayer resolves the same way throughout the stack (C++
+    /// `PcpExpressionVariables`). `resolution` memoizes sublayer path
+    /// canonicalization — the graph's cache on a rebuild, a scratch map on a read
+    /// query.
+    fn stack_members_uncached(
+        &self,
+        root: LayerId,
+        stack_vars: &HashMap<String, Value>,
+        resolution: &mut HashMap<LayerId, HashMap<String, String>>,
+        sink: Option<&mut EdgeSink>,
+    ) -> Vec<(LayerId, LayerOffset)> {
+        if !self.has_expr_sublayer(root) {
+            let members = self.collect_plain(root);
+            // A plain stack's edges are the context-free ones, so its
+            // unresolved entries are exactly the recorded per-parent table;
+            // scanning the members costs nothing on the common fully-resolved
+            // stage, where the table is empty.
+            if let Some(sink) = sink.filter(|_| !self.sublayers.unresolved_plain.is_empty()) {
+                for &(member, _) in &members {
+                    if let Some(entries) = self.sublayers.unresolved_plain.get(&member) {
+                        sink.demands
+                            .extend(entries.iter().map(|evaluated| (member, evaluated.clone())));
+                    }
+                }
+            }
+            return members;
+        }
+        let edges = self.compose_stack_edges(root, stack_vars, resolution, sink);
+        let muted = &self.muted;
+        let mut members = Vec::new();
+        let mut ancestors = HashSet::new();
+        collect_sublayers(
+            root,
+            LayerOffset::IDENTITY,
+            &mut members,
+            &mut ancestors,
+            |id| muted.contains(&id),
+            |id| edges.get(&id).map_or(&[][..], |e| e.as_slice()),
+        );
+        members
+    }
+
+    /// Resolves the sublayer edges of the stack rooted at `root` against
+    /// `stack_vars`, the stack's single composed expression-variable set, into a
+    /// per-`LayerId` edge map. Every `${VAR}` sublayer in the stack resolves
+    /// against that one set (C++ `PcpExpressionVariables`); a sublayer's own
+    /// `expressionVariables` contribute nothing. Unlike the shared context-free
+    /// [`LayerNode::children`], these edges carry the stack's variables.
+    /// `resolution` memoizes sublayer path canonicalization.
+    fn compose_stack_edges(
+        &self,
+        root: LayerId,
+        stack_vars: &HashMap<String, Value>,
+        resolution: &mut HashMap<LayerId, HashMap<String, String>>,
+        mut sink: Option<&mut EdgeSink>,
+    ) -> HashMap<LayerId, SublayerEdges> {
+        let mut edges: HashMap<LayerId, SublayerEdges> = HashMap::new();
+        let mut visited: HashSet<LayerId> = HashSet::new();
+        let mut work = vec![root];
+        while let Some(id) = work.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let resolved = self.resolve_edges(id, stack_vars, resolution, sink.as_deref_mut());
+            for &(child, _) in resolved.iter().rev() {
+                work.push(child);
+            }
+            edges.insert(id, resolved);
+        }
+        edges
+    }
+
+    /// The session layer's own `expressionVariables` — the overrides the root stage
+    /// stack composes over the stage root layer's own (C++ `PcpExpressionVariables`
+    /// reads the root and session layers, not their sublayers). Seeds the root
+    /// layer's `${VAR}` sublayer resolution (see
+    /// [`rebuild_sublayer_stacks`](Self::rebuild_sublayer_stacks)). Empty when the
+    /// session root authors none, the common case that keeps the root on the
+    /// sessionless path.
+    ///
+    /// The session root is the first session layer; a muted session root contributes
+    /// nothing, matching the members the root stack drops. The session root is
+    /// `order[0]`, the top of the session region, so muting drops it exactly when it
+    /// is itself muted.
+    fn session_expression_variables(&self) -> HashMap<String, Value> {
+        match self.session_layers().first() {
+            Some(&session_root) if !self.is_muted(session_root) => {
+                expr::read_variables(self.read_view().layer(session_root).data())
+                    .map(|dict| dict.into_owned())
+                    .unwrap_or_default()
+            }
+            _ => HashMap::new(),
+        }
+    }
+
+    /// The stage root stack's expression variables read regardless of muting: the
+    /// stage root layer's own overlaid by the session root's own (session wins). The
+    /// structural walk [`expression_ancestry_edges`](Self::expression_ancestry_edges)
+    /// resolves the root stage stack's `${VAR}` sublayers against this one set (both
+    /// regions of a single stack, C++ `PcpExpressionVariables`), so muting a layer
+    /// leaves the walk's edges unchanged: the ancestor set is identical before a mute
+    /// and after the matching unmute. The composition context a muted session root
+    /// drops out of is [`stack_variables`](Self::stack_variables).
+    fn root_stack_structural_vars(&self) -> HashMap<String, Value> {
+        let session = match self.session_layers().first() {
+            Some(&session_root) => expr::read_variables(self.read_view().layer(session_root).data())
+                .map(|dict| dict.into_owned())
+                .unwrap_or_default(),
+            None => HashMap::new(),
+        };
+        match self.root {
+            Some(root) => expr::stack_variables(self.read_view().layer(root).data(), &session).unwrap_or_default(),
+            None => session,
+        }
+    }
+
+    /// The composed expression variables of the layer stack `id` (C++
+    /// `PcpExpressionVariables`, stored on the stack like C++
+    /// `PcpLayerStack::GetExpressionVariables`): its root layer's own
+    /// `expressionVariables` overlaid by the inherited overrides — the arc's seed
+    /// for a target, the session root's own for the stage root stack. This is the
+    /// single set the stack's `${VAR}` sublayer paths, reference/payload asset
+    /// paths, and value-time asset attributes all resolve against; a sublayer of
+    /// the root contributes nothing. The same value the stack's members were
+    /// resolved with ([`build_stack_members`](Self::build_stack_members)), so
+    /// membership and asset-path resolution never diverge. Panics on an unminted
+    /// handle — composition only reads stacks the graph has built.
+    pub(crate) fn stack_variables(&self, id: LayerStackId) -> &HashMap<String, Value> {
+        self.stacks.expression_variables(id)
+    }
+
+    /// The context-free members of the stack rooted at `root`, composing offsets and
+    /// pruning muted layers over the shared [`LayerNode::children`]. The fast path
+    /// [`stack_members_uncached`](Self::stack_members_uncached) takes when the stack
+    /// has no expression sublayer ([`has_expr_sublayer`](Self::has_expr_sublayer)).
+    fn collect_plain(&self, root: LayerId) -> Vec<(LayerId, LayerOffset)> {
+        let muted = &self.muted;
+        let nodes = &self.nodes;
+        let mut members = Vec::new();
+        let mut ancestors = HashSet::new();
+        collect_sublayers(
+            root,
+            LayerOffset::IDENTITY,
+            &mut members,
+            &mut ancestors,
+            |id| muted.contains(&id),
+            |id| nodes.get(&id).map_or(&[][..], |n| n.children.as_slice()),
+        );
+        members
+    }
+
+    /// Whether a prior on-demand open of `asset_path` failed.
+    pub(crate) fn load_failed(&self, asset_path: &str) -> bool {
+        self.failed_loads.contains_key(asset_path)
+    }
+
+    /// What a prior on-demand open of `asset_path` recorded as its failure, or
+    /// `None` if it never failed.
+    pub(crate) fn load_failure(&self, asset_path: &str) -> Option<&LoadFailure> {
+        self.failed_loads.get(asset_path)
+    }
+
+    /// The recorded failure that still keeps `asset_path` from being opened
+    /// again: an unreadable one until a retry, or a rebuild of a prim that
+    /// recorded it, clears it, and an unresolved one
+    /// while the asset neither resolves nor names a layer the registry holds
+    /// (an adopted or anonymous one is found without resolving).
+    ///
+    /// TODO(perf): an unresolved asset is resolved again on every ask, a
+    /// filesystem probe per clipped read for a clip that stays missing; the
+    /// load barrier's `forget_resolvable_failures` could clear the record
+    /// instead.
+    pub(crate) fn blocking_failure(&self, asset_path: &str) -> Option<&LoadFailure> {
+        self.failed_loads.get(asset_path).filter(|failure| match failure {
+            LoadFailure::Unreadable(_) => true,
+            LoadFailure::Unresolved => {
+                self.registry.resolve(asset_path).is_none() && !matches!(self.registry.find(asset_path), Ok(Some(_)))
+            }
+        })
+    }
+
+    /// Forgets the recorded failures of `assets`, the targets a prim composed
+    /// again names, so its rebuild opens them again.
+    pub(crate) fn forget_load_failures(&mut self, assets: impl IntoIterator<Item = String>) {
+        for asset in assets {
+            self.failed_loads.remove(&asset);
+        }
+    }
+
+    /// Forgets the recorded failure of every failed sublayer entry and demands
+    /// each again, for the stage's load barrier: a `subLayers` or
+    /// `expressionVariables` edit can select a repaired asset again, and no
+    /// prim index records a sublayer's failure for its rebuild to retry.
+    /// Called once the stacks the edit
+    /// stranded are swept, so no entry is demanded for a stack nothing uses.
+    ///
+    /// Returns the demands with the assets whose failures it forgot, which
+    /// a prim index may have recorded too.
+    pub(crate) fn retry_failed_sublayers(&mut self) -> (Vec<SublayerDemand>, HashSet<String>) {
+        let demands = self.requeue_failed_sublayers();
+        let mut forgotten = HashSet::new();
+        for demand in &demands {
+            let asset = self.read_view().absolute_path(demand.parent, &demand.evaluated);
+            if self.failed_loads.remove(&asset).is_some() {
+                forgotten.insert(asset);
+            }
+        }
+        (demands, forgotten)
+    }
+
+    /// Forgets every recorded load failure so a now-readable asset is demanded
+    /// again, returning whether any were recorded. Called by a retry of the
+    /// failed loads, explicit or a reload's.
+    pub(crate) fn clear_failed_loads(&mut self) -> bool {
+        if self.failed_loads.is_empty() {
+            return false;
+        }
+        self.failed_loads.clear();
+        true
+    }
+
+    /// Whether any layer keeps structurally valid authored relocates.
+    pub(crate) fn has_relocates(&self) -> bool {
+        self.has_relocates
+    }
+
+    /// Number of layers in the graph.
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the graph has no layers.
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The open-time session-layer ids in strength order; the session root is
+    /// first. The session region's composed membership is a sublayer walk from
+    /// that root (see `rebuild_sublayer_stacks`), so a session sublayer loaded
+    /// at runtime is a root-stack member without appearing here.
+    pub(crate) fn session_layers(&self) -> &[LayerId] {
+        &self.order[..self.session_layer_count]
+    }
+
+    /// The composed session layers: the root layer stack's members ahead of
+    /// the root layer, `${VAR}` sublayers included (C++
+    /// `PcpLayerStack::GetSessionLayers`).
+    pub(crate) fn session_stack(&self) -> &[(LayerId, LayerOffset)] {
+        let stack = self.root_layer_stack();
+        let end = stack
+            .iter()
+            .position(|&(id, _)| Some(id) == self.root)
+            .unwrap_or(stack.len());
+        &stack[..end]
+    }
+
+    /// The layers the stage uses: every live stack's members and the layers
+    /// held for value clips alone (C++ `UsdStage::GetUsedLayers`). A layer
+    /// the graph keeps only for a pin, or one beneath a muted layer, is not
+    /// among them.
+    pub(crate) fn used_layers(&self) -> HashSet<LayerId> {
+        let mut used = self.stacks.member_layers();
+        used.extend(&self.clip_only);
+        used
+    }
+
+    /// The root layer's id (the first non-session layer), if any.
+    pub(crate) fn root_id(&self) -> Option<LayerId> {
+        self.root
+    }
+
+    /// Whether `stack` resolves to a member set containing `layer` — the test
+    /// both the dependency registration walk and its lookup apply to decide
+    /// whether a node's site belongs to an edited layer.
+    pub(crate) fn stack_contains(&self, stack: LayerStackId, layer: LayerId) -> bool {
+        self.stacks
+            .member_set(stack)
+            .is_some_and(|members| members.contains(&layer))
+    }
+
+    /// The composed stacks `layer` is a member of, in id order (C++
+    /// `PcpLayerStackRegistry::FindAllUsingLayer`). A change to `layer`
+    /// reaches the dependencies registered against these stacks.
+    pub(crate) fn stacks_using(&self, layer: LayerId) -> impl Iterator<Item = LayerStackId> + '_ {
+        self.stacks.stacks_using(layer)
+    }
+
+    /// All layer ids in collection order (session layers first).
+    pub(crate) fn all_ids(&self) -> &[LayerId] {
+        &self.order
+    }
+
+    /// The layers stage metadata resolves from, strongest first: the session
+    /// root unless it is muted, then the root layer, which is never muted
+    /// (C++ `_ComposePseudoRootMetadataImpl`). A session sublayer holds no
+    /// stage metadata.
+    pub(crate) fn stage_metadata_layers(&self) -> impl Iterator<Item = LayerId> + '_ {
+        self.session_layers()
+            .first()
+            .copied()
+            .into_iter()
+            .chain(self.root_id())
+            .filter(|&id| !self.is_muted(id))
+    }
+
+    /// Layer identifiers in collection order (root-stack first).
+    pub(crate) fn identifiers(&self) -> Vec<String> {
+        self.identifiers_of(self.order.iter().copied())
+    }
+
+    /// Maps a sequence of layer ids to their identifiers, in order.
+    pub(crate) fn identifiers_of(&self, ids: impl IntoIterator<Item = LayerId>) -> Vec<String> {
+        ids.into_iter().map(|id| self.identifier(id).to_string()).collect()
+    }
+
+    /// The identifiers of the stage's root layer stack (session layers, the root
+    /// layer, and its sublayers) in strength order. Backs C++
+    /// `UsdStage::GetLayerStack`.
+    pub(crate) fn root_layer_stack_identifiers(&self) -> Vec<String> {
+        self.identifiers_of(self.root_layer_stack().iter().map(|&(id, _)| id))
+    }
+
+    /// The layer ids + effective offsets of the root-sourced sublayer stack rooted
+    /// at `root_layer` (spec 10.3.1.1) — its sublayer edges resolved under the
+    /// layer's own `expressionVariables` overlaid by the stage root stack's
+    /// composed set (a stack with no explicit override source composes under the
+    /// root's, C++ `PcpExpressionVariables`), the depth-first pre-order walk with
+    /// offsets composed through nested sublayers. A layer that sublayers itself
+    /// transitively is a cycle and is skipped; an off-path duplicate is expanded
+    /// again. Empty for an unknown layer.
+    ///
+    /// The query goes through the same expansion policy as a rebuilt stack
+    /// ([`stack_members_uncached`](Self::stack_members_uncached)): it reads the
+    /// registry's interned `{root_layer, Root}` instance when one exists, and
+    /// otherwise composes on demand with a scratch resolution cache — so a
+    /// sublayer diamond whose shared layer resolves `${VAR}` differently per arm
+    /// expands per ancestry here exactly as it does in the interned members. A
+    /// variable a layer inherits only from a parent that sublayers it is not in
+    /// scope — those members appear in the parent's stack, not in the layer's own.
+    pub(crate) fn sublayer_stack(&self, root_layer: LayerId) -> Cow<'_, [(LayerId, LayerOffset)]> {
+        if let Some(id) = self.stacks.lookup_target(root_layer, VarsSource::Root) {
+            return Cow::Borrowed(self.stacks.members(id));
+        }
+        if !self.nodes.contains_key(&root_layer) {
+            return Cow::Borrowed(&[]);
+        }
+        // Only a `${VAR}` sublayer reads the stack's variables — the layer's own
+        // seeded by the root stack's composed set; the plain fast path never
+        // touches them. A true `has_expr_sublayer` implies an edge build ran,
+        // which minted the root stack first, so its composed set is present.
+        let stack_vars = if self.has_expr_sublayer(root_layer) {
+            let seed = self.stacks.expression_variables(LayerStackId::ROOT);
+            self.composed_stack_vars(root_layer, seed)
+        } else {
+            HashMap::new()
+        };
+        let mut resolution = HashMap::new();
+        Cow::Owned(self.stack_members_uncached(root_layer, &stack_vars, &mut resolution, None))
+    }
+
+    /// The stage's root layer stack (registry instance 0): session layers (identity
+    /// offset) followed by the root layer and its sublayers with their effective
+    /// offsets (spec 10.3.1). The set of layers a top-level prim index scans for
+    /// local opinions.
+    pub(crate) fn root_layer_stack(&self) -> &[(LayerId, LayerOffset)] {
+        self.stacks.members(LayerStackId::ROOT)
+    }
+
+    /// Whether `layer` is a member of the root layer stack (C++
+    /// `PcpLayerStack::HasLayer`).
+    pub(crate) fn in_root_stack(&self, layer: LayerId) -> bool {
+        self.root_layer_stack().iter().any(|&(id, _)| id == layer)
+    }
+
+    /// Resolves a [`LayerStackId`] back to its members (the `(layer id, effective
+    /// offset)` pairs in strength order) from the registry. Empty for a stack whose
+    /// root is unknown or muted.
+    pub(crate) fn layer_stack(&self, id: LayerStackId) -> &[(LayerId, LayerOffset)] {
+        self.stacks.members(id)
+    }
+
+    /// The layers of `id`'s stack, strongest first, each once: a stack lists a
+    /// sublayer two of its sublayers share at each place it is reached.
+    pub(crate) fn distinct_members(&self, id: LayerStackId) -> Vec<LayerId> {
+        let mut seen = HashSet::new();
+        self.layer_stack(id)
+            .iter()
+            .map(|&(layer, _)| layer)
+            .filter(|layer| seen.insert(*layer))
+            .collect()
+    }
+
+    /// The members of `id`'s stack, or `None` when the registry no longer holds
+    /// the instance — the presence-aware read for introspection over a handle
+    /// that may be a stale view (a node cloned out of a dropped index whose
+    /// stack a sweep reclaimed).
+    pub(crate) fn try_layer_stack(&self, id: LayerStackId) -> Option<&[(LayerId, LayerOffset)]> {
+        self.stacks.try_members(id)
+    }
+
+    /// The strongest (representative) layer of the stack `id` — its
+    /// [`layer_stack`](Self::layer_stack)'s first member — or [`LayerId::INVALID`]
+    /// when the stack is empty (an unknown or muted root).
+    pub(crate) fn layer_stack_root(&self, id: LayerStackId) -> LayerId {
+        self.stacks.members(id).first().map_or(LayerId::INVALID, |&(li, _)| li)
+    }
+
+    /// Rebuilds the sublayer edges and relocate data from the current layer
+    /// data, refreshing both [`cycles`](GraphDiagnostics::cycles) and
+    /// [`relocates`](GraphDiagnostics::relocates). Called after a
+    /// `subLayers`/`subLayerOffsets` edit, where the graph's edges may be stale.
+    ///
+    /// `edited` names the layers whose root metadata the edit authored; together
+    /// with the edges the rebuild finds changed, it scopes the stack re-resolution
+    /// to the instances the change can affect. `None` re-resolves every stack.
+    /// Layers that joined the graph are wired by
+    /// [`wire_joined`](Self::wire_joined).
+    ///
+    /// Returns the affected layer set the caller drops cached indices against — the
+    /// layers whose composed edges shifted (unioned with `edited`) plus those whose
+    /// relocate pairs changed, so eviction covers exactly the stacks the rebuild
+    /// re-resolved; empty when `edited` is `None` apart from the relocate set (a
+    /// full pass scopes nothing) — together with the [`StackVarsDelta`]s the stack
+    /// rebuild emitted, which only an `expressionVariables` edit's change
+    /// processing consumes.
+    pub(crate) fn recompute_sublayers(&mut self, edited: Option<&HashSet<LayerId>>) -> SublayerRecompute {
+        let scope = edited.map_or(EdgeScope::All, EdgeScope::Edited);
+        let (affected, vars_deltas) = self.build_sublayer_edges(scope);
+        let mut affected = affected.unwrap_or_default();
+        affected.extend(self.recompute_relocates());
+        SublayerRecompute { affected, vars_deltas }
+    }
+
+    /// Wires the layers in `joined`, which just joined the graph, into the
+    /// sublayer edges and the composed stacks. Only the joined layers and the
+    /// parents whose entries a join can take over are re-resolved, and only
+    /// the stacks reaching a changed edge or open to a join
+    /// ([`SublayerState::unsettled`]) recompose; a layer that joined earlier
+    /// keeps the edges it has.
+    ///
+    /// Returns the layers whose relocate pairs changed, which the caller drops
+    /// cached indices against. Relocates are revalidated when a loaded layer
+    /// holds valid pairs or a joined layer authors some. A joined layer
+    /// authoring none still opens a conflict scope over the loaded layers it
+    /// sublayers.
+    pub(crate) fn wire_joined(&mut self, joined: &HashSet<LayerId>) -> HashSet<LayerId> {
+        // Stack deltas matter only to `expressionVariables` change processing,
+        // which a join is not.
+        let _ = self.build_sublayer_edges(EdgeScope::Joined(joined));
+        let joined_relocates = {
+            let view = self.read_view();
+            joined.iter().any(|id| !view.layer(*id).relocates().is_empty())
+        };
+        if self.has_relocates || joined_relocates {
+            self.recompute_relocates()
+        } else {
+            HashSet::new()
+        }
+    }
+
+    /// The variable names whose value differs between the interned
+    /// expression-variable contexts `old` and `new` — how change processing
+    /// resolves a [`StackVarsDelta`]'s before/after pair into the C++
+    /// changed-name predicate
+    /// (`PcpChanges::_DidChangeLayerStackExpressionVariables`).
+    pub(crate) fn changed_var_names(&self, old: ExprVarId, new: ExprVarId) -> HashSet<String> {
+        self.stacks.changed_var_names(old, new)
+    }
+
+    /// The variable names the stack's `${VAR}` `subLayers` entries read when its
+    /// members were last composed. A variable edit hitting one of these can swap
+    /// the stack's membership, so change processing treats it as significant for
+    /// every prim using the stack (C++ `GetExpressionVariableDependencies`).
+    pub(crate) fn stack_sublayer_var_deps(&self, id: LayerStackId) -> &HashSet<String> {
+        self.stacks.sublayer_var_deps(id)
+    }
+
+    /// Re-derives every node's structurally valid relocate pairs from its
+    /// current layer data, replacing [`relocates`](GraphDiagnostics::relocates)
+    /// with the recoverable relocate diagnostics (C++
+    /// `PcpErrorInvalidAuthoredRelocates` and conflict diagnostics). Run once at
+    /// construction and again whenever a `subLayers`/`layerRelocates` edit
+    /// lands.
+    ///
+    /// Returns the layers whose cached relocate pairs changed, so a mute toggle
+    /// can fan out to the prims reading them (see
+    /// [`recompose_for_mute_with_fanout`](Self::recompose_for_mute_with_fanout))
+    /// without a separate before/after snapshot. Validation reads only authored
+    /// layer data, so each layer's new pairs are moved out of `relocates` into
+    /// the node cache.
+    pub(crate) fn recompute_relocates(&mut self) -> HashSet<LayerId> {
+        let (mut relocates, errors) = validate_layer_relocates(&self.read_view());
+        self.has_relocates = false;
+        let mut changed = HashSet::new();
+        for &id in &self.order {
+            let pairs = relocates.remove(&id).unwrap_or_default();
+            self.has_relocates |= !pairs.is_empty();
+            let node = self.nodes.get_mut(&id).expect("layer node exists");
+            if node.relocates != pairs {
+                changed.insert(id);
+            }
+            node.relocates = pairs;
+        }
+        self.diagnostics.relocates = errors;
+        changed
+    }
+
+    /// The current layer-graph diagnostics — sublayer cycles
+    /// ([`cycles`](GraphDiagnostics::cycles)), relocate errors
+    /// ([`relocates`](GraphDiagnostics::relocates)), then per-stack sublayer
+    /// errors ([`SublayerState::diagnostics`]). Always reflects the
+    /// present graph state: a fixed cycle, relocate, expression, or removed
+    /// entry stops appearing and a recompute never duplicates one, since each
+    /// bucket is replaced on rebuild.
+    pub(crate) fn errors(&self) -> Diagnostics {
+        let mut held: Diagnostics = self.diagnostics.iter().cloned().collect();
+        // A parent composing into several stacks derives the same per-referrer
+        // diagnostic into each stack's bucket, which the collection folds back
+        // into one.
+        held.extend(self.sublayers.diagnostics().cloned());
+        held
+    }
+
+    /// The ordered layer-id stacks, one per sublayer stack (one rooted at each
+    /// layer) plus the stage root stack. Used to scope relocate conflicts and
+    /// duplicate-source strength to a single layer stack (C++
+    /// `Pcp_ComputeRelocationsForLayerStack`).
+    pub(crate) fn relocate_conflict_scopes(&self) -> Vec<Vec<LayerId>> {
+        let mut scopes: Vec<Vec<LayerId>> = self
+            .order
+            .iter()
+            .map(|&id| self.sublayer_stack(id).iter().map(|&(layer, _)| layer).collect())
+            .collect();
+        scopes.push(self.root_layer_stack().iter().map(|&(id, _)| id).collect());
+        scopes
+    }
+
+    /// The relocation source for `target` if a layer in `ambient` relocates a
+    /// prim onto it (C++ `GetIncrementalRelocatesTargetToSource`). The strongest
+    /// layer wins a collision; a deletion relocate has no target and is skipped.
+    pub(crate) fn relocation_source(&self, ambient: LayerStackId, target: &Path) -> Option<Path> {
+        self.incremental_relocate_entries(ambient)
+            .into_iter()
+            .find_map(|(source, relocate_target, _)| {
+                (!relocate_target.is_empty() && relocate_target == *target).then_some(source)
+            })
+    }
+
+    /// The relocation [`MapFunction`] applying at `path` in the layer stack
+    /// `ambient` (C++ `PcpLayerStack::GetExpressionForRelocatesAtPath`): every
+    /// relocate whose source lies at or below `path`, chained, plus the `(/, /)`
+    /// identity catch-all. `None` when no relocate affects `path`. `exclude_source`
+    /// drops the relocate whose source is exactly that path.
+    pub(crate) fn relocates_expression_at(
+        &self,
+        ambient: LayerStackId,
+        path: &Path,
+        exclude_source: Option<&Path>,
+    ) -> Option<MapFunction> {
+        let mut pairs: Vec<(Path, Path)> = self
+            .combined_relocates(ambient)
+            .into_iter()
+            .filter(|(source, target)| !target.is_empty() && source.has_prefix(path) && Some(source) != exclude_source)
+            .collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        pairs.push((Path::abs_root(), Path::abs_root()));
+        Some(MapFunction::new(pairs))
+    }
+
+    /// The stack-effective relocates of `ambient`, strongest layer first, after
+    /// duplicate-source and conflict dropping (C++ `GetIncrementalRelocates*`).
+    /// Not chained.
+    fn incremental_relocate_entries(&self, ambient: LayerStackId) -> Vec<(Path, Path, LayerId)> {
+        let mut entries: Vec<(Path, Path, LayerId)> = Vec::new();
+        for &(layer, _) in self.layer_stack(ambient).iter() {
+            let Some(node) = self.nodes.get(&layer) else {
+                continue;
+            };
+            for (source, target) in &node.relocates {
+                entries.push((source.clone(), target.clone(), layer));
+            }
+        }
+        let pairs: RelocateList = entries
+            .iter()
+            .map(|(source, target, _)| (source.clone(), target.clone()))
+            .collect();
+        let status = analyze_relocate_occurrences(&pairs);
+        entries
+            .into_iter()
+            .zip(status)
+            .filter_map(|(entry, status)| status.is_active().then_some(entry))
+            .collect()
+    }
+
+    /// Chains the per-layer authored relocates of `ambient` into a single
+    /// source→target map (C++ `GetRelocatesSourceToTarget`): a target that is
+    /// itself a relocation source follows on to the final target, and a relocate
+    /// authored *under* another's target contributes a combined
+    /// pre-relocation-source → final-target pair so a single map application
+    /// reaches the final location through nested relocates.
+    pub(crate) fn combined_relocates(&self, ambient: LayerStackId) -> RelocateList {
+        let mut pairs: RelocateList = self
+            .incremental_relocate_entries(ambient)
+            .into_iter()
+            .map(|(source, target, _)| (source, target))
+            .collect();
+        let snapshot = pairs.clone();
+        for (source, target) in pairs.iter_mut() {
+            if target.is_empty() {
+                continue;
+            }
+            *target = chain_through_relocates(target, &snapshot, Some(source));
+        }
+
+        // Nested relocates: a relocate `s2 → t2` whose source `s2` lies under
+        // another's target `t1` (from `s1 → t1`) means content moved to `t1` is
+        // moved on. Express that as a pair from the pre-relocation source
+        // (`s1` + the suffix of `s2` below `t1`) straight to `t2`, so one map
+        // application covers the whole chain. Iterated to a fixpoint over chains
+        // of any depth; bounded by the relocate count.
+        // TODO(perf): this is O(relocates⁴) with the linear `.any` membership
+        // scans (a `sdf::PathSet` of seen sources would cut it); relocate counts
+        // are tiny in practice, and the per-ambient cache TODO at
+        // `IndexCache::compose_property_paths` would amortize it away.
+        for _ in 0..pairs.len() {
+            let mut added: Vec<(Path, Path)> = Vec::new();
+            for (s1, t1) in &pairs {
+                if t1.is_empty() {
+                    continue;
+                }
+                for (s2, t2) in &pairs {
+                    if s2 == s1 {
+                        continue;
+                    }
+                    let Some(combined) = s2.replace_prefix(t1, s1) else {
+                        continue;
+                    };
+                    // `combined == s2` is already excluded by the `pairs`
+                    // membership check (`s2` is in `pairs`).
+                    if !pairs.iter().any(|(s, _)| *s == combined) && !added.iter().any(|(s, _)| *s == combined) {
+                        added.push((combined, t2.clone()));
+                    }
+                }
+            }
+            if added.is_empty() {
+                break;
+            }
+            pairs.extend(added);
+        }
+        pairs
+    }
+
+    /// Whether a layer in `ambient` authors a relocate whose SOURCE is `source`
+    /// (the salted-earth prohibition test). Includes deletion relocates.
+    pub(crate) fn is_relocation_source(&self, ambient: LayerStackId, source: &Path) -> bool {
+        self.relocation_source_layer(ambient, source).is_some()
+    }
+
+    /// Identifier of the strongest layer in `ambient` that authors a relocate
+    /// whose SOURCE is `source`, or `None`.
+    pub(crate) fn relocation_source_layer(&self, ambient: LayerStackId, source: &Path) -> Option<&str> {
+        self.incremental_relocate_entries(ambient)
+            .into_iter()
+            .find_map(|(relocate_source, _, layer)| (relocate_source == *source).then(|| self.identifier(layer)))
+    }
+
+    /// The id of the layer interned under exactly `identifier` (the canonical,
+    /// resolver-produced form), or failing that the layer whose resolved real
+    /// path is `identifier`, or `None` (C++ `SdfLayer::Find`: by identifier,
+    /// then by real path). An authored relative path must be anchored to its
+    /// canonical identifier first (see [`find_relative`](Self::find_relative));
+    /// this is the registry lookup the anchored path then resolves through, and
+    /// the authoring surface keys a layer this way. The real-path alias is what
+    /// lets a layer found through a search directory — interned under the
+    /// search path — be named by the file it resolved to.
+    pub(crate) fn id_of(&self, identifier: &str) -> Option<LayerId> {
+        self.by_identifier
+            .get(identifier)
+            .or_else(|| self.by_real_path.get(identifier))
+            .copied()
+    }
+
+    /// The id of the layer `handle` names, or `None` when this graph does not
+    /// hold it.
+    pub(crate) fn id_of_handle(&self, handle: &sdf::LayerHandle) -> Option<LayerId> {
+        self.id_of(handle.identifier()).filter(|&id| self.handle(id) == handle)
+    }
+
+    /// The layer interned under the resolver-anchored identifier `anchored`,
+    /// or — when nothing is interned there — under the authored `asset_path`'s
+    /// [`in_memory_identifier`](crate::ar::Resolver::in_memory_identifier).
+    /// Anchoring wins so a relative path against a filesystem-backed layer never
+    /// resolves to an unrelated layer interned under the bare string, while an
+    /// in-memory layer keyed under that literal name (no filesystem anchor) still
+    /// resolves. The layer comes paired with whether the anchored identifier
+    /// matched. The shared lookup behind [`find_relative`](Self::find_relative)
+    /// and [`resolve_sublayer`](Self::resolve_sublayer).
+    fn anchored_or_bare(&self, anchored: &str, asset_path: &str) -> Option<(LayerId, bool)> {
+        match self.composing_id(anchored) {
+            Some(id) => Some((id, true)),
+            None => self
+                .composing_id(&self.registry.in_memory_identifier(asset_path))
+                .map(|id| (id, false)),
+        }
+    }
+
+    /// The layer `identifier` names, as [`id_of`](Self::id_of), when it takes
+    /// part in composition. A layer the graph holds only for value clips
+    /// ([`clip_only`](Self::clip_only)) answers to `id_of` alone, so an arc or
+    /// sublayer entry naming it loads it as any unloaded layer, which joins it
+    /// to composition.
+    pub(crate) fn composing_id(&self, identifier: &str) -> Option<LayerId> {
+        self.id_of(identifier).filter(|id| !self.clip_only.contains(id))
+    }
+
+    /// Whether the graph holds `id` only for value clips, so it takes no part
+    /// in composition.
+    pub(crate) fn is_clip_only(&self, id: LayerId) -> bool {
+        self.clip_only.contains(&id)
+    }
+
+    /// Adds `layer`, opened for a value clip, to the graph as a layer that
+    /// takes no part in composition, returning its id and whether it newly
+    /// joined. A layer the graph already holds keeps what it takes part in.
+    pub(crate) fn join_clip(&mut self, layer: sdf::LoadedLayer) -> (LayerId, bool) {
+        if let Some(id) = self.id_of(&layer.identifier) {
+            return (id, false);
+        }
+        let (id, fresh) = self.ensure_layer(layer);
+        if fresh {
+            self.clip_only.insert(id);
+            // A mute recorded while the layer was not held takes hold now, so
+            // a later open leaves it out.
+            self.resolve_muted_ids();
+        }
+        (id, fresh)
+    }
+
+    /// Forgets the recorded failure to open `asset_path`, returning whether
+    /// there was one: the asset has since opened.
+    pub(crate) fn forget_load_failure(&mut self, asset_path: &str) -> bool {
+        self.failed_loads.remove(asset_path).is_some()
+    }
+
+    /// Resolves `asset_path` as authored in `anchor`, anchoring it through the
+    /// resolver to a canonical identifier, then looking that up exactly (C++
+    /// `SdfLayer::FindRelativeToLayer`). The resolver owns anchoring and
+    /// canonicalization, so a `..` path or a symlinked leaf resolves to the same
+    /// canonical identifier the load path (`LayerRegistry::open_sublayers`)
+    /// interned the layer under — the lookup is an exact registry hit that agrees
+    /// with the load path by construction.
+    ///
+    /// The anchored identifier — the asset USD resolves a relative path to — is
+    /// tried first. Only when no layer is interned there does it fall back to the
+    /// bare authored string, which lets an in-memory layer keyed under that
+    /// literal name (with no filesystem location to anchor against) resolve.
+    /// Anchoring first means a relative path against a filesystem-backed layer
+    /// never resolves to an unrelated layer that merely happens to be interned
+    /// under the bare string.
+    pub(crate) fn find_relative(&self, asset_path: &str, anchor: LayerId) -> Option<LayerId> {
+        self.resolve_relative(asset_path, anchor).ok()
+    }
+
+    /// The resolution behind [`find_relative`](Self::find_relative), keeping
+    /// the miss: returns the interned layer, or `Err` with the anchored
+    /// canonical identifier the asset would intern under — the form the
+    /// on-demand loader opens a sublayer demand at, and the key load failures
+    /// and open attempts are recorded by.
+    pub(crate) fn resolve_relative(&self, asset_path: &str, anchor: LayerId) -> Result<LayerId, String> {
+        let anchored = self.read_view().absolute_path(anchor, asset_path);
+        self.anchored_or_bare(&anchored, asset_path)
+            .map(|(id, _)| id)
+            .ok_or(anchored)
+    }
+
+    /// [`resolve_sublayer`](Self::resolve_sublayer) for a demanded sublayer
+    /// entry at the load barrier, over the graph's own memo
+    /// ([`SublayerState::resolution`]): the entry resolves to the layer the
+    /// barrier already interned, or yields the anchored identifier to open.
+    pub(crate) fn refresh_demanded_sublayer(&mut self, parent: LayerId, sub_path: &str) -> Result<LayerId, String> {
+        let mut resolution = mem::take(&mut self.sublayers.resolution);
+        let resolved = self.resolve_sublayer(parent, sub_path, &mut resolution);
+        self.sublayers.resolution = resolution;
+        resolved.map(|(id, _)| id)
+    }
+
+    /// Mutes the layer with the given identifier so it contributes no opinions to
+    /// composition (C++ `PcpCache::RequestLayerMuting`), recomposing the
+    /// muting-dependent graph state. Returns what changed (see [`MuteChange`]), or
+    /// `None` when nothing did: the identifier was already muted, or it resolves to
+    /// the root layer, which cannot be muted ("would lead to empty layer stacks").
+    ///
+    /// The layer need not be loaded; the canonical identifier is stored and takes
+    /// effect the moment a later edit interns a matching layer (see
+    /// [`rebuild_sublayer_stacks`](Self::rebuild_sublayer_stacks), which
+    /// re-materializes the interned muted ids).
+    pub(crate) fn mute_layer(&mut self, identifier: String) -> Option<MuteChange> {
+        let canonical = self.canonical_muted_id(&identifier, self.anchor_location(self.root));
+        let named = self.named_layer(&canonical, self.anchor_location(self.root));
+        if self.is_root(named) {
+            return None;
+        }
+        let changed = if let Some(id) = named {
+            // The muted layer leaves every stack, and the graph at the mute's
+            // reclaim.
+            self.muted.insert(id).then(|| self.identity(id))?
+        } else {
+            if self.pending_of(&canonical, self.anchor_location(self.root)).is_some() {
+                return None;
+            }
+            let key = self.pending_key(&canonical).to_owned();
+            self.pending_mutes.insert(key.clone()).then_some(key)?
+        };
+        Some(self.recompose_for_mute_with_fanout(changed))
+    }
+
+    /// Unmutes the layer with the given identifier, restoring its opinions and
+    /// recomposing. Returns what changed (see [`MuteChange`]), or `None` when the
+    /// identifier was not muted. The identifier is canonicalized the same way
+    /// muting canonicalized it and resolved to the layer's identity, so any
+    /// spelling of one layer unmutes it, whichever spelling muted it.
+    pub(crate) fn unmute_layer(&mut self, identifier: &str) -> Option<MuteChange> {
+        let anchor = self.anchor_location(self.root);
+        let canonical = self.canonical_muted_id(identifier, anchor);
+        let changed = match self.named_layer(&canonical, anchor) {
+            Some(id) if self.muted.remove(&id) => self.identity(id),
+            _ => {
+                let key = self.pending_of(&canonical, self.anchor_location(self.root))?;
+                self.pending_mutes.remove(&key);
+                self.forget_aliases(&key);
+                key
+            }
+        };
+        Some(self.recompose_for_mute_with_fanout(changed))
+    }
+
+    /// The key a pending mute of `canonical` is kept under: the identifier a
+    /// freed muted layer's other spelling stands for, or `canonical` itself.
+    fn pending_key<'a>(&'a self, canonical: &'a str) -> &'a str {
+        self.freed_aliases.get(canonical).map_or(canonical, String::as_str)
+    }
+
+    /// Drops the other spellings of the freed muted layer `identifier`, whose
+    /// pending mute just ended.
+    fn forget_aliases(&mut self, identifier: &str) {
+        self.freed_aliases.retain(|_, muted| muted != identifier);
+    }
+
+    /// The identity a loaded layer is muted under: its interned identifier.
+    fn identity(&self, id: LayerId) -> String {
+        self.nodes[&id].handle.identifier().to_string()
+    }
+
+    /// Recomposes the muting-dependent graph state for a just-changed muted set
+    /// and returns the [`MuteChange`] for the toggle of the layer with
+    /// canonical identifier `changed`. The layers it can invalidate are the
+    /// structural [`mute_fanout`](Self::mute_fanout) plus any layer whose
+    /// cached relocate pairs the recompose changed, and its stacks are those
+    /// holding one of them before or after the recompose.
+    ///
+    /// Relocate extraction omits muted layers and refreshes diagnostics in the
+    /// graph. Any layer whose cached relocate pairs change is added to the
+    /// fanout so dependent prims rebuild against the current stack state.
+    fn recompose_for_mute_with_fanout(&mut self, changed: String) -> MuteChange {
+        let mut affected = self.mute_fanout(&changed);
+        let mut stacks: BTreeSet<LayerStackId> = affected.iter().flat_map(|&id| self.stacks_using(id)).collect();
+        affected.extend(self.recompose_for_mute());
+        stacks.extend(affected.iter().flat_map(|&id| self.stacks_using(id)));
+        MuteChange { changed, stacks }
+    }
+
+    /// The interned layers a (un)mute of the layer with canonical identifier
+    /// `canonical` can invalidate: the layer itself and every layer whose
+    /// `subLayers` subtree contains it. Empty when no loaded layer has that
+    /// identifier — muting a not-yet-loaded layer changes no composed index.
+    ///
+    /// A composed prim index is affected by toggling the layer exactly when one
+    /// of its nodes resolves against a layer stack containing it, and a sublayer
+    /// stack contains a layer iff its root layer does, so the set's members are
+    /// the stack roots whose nodes a dependent index would list. Both the
+    /// identifier lookup and the subtree edges are independent of the muted set,
+    /// so the set is identical whether computed before muting or after unmuting.
+    ///
+    /// The stage root layer stack is the one stack that is not a single sublayer
+    /// subtree: it glues the session layers (and their subtrees) onto the root
+    /// layer's subtree. A toggle anywhere in it can change every prim that
+    /// composes locally against it, and such a prim always retains the root layer
+    /// in its composition (the root layer is never muted), so when a session
+    /// layer is in the set the root layer is added as the anchor a dependent
+    /// index is found through.
+    fn mute_fanout(&self, canonical: &str) -> HashSet<LayerId> {
+        let Some(id) = self.id_of(canonical) else {
+            return HashSet::new();
+        };
+        let mut affected = self.ancestors_including(id);
+        if let Some(root) = self.root
+            && self.session_layers().iter().any(|s| affected.contains(s))
+        {
+            affected.insert(root);
+        }
+        affected
+    }
+
+    /// Every layer whose `subLayers` subtree contains `target`, including
+    /// `target` itself. Derived from the sublayer edges, which `subLayers`
+    /// metadata is the single source of truth for and which muting never alters,
+    /// so the result does not depend on the current muted set. A `${VAR}` sublayer
+    /// is absent from the context-free [`LayerNode::children`], so the edges only a
+    /// stack's variables resolve are supplied by
+    /// [`expression_ancestry_edges`](Self::expression_ancestry_edges).
+    fn ancestors_including(&self, target: LayerId) -> HashSet<LayerId> {
+        let mut found = HashSet::from([target]);
+        let expr_edges = self.expression_ancestry_edges();
+        // The sublayer DAG holds one node per loaded layer, so growing the set to
+        // a fixpoint — add any layer with a child already in it, until it stops
+        // growing — is cheaper than materializing a reverse-edge index.
+        let mut growing = true;
+        while growing {
+            growing = false;
+            for (&id, node) in &self.nodes {
+                if found.contains(&id) {
+                    continue;
+                }
+                let reaches = node.children.iter().any(|&(child, _)| found.contains(&child))
+                    || expr_edges
+                        .get(&id)
+                        .is_some_and(|children| children.iter().any(|c| found.contains(c)));
+                if reaches {
+                    found.insert(id);
+                    growing = true;
+                }
+            }
+        }
+        found
+    }
+
+    /// The sublayer edges only a stack's expression variables resolve, keyed by the
+    /// parent layer — the supplement the context-free [`LayerNode::children`] omit, so
+    /// [`ancestors_including`](Self::ancestors_including) still finds a stack root whose
+    /// `${VAR}` sublayer selects the target. Each stack's subtree is resolved against
+    /// its own variables (the root stack's structural variables for the stage root
+    /// stack's root and session regions, a seed for a target), read regardless of
+    /// muting so the ancestor set is identical across the interned stacks before a
+    /// mute and after the matching unmute.
+    fn expression_ancestry_edges(&self) -> HashMap<LayerId, Vec<LayerId>> {
+        let mut edges: HashMap<LayerId, Vec<LayerId>> = HashMap::new();
+        if !self.sublayers.any_expr {
+            return edges;
+        }
+        // The roots of every stack whose subtree can hold an expression edge: the
+        // stage root stack — both its root region and its session region, each
+        // resolved against the structural root-stack variables so a session
+        // sublayer sees the stage root's variables too — and every interned
+        // target stack, resolved against its stored composed set (the same set
+        // its `${VAR}` sublayer edges resolved against on the last rebuild).
+        let structural = self.root_stack_structural_vars();
+        let mut specs: Vec<(LayerId, &HashMap<String, Value>)> = Vec::new();
+        if let Some(root) = self.root {
+            specs.push((root, &structural));
+        }
+        if let Some(&session_root) = self.session_layers().first() {
+            specs.push((session_root, &structural));
+        }
+        specs.extend(
+            self.stacks
+                .targets()
+                .into_iter()
+                .map(|(id, root, _)| (root, self.stacks.expression_variables(id))),
+        );
+        let mut resolution = HashMap::new();
+        for (root, vars) in specs {
+            if !self.has_expr_sublayer(root) {
+                continue;
+            }
+            for (parent, resolved) in self.compose_stack_edges(root, vars, &mut resolution, None) {
+                edges
+                    .entry(parent)
+                    .or_default()
+                    .extend(resolved.into_iter().map(|(child, _)| child));
+            }
+        }
+        edges
+    }
+
+    /// Seeds the muted set from `identifiers` (open-time muting), then recomposes
+    /// once — cheaper than a `mute_layer` per identifier, which would recompose on
+    /// each. Canonicalizes each against the root layer and drops any that names the
+    /// root (which cannot be muted); the spellings of one layer collapse onto its
+    /// identity, so [`muted_layers`](Self::muted_layers) lists each muted layer
+    /// once.
+    pub(crate) fn set_muted_identifiers(&mut self, identifiers: impl IntoIterator<Item = String>) {
+        let root_anchor = self.anchor_location(self.root).cloned();
+        for identifier in identifiers {
+            let canonical = self.canonical_muted_id(&identifier, root_anchor.as_ref());
+            let named = self.named_layer(&canonical, root_anchor.as_ref());
+            if self.is_root(named) {
+                continue;
+            }
+            match named {
+                Some(id) => {
+                    self.muted.insert(id);
+                }
+                None if self.pending_of(&canonical, root_anchor.as_ref()).is_none() => {
+                    self.pending_mutes.insert(canonical);
+                }
+                None => {}
+            }
+        }
+        self.recompose_for_mute();
+    }
+
+    /// Whether the layer named by this identifier is muted, matching by canonical
+    /// identifier anchored against the root layer (C++ `PcpCache::IsLayerMuted`),
+    /// so any spelling of one layer reads alike — including, for a loaded layer,
+    /// its identifier and its real path (see [`id_of`](Self::id_of)).
+    pub(crate) fn is_layer_muted(&self, identifier: &str) -> bool {
+        self.has_muted_layers()
+            && self
+                .muted_identity(identifier, self.anchor_location(self.root))
+                .is_some()
+    }
+
+    /// The muted-set entry the layer `path`, authored at `anchor`, names (see
+    /// [`mute_keys`](Self::mute_keys)), or `None` when it names no muted
+    /// layer.
+    fn muted_identity(&self, path: &str, anchor: Option<&ResolvedPath>) -> Option<String> {
+        let canonical = self.canonical_muted_id(path, anchor);
+        self.mute_keys(&canonical, anchor)
+            .iter()
+            .find_map(|key| self.muted_entry(key))
+    }
+
+    /// The loaded layer a mute keyed `canonical`, anchored at `anchor`,
+    /// names (see [`mute_keys`](Self::mute_keys)).
+    fn named_layer(&self, canonical: &str, anchor: Option<&ResolvedPath>) -> Option<LayerId> {
+        self.mute_keys(canonical, anchor).iter().find_map(|key| self.id_of(key))
+    }
+
+    /// The pending mute a mute keyed `canonical`, anchored at `anchor`, names
+    /// (see [`mute_keys`](Self::mute_keys)), by the key it is kept under.
+    fn pending_of(&self, canonical: &str, anchor: Option<&ResolvedPath>) -> Option<String> {
+        self.mute_keys(canonical, anchor)
+            .iter()
+            .map(|key| self.pending_key(key))
+            .find(|key| self.pending_mutes.contains(*key))
+            .map(str::to_owned)
+    }
+
+    /// The identifiers a mute keyed `canonical`, anchored at `anchor`, names
+    /// a layer by, in the order they are tried: `canonical`, and for a mute
+    /// with no anchor, an anonymous root's, keyed by the path as spelled,
+    /// the identifier the registry loads that spelling as, anchored where a
+    /// path with no anchor is.
+    fn mute_keys(&self, canonical: &str, anchor: Option<&ResolvedPath>) -> Vec<String> {
+        let mut keys = vec![canonical.to_owned()];
+        // TODO(perf): the identifier is derived again on every mute query of
+        // an anonymous root's stage, a filesystem canonicalize apiece; it is
+        // fixed per spelling and could be kept beside the pending mute.
+        if anchor.is_none() {
+            let view = self.read_view();
+            let loaded = sdf::absolute_path_with(&self.registry, None, canonical, &mut sdf::HeldListing(&view.store));
+            if loaded != canonical {
+                keys.push(loaded);
+            }
+        }
+        keys
+    }
+
+    /// The identity under which the layer with canonical identifier `canonical`
+    /// is muted — a loaded layer's interned identifier, or the pending canonical
+    /// identifier of one not yet loaded — or `None` when it is not muted. The
+    /// identifier and real-path spellings of a loaded layer (see
+    /// [`id_of`](Self::id_of)) read alike.
+    fn muted_entry(&self, canonical: &str) -> Option<String> {
+        let loaded = self.id_of(canonical).filter(|id| self.muted.contains(id));
+        let pending = self.pending_key(canonical);
+        loaded
+            .map(|id| self.identity(id))
+            .or_else(|| self.pending_mutes.contains(pending).then(|| pending.to_string()))
+    }
+
+    /// Whether any layer is muted at all. A cheap gate so the per-arc mute check
+    /// skips its anchoring work on the common unmuted stage.
+    pub(crate) fn has_muted_layers(&self) -> bool {
+        !self.muted.is_empty() || !self.pending_mutes.is_empty()
+    }
+
+    /// What the graph has of the layer `identifier`, the canonical identifier
+    /// a stack open derived, for the loaders. A muted layer contributes
+    /// nothing, and the open leaves it out.
+    pub(crate) fn presence(&self, identifier: &str) -> sdf::Presence {
+        match self.id_of(identifier) {
+            Some(id) if self.muted.contains(&id) => sdf::Presence::Excluded,
+            // A layer held only for value clips joins composition through the
+            // open.
+            Some(id) if self.clip_only.contains(&id) => sdf::Presence::Absent,
+            Some(_) => sdf::Presence::Held,
+            None if self.pending_mutes.contains(self.pending_key(identifier)) => sdf::Presence::Excluded,
+            None => sdf::Presence::Absent,
+        }
+    }
+
+    /// The muted-set identifier the sublayer entry `asset_path`, authored in
+    /// the layer anchored at `anchor`, names (see
+    /// [`muted_identity`](Self::muted_identity); C++
+    /// `Pcp_MutedLayers::IsLayerMuted`), or `None` when it names no muted
+    /// layer. Unlike [`is_muted`](Self::is_muted), this matches before the
+    /// layer is interned, so the on-demand loader can recognize a muted
+    /// sublayer and skip opening it.
+    pub(crate) fn muted_asset_id(&self, asset_path: &str, anchor: Option<&ResolvedPath>) -> Option<String> {
+        if !self.has_muted_layers() {
+            return None;
+        }
+        self.muted_identity(asset_path, anchor)
+    }
+
+    /// The muted-set entry the reference or payload target `identifier`
+    /// names, or `None` when it names no muted layer. `identifier` is the
+    /// target as composition anchored it against the arc's authoring layer,
+    /// the one a build looks the target up under, so the mute matches the
+    /// layer the arc would load (C++ `_EvalRefOrPayloadArcs` checks the
+    /// authoring `srcLayer`).
+    ///
+    /// The entry is the one an unmute toggles, so a target not yet loaded
+    /// records it as the trace an unmute fans out through.
+    pub(crate) fn muted_target(&self, identifier: &str) -> Option<String> {
+        if !self.has_muted_layers() {
+            return None;
+        }
+        self.muted_entry(identifier)
+    }
+
+    /// The layers of every composed stack — the effectively-present set the stage
+    /// filters muted collection diagnostics against (see
+    /// [`retain_contributing`](Self::retain_contributing)). Read from
+    /// the composed stacks (muting has pruned their muted subtrees), so it is a
+    /// pure function of the muted set and the live stacks. Like the rest of the
+    /// lazily composed state, the set reflects the composition performed so far:
+    /// reclamation removes an unreferenced stack's members, and recomposition
+    /// re-derives them.
+    fn effective_layers(&self) -> HashSet<LayerId> {
+        self.stacks.member_layers()
+    }
+
+    /// Keeps only the collection diagnostics that still describe the composed
+    /// state once muting is applied. The loader reports every load failure raw,
+    /// unaware of muting, so a sublayer failure under a muted branch has to be
+    /// filtered out here rather than discarded at load; unmuting restores it
+    /// because the raw copy was never dropped.
+    ///
+    /// Whether anything can be suppressed is this graph's own knowledge — an
+    /// unmuted stage suppresses nothing, and muting only ever reaches sublayer
+    /// diagnostics — so the effective-layer set is built only once something in
+    /// `diagnostics` could be affected by it.
+    pub(crate) fn retain_contributing(&self, mut diagnostics: Diagnostics) -> Diagnostics {
+        if !self.has_muted_layers() || !diagnostics.iter().any(|d| sublayer_source(d).is_some()) {
+            return diagnostics;
+        }
+        let effective = self.effective_layers();
+        diagnostics.retain(|diagnostic| self.sublayer_diagnostic_contributes(diagnostic, &effective));
+        diagnostics
+    }
+
+    /// Whether one diagnostic survives the muting filter. A non-sublayer
+    /// diagnostic always does. A missing or unreadable sublayer survives only
+    /// when its referencing layer is `effective` (a member of some composed
+    /// stack) and the sublayer it names is not itself muted; otherwise muting
+    /// prunes it and the raw diagnostic is spurious. The `effective` set is a
+    /// pure function of the muted set and the live stacks (see
+    /// [`effective_layers`](Self::effective_layers)).
+    fn sublayer_diagnostic_contributes(
+        &self,
+        diagnostic: &CompositionDiagnostic,
+        effective: &HashSet<LayerId>,
+    ) -> bool {
+        let Some((asset_path, introduced_by)) = sublayer_source(diagnostic) else {
+            return true;
+        };
+        let Some(referrer) = self.id_of(introduced_by) else {
+            return true;
+        };
+        effective.contains(&referrer)
+            && self
+                .muted_asset_id(asset_path, self.anchor_location(Some(referrer)))
+                .is_none()
+    }
+
+    /// The muted layers — a loaded one by its identifier, a pending one by the
+    /// canonical identifier it was muted under — sorted for a deterministic
+    /// result.
+    pub(crate) fn muted_layers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .muted
+            .iter()
+            .map(|&id| self.identity(id))
+            .chain(self.pending_mutes.iter().cloned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Whether the layer with this id is muted, i.e. excluded from every stack.
+    /// A muted layer contributes nothing to composition — not its opinions, its
+    /// stage metadata, or its diagnostics.
+    pub(crate) fn is_muted(&self, id: LayerId) -> bool {
+        self.muted.contains(&id)
+    }
+
+    /// Refreshes every muting-dependent piece of graph state after the muted set
+    /// changes: the sublayer stacks (rebuilding re-resolves the muted ids), the
+    /// sublayer-cycle diagnostics (a cycle through a muted layer no longer
+    /// composes), and the relocates, whose validation and conflict scopes both
+    /// drop muted layers. Returns the layers whose cached relocate pairs changed
+    /// (from [`recompute_relocates`](Self::recompute_relocates)).
+    fn recompose_for_mute(&mut self) -> HashSet<LayerId> {
+        // A mute toggles the muted set rather than the sublayer edges, so the
+        // edge-diff scoping `build_sublayer_edges` uses does not apply; re-resolve
+        // every instance (an unmuted layer rejoins stacks whose members no longer
+        // list it, which a member-set scope would miss). `rebuild_sublayer_stacks`
+        // refreshes the muted set and recomputes the root's session-seeded members,
+        // so muting a session layer that supplies a root `${VAR}` sublayer's variable
+        // re-resolves that sublayer out of (or into, among interned layers) the root
+        // stack. The vars deltas a mute can emit are discarded, and that costs
+        // neither invalidation nor notice.
+        //
+        // Only a session-layer toggle can move any stack's composed *values*: a
+        // stack's variables come from its own root layer overlaid by the
+        // referrer's (`expr::stack_variables`), sublayers contribute
+        // none, and a muted root still feeds its own — so
+        // `session_expression_variables` is the single muting-sensitive input,
+        // and the stage root layer can never be muted. `mute_fanout` answers such
+        // a toggle with the root layer, which every prim composing against the
+        // root layer stack retains, and `drop_index_victims` retires the
+        // prototypes those drops touch. So the asset-path channel `Changes::apply`
+        // publishes for a composed-variable move could name only indices the mute
+        // has already dropped.
+        let _ = self.rebuild_sublayer_stacks(None, &HashSet::new());
+        self.recompute_cycle_diagnostics();
+        self.recompute_relocates()
+    }
+
+    /// Moves every pending mute that now names a loaded layer into
+    /// [`muted`](Self::muted), at the start of every stack rebuild, so a layer
+    /// muted before it was loaded takes effect the moment a later edit interns
+    /// it. The root is never present: its identifier is rejected before any
+    /// entry is recorded (see [`is_root`](Self::is_root)).
+    fn resolve_muted_ids(&mut self) {
+        if self.pending_mutes.is_empty() {
+            return;
+        }
+        // A freed muted layer may join again under any spelling that named it.
+        let aliases = self.freed_aliases.iter();
+        let promoted: Vec<(String, LayerId)> = self
+            .pending_mutes
+            .iter()
+            .map(|canonical| (canonical, canonical))
+            .chain(aliases)
+            .filter_map(|(spelling, key)| self.id_of(spelling).map(|id| (key.clone(), id)))
+            .collect();
+        for (canonical, id) in promoted {
+            self.pending_mutes.remove(&canonical);
+            self.forget_aliases(&canonical);
+            self.muted.insert(id);
+        }
+    }
+
+    /// Whether `named`, the layer a mute names ([`named_layer`](Self::named_layer)),
+    /// is the root layer, which cannot be muted ("would lead to empty layer
+    /// stacks"). The single authority for rejecting a request to mute the
+    /// root, regardless of the spelling the caller supplied.
+    fn is_root(&self, named: Option<LayerId>) -> bool {
+        self.root.is_some_and(|root| named == Some(root))
+    }
+
+    /// The canonical identifier a muted-layer path resolves to (C++
+    /// `Pcp_MutedLayers::_GetCanonicalLayerId`): the identifier composition
+    /// anchors the path to, the one its layer is interned under (see
+    /// [`ensure_layer`](Self::ensure_layer)). With no `anchor`, an anonymous
+    /// root's, the path keeps its spelling: an in-memory layer is interned
+    /// under it, and the layer it loads as from the filesystem is found by
+    /// [`named_layer`](Self::named_layer).
+    ///
+    /// C++ keys a mute by the resolver's identifier for the path instead,
+    /// which for a path authored inside a package names a location beside
+    /// the package file, so one mute there can match the layers several
+    /// packaged layers name by one path. Keyed by the composition
+    /// identifier, a mute names the one layer the path loads.
+    ///
+    /// `anchor` is the layer the path is anchored against: the root layer for the
+    /// mute/unmute/query API, the arc's authoring layer for a reference/payload
+    /// target. Keying the muted set on this makes two spellings of one layer
+    /// collapse to a single entry and lets a not-yet-loaded target match the
+    /// identifier it will be interned under. The result is a pure function of
+    /// `(path, anchor)`, independent of which layers are currently loaded — so the
+    /// same physical layer never keys under different strings by load order.
+    ///
+    /// The path is anchored by [`sdf::absolute_path_with`] over the package
+    /// listings the store holds, as composition anchors.
+    fn canonical_muted_id(&self, path: &str, anchor: Option<&ResolvedPath>) -> String {
+        if anchor.is_none() {
+            return path.to_string();
+        }
+        let view = self.read_view();
+        sdf::absolute_path_with(&self.registry, anchor, path, &mut sdf::HeldListing(&view.store))
+    }
+}
+
+/// The graph releases its layers when it drops: a handle kept past it (one
+/// a stage gave out, such as [`Stage::layer`](crate::usd::Stage::layer)'s)
+/// holds only its own layer, not every layer the graph loaded.
+impl Drop for LayerGraph {
+    fn drop(&mut self) {
+        self.nodes.clear();
+        self.store.sweep();
+    }
+}
+
+/// A [`LayerGraph`] with its layers' content borrowed for reading: what a
+/// composition query reads layers through. It derefs to the graph for the
+/// structure (stacks, edges, identifiers) and adds [`layer`](Self::layer) for
+/// the content.
+///
+/// A view shares the graph's store for its lifetime. The stage takes one for
+/// a whole query and hands it to the builds, which read only through it.
+// TODO(rayon): a view holds a `Ref` guard on the store's `RefCell`, which is
+// not `Sync`, and parallel builds cannot share one. Lending the builds a
+// plain borrow of the store's slots, taken once by the stage, would let them.
+pub(crate) struct LayerView<'a> {
+    /// The graph whose layers are borrowed.
+    graph: GraphBorrow<'a>,
+    /// The borrow of the graph's store.
+    store: sdf::StoreRead<'a>,
+}
+
+/// How a [`LayerView`] holds its graph: borrowed outright, or through the
+/// cell the stage keeps it in. The second lets a view outlive the call that
+/// borrowed the cell.
+enum GraphBorrow<'a> {
+    /// A plain borrow.
+    Plain(&'a LayerGraph),
+    /// A borrow of the cell holding the graph.
+    Cell(sdf::Held<'a, LayerGraph>),
+}
+
+impl Deref for LayerView<'_> {
+    type Target = LayerGraph;
+
+    fn deref(&self) -> &LayerGraph {
+        match &self.graph {
+            GraphBorrow::Plain(graph) => graph,
+            GraphBorrow::Cell(graph) => graph,
+        }
+    }
+}
+
+impl<'a> LayerView<'a> {
+    /// A view of the graph in `graph`, whose layers `store` holds: the
+    /// graph's own store, kept by its owner beside the cell. Fails with
+    /// [`LayerError::Busy`](sdf::LayerError::Busy) while an edit holds them.
+    pub(crate) fn of(graph: sdf::Held<'a, LayerGraph>, store: &'a sdf::LayerStore) -> Result<Self, sdf::LayerError> {
+        debug_assert!(ptr::eq(&*graph.store, store), "the store is the graph's own");
+        Ok(Self {
+            store: store.read()?,
+            graph: GraphBorrow::Cell(graph),
+        })
+    }
+}
+
+impl LayerView<'_> {
+    /// `asset_path`, authored in the layer `anchor`, as an identifier through
+    /// the graph's registry (C++ `SdfComputeAssetPathRelativeToLayer`). The
+    /// packages its rules read are those the store holds beside `anchor`, so
+    /// no asset is read.
+    pub(crate) fn absolute_path(&self, anchor: LayerId, asset_path: &str) -> String {
+        sdf::absolute_path_with(
+            &self.registry,
+            self.anchor_location(Some(anchor)),
+            asset_path,
+            &mut sdf::HeldListing(&self.store),
+        )
+    }
+
+    /// The layer the graph's registry holds under `identifier`, or, with
+    /// `real_path`, the one it read from that location, whether or not the
+    /// graph names it.
+    pub(crate) fn held(&self, identifier: &str, real_path: Option<&str>) -> Option<&sdf::Layer> {
+        self.store.find(identifier, real_path)
+    }
+
+    /// The layer with the given id. Panics if the id is unknown.
+    pub(crate) fn layer(&self, id: LayerId) -> &sdf::Layer {
+        // TODO(perf): every per-prim spec probe lands here, and the lookup
+        // goes node map, then the handle's token, then the slot, then the
+        // slot's `Rc` to the layer. If the token hop shows in an
+        // open-and-traverse profile, key the slot from a copy of its key the
+        // node keeps.
+        self.store.layer(&self.nodes[&id].handle)
+    }
+
+    /// The layer with the given id, or `None` when the id names no layer in
+    /// this graph: the presence-checking counterpart of
+    /// [`layer`](Self::layer).
+    pub(crate) fn try_layer(&self, id: LayerId) -> Option<&sdf::Layer> {
+        Some(self.store.layer(&self.nodes.get(&id)?.handle))
+    }
+
+    /// The root layer (the first non-session layer), if any. Per spec 12.2.7,
+    /// pseudo-root layer metadata resolves from this layer alone.
+    pub(crate) fn root_layer(&self) -> Option<&sdf::Layer> {
+        self.root.map(|id| self.layer(id))
+    }
+
+    /// Pseudo-root layer metadata from the root layer only.
+    ///
+    /// Session-layer and sublayer opinions are intentionally ignored here,
+    /// matching spec 12.2.7.
+    pub(crate) fn root_layer_field(&self, field: &str) -> Result<Option<Value>, sdf::DataError> {
+        let root = Path::abs_root();
+        let Some(root_layer) = self.root_layer() else {
+            return Ok(None);
+        };
+        let Some(value) = root_layer.data().try_field(&root, field)? else {
+            return Ok(None);
+        };
+        if matches!(value.as_ref(), Value::ValueBlock) {
+            return Ok(None);
+        }
+        Ok(Some(value.into_owned()))
+    }
+
+    /// The `defaultPrim` token authored on `layer`, if any. Raw metadata: the
+    /// caller decides which layer to ask and what the token means (see
+    /// [`sdf::default_prim_path`](crate::sdf::default_prim_path)).
+    /// `None` for an id naming no layer here, like
+    /// [`try_identifier`](LayerGraph::try_identifier): a queued edit reaches
+    /// this holding an id that may have outlived its layer.
+    pub(crate) fn default_prim_token(&self, layer: LayerId) -> Option<tf::Token> {
+        self.try_layer(layer)?.default_prim()
+    }
+
+    /// The `defaultPrim` metadata from the root layer, if set.
+    ///
+    /// When session layers are present, `defaultPrim` is read from the first
+    /// non-session layer (the root layer), matching C++ behavior.
+    pub(crate) fn default_prim(&self) -> Option<tf::Token> {
+        self.default_prim_token(self.root_id()?)
+    }
+
+    /// Whether a layer stage metadata resolves from holds an opinion for
+    /// `field`, a [`Value::ValueBlock`] included: blocking a field is
+    /// authoring it.
+    pub(crate) fn has_stage_metadata(&self, field: &str) -> bool {
+        let root = Path::abs_root();
+        self.stage_metadata_layers()
+            .any(|id| self.layer(id).data().has_field(&root, field))
+    }
+}
+
+/// Depth-first pre-order walk of a sublayer subtree, composing each hop's offset
+/// and pruning muted layers, the shared traversal behind every composed stack.
+/// `children_of` supplies a layer's resolved sublayer edges — the shared
+/// context-free [`LayerNode::children`], or a stack's expression-resolved edges —
+/// so both build paths stay locked together. Runs on an explicit work stack so a
+/// deep chain does not overflow the native stack; an `Exit` frame pops the layer
+/// back out of the `ancestors` path after its subtree. A layer that sublayers
+/// itself transitively is a cycle and is skipped; an off-path duplicate (a sublayer
+/// diamond) is expanded again.
+fn collect_sublayers<'a>(
+    root: LayerId,
+    effective: LayerOffset,
+    members: &mut Vec<(LayerId, LayerOffset)>,
+    ancestors: &mut HashSet<LayerId>,
+    is_muted: impl Fn(LayerId) -> bool,
+    children_of: impl Fn(LayerId) -> &'a [(LayerId, LayerOffset)],
+) {
+    enum Step {
+        Enter(LayerId, LayerOffset),
+        Exit(LayerId),
+    }
+    let mut work = vec![Step::Enter(root, effective)];
+    while let Some(step) = work.pop() {
+        let (id, effective) = match step {
+            Step::Exit(id) => {
+                ancestors.remove(&id);
+                continue;
+            }
+            Step::Enter(id, effective) => (id, effective),
+        };
+        // A muted layer contributes nothing: skip it and its whole subtree.
+        if is_muted(id) {
+            continue;
+        }
+        members.push((id, effective));
+        ancestors.insert(id);
+        work.push(Step::Exit(id));
+        for &(child, edge_offset) in children_of(id).iter().rev() {
+            if !ancestors.contains(&child) {
+                work.push(Step::Enter(child, effective.concatenate(&edge_offset)));
+            }
+        }
+    }
+}
+
+/// Borrow `store`'s layers for the graph's own maintenance, which runs from
+/// stage operations between edits of the layers, never from inside one.
+fn maintenance_read(store: &sdf::LayerStore) -> sdf::StoreRead<'_> {
+    store
+        .read()
+        .expect("the graph is maintained only between edits of its layers")
+}
+
+#[cfg(test)]
+impl LayerGraph {
+    /// Mints the layer stack each demand resolves against, once its target
+    /// layer is interned: `id_of` the demanded asset, then
+    /// [`intern_external`](Self::intern_external) under the demand's context.
+    /// The demand drain the test harnesses run in place of the stage's load
+    /// barrier (whose own mint loop additionally re-checks contextual opens for
+    /// targets that joined mid-pass); their fixtures load every layer up front,
+    /// so a demand for a loaded target only ever needs interning, and one for
+    /// a target no fixture holds is an asset that does not resolve. Returns
+    /// whether anything changed, a new instance or a first recorded failure,
+    /// so the caller re-runs the composition pass that recorded the demands.
+    pub(crate) fn intern_demanded(&mut self, demands: &[Demand]) -> bool {
+        let mut progressed = false;
+        for demand in demands {
+            match self.id_of(demand.asset_path.as_str()) {
+                Some(root) => progressed |= self.intern_external(root, demand.context).1,
+                None if !self.load_failed(&demand.asset_path) => {
+                    self.mark_load_failed(&demand.asset_path, LoadFailure::Unresolved);
+                    progressed = true;
+                }
+                None => {}
+            }
+        }
+        progressed
+    }
+
+    /// Whether the registry still holds the stack's instance, for tests
+    /// asserting reclamation and re-minting.
+    pub(crate) fn stack_is_live(&self, id: LayerStackId) -> bool {
+        self.stacks.member_set(id).is_some()
+    }
+
+    /// The number of stack instances the registry currently holds, for tests
+    /// asserting reclamation keeps the registry bounded.
+    pub(crate) fn live_stack_count(&self) -> usize {
+        self.stacks.instance_count()
+    }
+
+    /// The number of per-stack sublayer diagnostic buckets, for tests
+    /// asserting reclamation retires diagnostics with their stacks.
+    pub(crate) fn diagnostic_bucket_count(&self) -> usize {
+        self.sublayers.errors.len()
+    }
+}
+
+/// The asset path a sublayer load diagnostic names and the identifier of the
+/// layer that authored it, or `None` for any other diagnostic.
+fn sublayer_source(diagnostic: &CompositionDiagnostic) -> Option<(&String, &String)> {
+    match diagnostic {
+        CompositionDiagnostic::UnresolvedSublayer {
+            asset_path,
+            introduced_by,
+        }
+        | CompositionDiagnostic::MalformedSublayer {
+            asset_path,
+            introduced_by,
+            ..
+        } => Some((asset_path, introduced_by)),
+        _ => None,
+    }
+}
+
+/// The identifier of the layer that introduced a sublayer diagnostic (an
+/// unresolvable or malformed sublayer, or a sublayer expression that does not
+/// evaluate), or `None` for any other diagnostic.
+pub(super) fn sublayer_introducer(diagnostic: &CompositionDiagnostic) -> Option<&String> {
+    match diagnostic {
+        CompositionDiagnostic::InvalidExpression {
+            context: ExpressionContext::Sublayer,
+            source_layer,
+            ..
+        } => Some(source_layer),
+        _ => sublayer_source(diagnostic).map(|(_, introduced_by)| introduced_by),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::Path as FsPath;
+
+    use super::*;
+    use crate::ar;
+
+    /// Author through a layer's `edit` API and commit, for building test fixtures.
+    fn edit_layer(layer: &mut sdf::Layer, f: impl FnOnce(&mut sdf::LayerEdit<'_>)) {
+        layer
+            .edit(|e| {
+                f(e);
+                Ok(())
+            })
+            .expect("authored");
+    }
+
+    /// Adds `layer` to the graph's store and the graph, as a stage does when a
+    /// layer joins it.
+    fn join(graph: &mut LayerGraph, layer: sdf::Layer) -> (LayerId, bool) {
+        let handle = graph
+            .store
+            .insert(layer, Vec::new())
+            .expect("the layer is new to the store");
+        graph.ensure_layer(handle.into())
+    }
+
+    impl LayerGraph {
+        /// Build a graph from `layers` in one step: intern each, then
+        /// [`finalize`](Self::finalize). The first `session_layer_count` layers
+        /// are the session layers; the next is the root. A test convenience — the
+        /// stage builds its graph through [`new`](Self::new) +
+        /// [`ensure_layer`](Self::ensure_layer) so it can attach a change sink to
+        /// each layer as it joins.
+        pub(crate) fn from_layers(
+            layers: Vec<sdf::Layer>,
+            session_layer_count: usize,
+            registry: sdf::LayerRegistry,
+        ) -> Self {
+            let mut graph = Self::new(registry);
+            let mut root = None;
+            let mut session_count = 0;
+            for (i, layer) in layers.into_iter().enumerate() {
+                let layer = sdf::layer_registry::tests::hold(&graph.store, layer);
+                let (id, fresh) = graph.ensure_layer(layer);
+                if i == session_layer_count {
+                    root = Some(id);
+                }
+                if fresh && i < session_layer_count {
+                    session_count += 1;
+                }
+            }
+            graph.finalize(session_count, root);
+            graph
+        }
+
+        /// The id of a loaded layer whose identifier ends with the path component
+        /// `leaf` (its file name), or `None`. A test convenience for locating a
+        /// layer in a stack built from on-disk assets, where the identifier is the
+        /// full resolved path rather than the authored leaf; production code keys
+        /// layers by canonical identifier ([`id_of`](Self::id_of)) or anchors an
+        /// authored path first ([`find_relative`](Self::find_relative)).
+        pub(crate) fn find_by_leaf(&self, leaf: &str) -> Option<LayerId> {
+            self.order
+                .iter()
+                .copied()
+                .find(|&id| FsPath::new(self.identifier(id)).ends_with(leaf))
+        }
+    }
+
+    /// A `root → sub → leaf` sublayer chain, each layer named verbatim so the
+    /// authored `subLayers` entries resolve by exact identifier match.
+    fn chain_graph() -> LayerGraph {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["sub.usda"]);
+        });
+        let mut sub = sdf::Layer::new_in_memory("sub.usda");
+        edit_layer(&mut sub, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["leaf.usda"]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+        LayerGraph::from_layers(vec![root, sub, leaf], 0, sdf::LayerRegistry::default())
+    }
+
+    /// Muting a sublayer drops it and its whole subtree from `sublayer_stack`
+    /// and `root_layer_stack`; unmuting restores them.
+    #[test]
+    fn muted_excludes_subtree() {
+        let mut graph = chain_graph();
+        let root = graph.root_id().unwrap();
+        let sub = graph.id_of("sub.usda").unwrap();
+        let leaf = graph.id_of("leaf.usda").unwrap();
+
+        let ids: Vec<LayerId> = graph.sublayer_stack(root).iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![root, sub, leaf]);
+        assert_eq!(graph.root_layer_stack().len(), 3);
+
+        assert!(graph.mute_layer("sub.usda".to_string()).is_some());
+        let ids: Vec<LayerId> = graph.sublayer_stack(root).iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![root], "the muted sublayer and its subtree are pruned");
+        assert_eq!(graph.root_layer_stack().len(), 1);
+
+        assert!(graph.unmute_layer("sub.usda").is_some());
+        let ids: Vec<LayerId> = graph.sublayer_stack(root).iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![root, sub, leaf], "unmuting restores the subtree");
+    }
+
+    /// Muting the root layer is rejected: `mute_layer` reports no change and the
+    /// root stack is unchanged.
+    #[test]
+    fn muted_root_ignored() {
+        let mut graph = chain_graph();
+        assert!(
+            graph.mute_layer("root.usda".to_string()).is_none(),
+            "the root layer cannot be muted"
+        );
+        assert!(!graph.is_layer_muted("root.usda"));
+        assert_eq!(graph.root_layer_stack().len(), 3);
+    }
+
+    /// Muting a layer in a sublayer cycle clears the cycle diagnostic, since the
+    /// muted branch no longer composes; unmuting brings it back.
+    #[test]
+    fn muted_cycle_clears_error() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["a.usda"]);
+        });
+        let mut a = sdf::Layer::new_in_memory("a.usda");
+        edit_layer(&mut a, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["b.usda"]);
+        });
+        let mut b = sdf::Layer::new_in_memory("b.usda");
+        edit_layer(&mut b, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["a.usda"]);
+        });
+        let mut graph = LayerGraph::from_layers(vec![root, a, b], 0, sdf::LayerRegistry::default());
+        assert!(!graph.errors().is_empty(), "the a → b → a sublayer cycle is reported");
+
+        assert!(graph.mute_layer("b.usda".to_string()).is_some());
+        assert!(
+            graph.errors().is_empty(),
+            "muting a layer in the cycle clears the diagnostic"
+        );
+
+        assert!(graph.unmute_layer("b.usda").is_some());
+        assert!(!graph.errors().is_empty(), "unmuting restores the cycle diagnostic");
+    }
+
+    /// Authors an `expressionVariables` dictionary on a layer's pseudo-root.
+    fn set_expr_var(layer: &mut sdf::Layer, name: &str, value: &str) {
+        edit_layer(layer, |e| e.set_expression_variables(expr_vars(name, value)).unwrap());
+    }
+
+    /// `name = value` as a layer's only expression variable.
+    fn expr_vars(name: &str, value: &str) -> HashMap<String, Value> {
+        HashMap::from([(name.to_string(), Value::String(value.to_string()))])
+    }
+
+    /// A variable authored on a **sublayer** is ignored: a layer stack's expression
+    /// variables come from its root layer, not its sublayers (C++
+    /// `PcpExpressionVariables`). `a` sublayers the root and authors `V`, but `b`'s
+    /// `${V}` sublayer resolves against the stack root's variables (none here), so it
+    /// does not resolve and `leaf` never enters the stack.
+    #[test]
+    fn sublayer_var_ignored() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["a.usda"]);
+        });
+        let mut a = sdf::Layer::new_in_memory("a.usda");
+        set_expr_var(&mut a, "V", "leaf");
+        edit_layer(&mut a, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["b.usda"]);
+        });
+        let mut b = sdf::Layer::new_in_memory("b.usda");
+        edit_layer(&mut b, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+
+        let graph = LayerGraph::from_layers(vec![root, a, b, leaf], 0, sdf::LayerRegistry::default());
+        let root = graph.root_id().unwrap();
+        let leaf = graph.id_of("leaf.usda").unwrap();
+        let ids: Vec<LayerId> = graph.sublayer_stack(root).iter().map(|&(id, _)| id).collect();
+        assert!(
+            !ids.contains(&leaf),
+            "`a` is a sublayer, so its `V` is ignored and `b`'s ${{V}} does not resolve: {ids:?}",
+        );
+    }
+
+    /// A `${VAR}` root sublayer resolved by a session variable back onto the root
+    /// is a cycle, and it is reported: the session-seeded root edges feed cycle
+    /// detection, not just member collection, so the diagnostic surfaces rather
+    /// than the edge being silently pruned.
+    #[test]
+    fn session_var_sublayer_cycle() {
+        let mut session = sdf::Layer::new_in_memory("session.usda");
+        set_expr_var(&mut session, "WHICH", "root");
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let graph = LayerGraph::from_layers(vec![session, root], 1, sdf::LayerRegistry::default());
+        assert!(
+            graph
+                .errors()
+                .iter()
+                .any(|e| matches!(e, CompositionDiagnostic::SublayerCycle { .. })),
+            "the session-resolved self-sublayer is reported as a cycle: {:?}",
+            graph.errors()
+        );
+    }
+
+    /// A failing `${VAR}` sublayer expression — a bare reference to an
+    /// undefined variable errors, where a quoted string substitutes the name in
+    /// place — records one `InvalidExpression` diagnostic with the sublayer
+    /// context from the stack's contextual re-resolution (C++
+    /// `_BuildLayerStack`); the context-free edge pass stays silent. Authoring
+    /// the variable clears it on the next rebuild.
+    #[test]
+    fn sublayer_expr_error_reported() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["`${WHICH}`"]);
+        });
+        let sub = sdf::Layer::new_in_memory("sub.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, sub], 0, sdf::LayerRegistry::default());
+        let errors = graph.errors();
+        let expression_errors = errors
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    CompositionDiagnostic::InvalidExpression {
+                        context: ExpressionContext::Sublayer,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            expression_errors, 1,
+            "one failing evaluation, one diagnostic: {errors:?}"
+        );
+
+        let root_id = graph.root_id().unwrap();
+        graph
+            .handle(root_id)
+            .edit(|e| e.set_expression_variables(expr_vars("WHICH", "sub.usda")))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([root_id])));
+        assert!(
+            graph.errors().is_empty(),
+            "authoring WHICH resolves the expression and clears the diagnostic"
+        );
+        let sub_id = graph.id_of("sub.usda").unwrap();
+        assert!(
+            graph.root_layer_stack().iter().any(|&(id, _)| id == sub_id),
+            "the resolved selection joins the root stack"
+        );
+    }
+
+    /// A degenerate empty `subLayers` entry names nothing to open: it resolves
+    /// to no edge and records no load demand.
+    #[test]
+    fn empty_entry_no_demand() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([""]);
+        });
+        let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
+        assert!(graph.take_sublayer_demands().is_empty());
+    }
+
+    /// An anonymous parent's unresolved entry records a load demand like any
+    /// other parent's: the entry resolves without an anchor, as C++
+    /// `SdfComputeAssetPathRelativeToLayer` does for an anonymous layer.
+    #[test]
+    fn anon_parent_demands() {
+        let mut root = sdf::Layer::new_anonymous("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["ghost.usda"]);
+        });
+        let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
+        let demands = graph.take_sublayer_demands();
+        assert_eq!(demands.len(), 1);
+        assert_eq!(demands[0].evaluated, "ghost.usda");
+    }
+
+    /// Muting a session layer that supplies a root `${VAR}` sublayer's variable
+    /// re-resolves the root edges: the sublayer it selected drops, rather than the
+    /// muted layer continuing to resolve it.
+    #[test]
+    fn mute_session_drops_sublayer() {
+        let mut session = sdf::Layer::new_in_memory("session.usda");
+        set_expr_var(&mut session, "WHICH", "a");
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${WHICH}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let mut graph = LayerGraph::from_layers(vec![session, root, a], 1, sdf::LayerRegistry::default());
+        let a_id = graph.id_of("a.usda").unwrap();
+        let in_root = |g: &LayerGraph| g.root_layer_stack().iter().any(|&(id, _)| id == a_id);
+
+        assert!(
+            in_root(&graph),
+            "the session's WHICH=a resolves the root sublayer to a.usda"
+        );
+        graph.mute_layer("session.usda".to_string());
+        assert!(
+            !in_root(&graph),
+            "muting the session layer drops the variable, so the root sublayer no longer resolves"
+        );
+    }
+
+    /// A variable authored on a session **sublayer** is ignored; only the session
+    /// root layer's own reaches the root stack (C++ `PcpExpressionVariables` reads
+    /// the session layer, not its sublayers). The mirror — the session root itself
+    /// authoring the variable — does apply.
+    #[test]
+    fn session_sublayer_var_ignored() {
+        let sublayer_authored = |on_root: bool| -> bool {
+            let mut session = sdf::Layer::new_in_memory("session.usda");
+            if on_root {
+                set_expr_var(&mut session, "V", "leaf");
+            }
+            edit_layer(&mut session, |e| {
+                e.pseudo_root_mut().unwrap().set_sublayers(["session_sub.usda"]);
+            });
+            let mut session_sub = sdf::Layer::new_in_memory("session_sub.usda");
+            if !on_root {
+                set_expr_var(&mut session_sub, "V", "leaf");
+            }
+            let mut root = sdf::Layer::new_in_memory("root.usda");
+            edit_layer(&mut root, |e| {
+                e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+            });
+            let leaf = sdf::Layer::new_in_memory("leaf.usda");
+            let graph =
+                LayerGraph::from_layers(vec![session, session_sub, root, leaf], 2, sdf::LayerRegistry::default());
+            let leaf_id = graph.id_of("leaf.usda").unwrap();
+            graph.root_layer_stack().iter().any(|&(id, _)| id == leaf_id)
+        };
+        assert!(
+            !sublayer_authored(false),
+            "a session sublayer's V is ignored, so the root's `${{V}}` does not resolve",
+        );
+        assert!(
+            sublayer_authored(true),
+            "the session root's own V applies, so the root's `${{V}}` resolves",
+        );
+    }
+
+    /// A stack uses its **root** layer's own variables. `a` authors `V` and
+    /// sublayers `b`; a stack rooted at `a` resolves `b`'s `${V}` sublayer to `leaf`
+    /// (`a` is that stack's root). A stack rooted at `b` does not: `b` authors no
+    /// variables, and `a` — which merely sublayers `b` — contributes none (C++
+    /// `PcpExpressionVariables`). The result is independent of `b` being interned
+    /// before `a`.
+    #[test]
+    fn stack_root_var_applies() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut a = sdf::Layer::new_in_memory("a.usda");
+        set_expr_var(&mut a, "V", "leaf");
+        edit_layer(&mut a, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["b.usda"]);
+        });
+        let mut b = sdf::Layer::new_in_memory("b.usda");
+        edit_layer(&mut b, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+
+        // `root` sublayers none of them, so `a`/`b`/`leaf` are an orphan subtree;
+        // `b` precedes `a` in collection order.
+        let graph = LayerGraph::from_layers(vec![root, b, a, leaf], 0, sdf::LayerRegistry::default());
+        let a_id = graph.id_of("a.usda").unwrap();
+        let b_id = graph.id_of("b.usda").unwrap();
+        let leaf_id = graph.id_of("leaf.usda").unwrap();
+
+        let a_stack: Vec<LayerId> = graph.sublayer_stack(a_id).iter().map(|&(id, _)| id).collect();
+        assert!(
+            a_stack.contains(&leaf_id),
+            "`a`'s stack threads `a`'s `V` into `b`, so `b`'s ${{V}} resolves to `leaf`: {a_stack:?}",
+        );
+        let b_stack: Vec<LayerId> = graph.sublayer_stack(b_id).iter().map(|&(id, _)| id).collect();
+        assert!(
+            !b_stack.contains(&leaf_id),
+            "`b`'s own stack has no inherited context, so its ${{V}} stays unresolved: {b_stack:?}",
+        );
+    }
+
+    /// A deep single-sublayer chain composes without overflowing the native
+    /// stack: the edge walk, the cycle scan, and the stack collection all run on
+    /// explicit stacks. Each layer sublayers the next; the root's composed
+    /// sublayer stack contains the whole chain. Only the root's stack is
+    /// precomputed (the chain has one sublayer-DAG root), so this is O(n).
+    #[test]
+    fn deep_sublayer_chain_no_overflow() {
+        const DEPTH: usize = 50_000;
+        let mut layers = Vec::with_capacity(DEPTH);
+        for i in 0..DEPTH {
+            let mut layer = sdf::Layer::new_in_memory(format!("layer{i}.usda"));
+            if i + 1 < DEPTH {
+                edit_layer(&mut layer, |e| {
+                    e.pseudo_root_mut()
+                        .unwrap()
+                        .set_sublayers([format!("layer{}.usda", i + 1)]);
+                });
+            }
+            layers.push(layer);
+        }
+        let graph = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        assert_eq!(graph.sublayer_stack(root_id).len(), DEPTH, "the whole chain composes");
+    }
+
+    /// `sublayer_stack` composes a non-precomputed layer's stack on demand: a
+    /// layer that is sublayered (so not a sublayer-DAG root, not precomputed)
+    /// still reports its own stack when queried — the case of a layer that is both
+    /// sublayered and used as a reference/payload target.
+    #[test]
+    fn sublayer_stack_computed_on_demand() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["a.usda"]);
+        });
+        let mut a = sdf::Layer::new_in_memory("a.usda");
+        edit_layer(&mut a, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["b.usda"]);
+        });
+        let b = sdf::Layer::new_in_memory("b.usda");
+
+        let graph = LayerGraph::from_layers(vec![root, a, b], 0, sdf::LayerRegistry::default());
+        let a_id = graph.id_of("a.usda").unwrap();
+        let b_id = graph.id_of("b.usda").unwrap();
+        // `a` is sublayered by root, so it is not a precomputed DAG root.
+        let ids: Vec<LayerId> = graph.sublayer_stack(a_id).iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![a_id, b_id], "a's stack composes on demand");
+    }
+
+    /// A `${VAR}` sublayer on a reference/payload target resolves against the
+    /// expression variables inherited across the arc, held on the target's
+    /// source-keyed stack instance. The root-sourced
+    /// [`sublayer_stack`](LayerGraph::sublayer_stack) (no variables anywhere in
+    /// the root stack) cannot resolve it; the instance interned for an arc from a
+    /// var-authoring source can.
+    #[test]
+    fn contextual_var_sublayer() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "over");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let over = sdf::Layer::new_in_memory("over.usda");
+
+        let mut graph = LayerGraph::from_layers(vec![root, src, target, over], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+        let over = graph.id_of("over.usda").unwrap();
+
+        let ids: Vec<LayerId> = graph.sublayer_stack(target).iter().map(|&(id, _)| id).collect();
+        assert!(!ids.contains(&over), "the root-sourced stack cannot resolve `${{V}}`");
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let id = graph.intern_external(target, src_stack).0;
+        let ids: Vec<LayerId> = graph.layer_stack(id).iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&over),
+            "the contextual instance resolves the `${{V}}` sublayer edge"
+        );
+    }
+
+    /// The same `${VAR}`-sublayer target reached from two sources authoring
+    /// different variables resolves its sublayer independently: each source gets
+    /// its own stack instance with its own resolved member.
+    #[test]
+    fn contextual_var_sublayer_per_context() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut sa = sdf::Layer::new_in_memory("sa.usda");
+        set_expr_var(&mut sa, "V", "a");
+        let mut sb = sdf::Layer::new_in_memory("sb.usda");
+        set_expr_var(&mut sb, "V", "b");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let b = sdf::Layer::new_in_memory("b.usda");
+
+        let mut graph = LayerGraph::from_layers(vec![root, sa, sb, target, a, b], 0, sdf::LayerRegistry::default());
+        let sa = graph.id_of("sa.usda").unwrap();
+        let sb = graph.id_of("sb.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+        let a = graph.id_of("a.usda").unwrap();
+        let b = graph.id_of("b.usda").unwrap();
+
+        let sa_stack = graph.intern_external(sa, LayerStackId::ROOT).0;
+        let sb_stack = graph.intern_external(sb, LayerStackId::ROOT).0;
+        let ia = graph.intern_external(target, sa_stack).0;
+        let ib = graph.intern_external(target, sb_stack).0;
+        assert_ne!(ia, ib, "different sources get distinct instances");
+
+        let members = |id| {
+            graph
+                .layer_stack(id)
+                .iter()
+                .map(|&(layer, _)| layer)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            members(ia).contains(&a) && !members(ia).contains(&b),
+            "V=a resolves a.usda"
+        );
+        assert!(
+            members(ib).contains(&b) && !members(ib).contains(&a),
+            "V=b resolves b.usda"
+        );
+    }
+
+    /// Every target stack is keyed by its variable source, even when the carried
+    /// variables cannot change its members — here the target's only expression
+    /// sublayer is muted. The two sources intern distinct instances with equal
+    /// members, and each instance carries its own composed expression variables
+    /// (the context an asset attribute inside the target evaluates against).
+    #[test]
+    fn muted_expr_sublayer_per_context() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut sa = sdf::Layer::new_in_memory("sa.usda");
+        set_expr_var(&mut sa, "V", "a");
+        let mut sb = sdf::Layer::new_in_memory("sb.usda");
+        set_expr_var(&mut sb, "V", "b");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["muted_expr.usda"]);
+        });
+        let mut muted_expr = sdf::Layer::new_in_memory("muted_expr.usda");
+        edit_layer(&mut muted_expr, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+
+        let mut graph =
+            LayerGraph::from_layers(vec![root, sa, sb, target, muted_expr], 0, sdf::LayerRegistry::default());
+        graph.mute_layer("muted_expr.usda".to_string());
+        let sa = graph.id_of("sa.usda").unwrap();
+        let sb = graph.id_of("sb.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let sa_stack = graph.intern_external(sa, LayerStackId::ROOT).0;
+        let sb_stack = graph.intern_external(sb, LayerStackId::ROOT).0;
+        let ia = graph.intern_external(target, sa_stack).0;
+        let ib = graph.intern_external(target, sb_stack).0;
+        assert_ne!(ia, ib, "each source gets its own instance");
+        assert_eq!(
+            graph.layer_stack(ia),
+            graph.layer_stack(ib),
+            "the muted expression sublayer leaves both sources' members equal"
+        );
+        assert_eq!(
+            graph.stack_variables(ia),
+            &HashMap::from([("V".to_string(), Value::String("a".to_string()))]),
+            "the instance carries its source's variables"
+        );
+        assert_eq!(
+            graph.stack_variables(ib),
+            &HashMap::from([("V".to_string(), Value::String("b".to_string()))]),
+            "the instance carries its source's variables"
+        );
+    }
+
+    /// The stored composed set is the target root's own variables overlaid by the
+    /// seed (seed winning), and an `expressionVariables` edit on the target root
+    /// refreshes it through the scoped rebuild.
+    #[test]
+    fn stored_composed_refreshed() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "W", "x");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        set_expr_var(&mut target, "V", "a");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let id = graph.intern_external(target, src_stack).0;
+        assert_eq!(
+            graph.stack_variables(id),
+            &HashMap::from([
+                ("V".to_string(), Value::String("a".to_string())),
+                ("W".to_string(), Value::String("x".to_string())),
+            ]),
+            "the stored set is the target's own V overlaid by the source's W"
+        );
+
+        graph
+            .handle(target)
+            .edit(|e| e.set_expression_variables(expr_vars("V", "b")))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([target])));
+        assert_eq!(
+            graph.stack_variables(id),
+            &HashMap::from([
+                ("V".to_string(), Value::String("b".to_string())),
+                ("W".to_string(), Value::String("x".to_string())),
+            ]),
+            "editing the target root's V refreshes the stored set in place"
+        );
+    }
+
+    /// An `expressionVariables` edit on a muted target root still refreshes the
+    /// instance's stored composed set: the muted root's member set is empty
+    /// (disjoint from every edit), so the rebuild filter must match the target
+    /// root itself, not only the members.
+    #[test]
+    fn muted_target_root_edit() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        set_expr_var(&mut target, "V", "a");
+        let mut graph = LayerGraph::from_layers(vec![root, target], 0, sdf::LayerRegistry::default());
+        graph.mute_layer("target.usda".to_string());
+        let target = graph.id_of("target.usda").unwrap();
+
+        let id = graph.intern_external(target, LayerStackId::ROOT).0;
+        assert!(graph.layer_stack(id).is_empty(), "the muted root empties the stack");
+        assert_eq!(
+            graph.stack_variables(id),
+            &HashMap::from([("V".to_string(), Value::String("a".to_string()))]),
+            "the muted root's own variables still compose the stored set"
+        );
+
+        graph
+            .handle(target)
+            .edit(|e| e.set_expression_variables(expr_vars("V", "b")))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([target])));
+        assert_eq!(
+            graph.stack_variables(id),
+            &HashMap::from([("V".to_string(), Value::String("b".to_string()))]),
+            "the edit reaches the instance even though its member set is empty"
+        );
+    }
+
+    /// A back-reference to a sessionless stage root collapses to the ROOT
+    /// instance exactly when the identity keys agree: the arc carries the Root
+    /// variable source (a non-authoring chain, or an arc from inside the root
+    /// stack itself). A carried `Instance` source — the arc runs through a
+    /// var-authoring stack — mints a contextual instance rooted at the stage
+    /// root layer that keeps the outer variables in force.
+    #[test]
+    fn root_backref_identity() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        set_expr_var(&mut root, "V", "r");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "EXTRA", "e");
+        let mut graph = LayerGraph::from_layers(vec![root, src], 0, sdf::LayerRegistry::default());
+        let root = graph.root_id().unwrap();
+        let src = graph.id_of("src.usda").unwrap();
+
+        let id = graph.intern_external(root, LayerStackId::ROOT).0;
+        assert_eq!(
+            id,
+            LayerStackId::ROOT,
+            "the Root source collapses to ROOT by key equality"
+        );
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let id = graph.intern_external(root, src_stack).0;
+        assert_ne!(
+            id,
+            LayerStackId::ROOT,
+            "a back-reference through a var-authoring source stays contextual"
+        );
+        assert_eq!(
+            graph.stack_variables(id),
+            &HashMap::from([
+                ("V".to_string(), Value::String("r".to_string())),
+                ("EXTRA".to_string(), Value::String("e".to_string())),
+            ]),
+            "the contextual instance keeps the carried variables over the root's own"
+        );
+    }
+
+    /// Two source stacks each authoring the same variables into the same target
+    /// keep distinct target instances: identity keys by the variables' source,
+    /// not their value (C++ `PcpLayerStackIdentifier` with
+    /// `expressionVariablesOverrideSource`), and each source changed the
+    /// dictionary, so each is its own source.
+    #[test]
+    fn equal_map_distinct_source() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut s1 = sdf::Layer::new_in_memory("s1.usda");
+        set_expr_var(&mut s1, "V", "x");
+        let mut s2 = sdf::Layer::new_in_memory("s2.usda");
+        set_expr_var(&mut s2, "V", "x");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, s1, s2, target], 0, sdf::LayerRegistry::default());
+        let s1 = graph.id_of("s1.usda").unwrap();
+        let s2 = graph.id_of("s2.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let s1_stack = graph.intern_external(s1, LayerStackId::ROOT).0;
+        let s2_stack = graph.intern_external(s2, LayerStackId::ROOT).0;
+        assert_ne!(s1_stack, s2_stack, "the sources are distinct stacks");
+
+        let (t1, fresh1) = graph.intern_external(target, s1_stack);
+        let (t2, fresh2) = graph.intern_external(target, s2_stack);
+        assert!(fresh1 && fresh2, "each authoring source mints its own instance");
+        assert_ne!(t1, t2, "equal composed maps do not coalesce distinct sources");
+        assert_eq!(
+            graph.stack_variables(t1),
+            graph.stack_variables(t2),
+            "both instances compose the same variables"
+        );
+    }
+
+    /// Non-authoring stacks propagate their source: a stack whose own variables
+    /// change nothing reuses its seed's source (the C++
+    /// `Pcp_ComposeExpressionVariables` rule), so arcs into the same target
+    /// through a parallel intermediate and through a chained one all carry the
+    /// Root source and share the Root-sourced instance.
+    #[test]
+    fn source_propagates_noop() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let m1 = sdf::Layer::new_in_memory("m1.usda");
+        let m2 = sdf::Layer::new_in_memory("m2.usda");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, m1, m2, target], 0, sdf::LayerRegistry::default());
+        let m1 = graph.id_of("m1.usda").unwrap();
+        let m2 = graph.id_of("m2.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let m1_stack = graph.intern_external(m1, LayerStackId::ROOT).0;
+        let m2_stack = graph.intern_external(m2, m1_stack).0;
+        assert_ne!(m1_stack, m2_stack, "the intermediates are distinct stacks");
+
+        let t1 = graph.intern_external(target, m1_stack).0;
+        let t2 = graph.intern_external(target, m2_stack).0;
+        assert_eq!(t1, t2, "the parallel and chained routes key the same instance");
+        assert_eq!(
+            t1,
+            graph.intern_external(target, LayerStackId::ROOT).0,
+            "the shared instance is the Root-sourced one"
+        );
+    }
+
+    /// A stack's value identity round-trips: the captured source chain resolves
+    /// back to the same instance on the same graph, re-deriving each hop from
+    /// live content rather than trusting the numeric handle; the root stack's
+    /// identity is total and maps to ROOT.
+    #[test]
+    fn stack_identity_roundtrip() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "x");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let t = graph.intern_external(target, src_stack).0;
+        let identity = graph.stack_identity(t);
+        assert_eq!(
+            identity,
+            StackIdentity::Target {
+                root: "target.usda".to_string(),
+                source_chain: vec!["src.usda".to_string()],
+            }
+        );
+        assert_eq!(graph.resolve_stack_identity(&identity).ok(), Some(t));
+
+        let root_identity = graph.stack_identity(LayerStackId::ROOT);
+        assert_eq!(root_identity, StackIdentity::Root);
+        assert_eq!(
+            graph.resolve_stack_identity(&root_identity).ok(),
+            Some(LayerStackId::ROOT)
+        );
+    }
+
+    /// An `expressionVariables` edit on a source stack's root refreshes every
+    /// stack keyed by it in place: the seed is read live from the source
+    /// instance during the rebuild, so the dependent's stored composed set and
+    /// members follow the edit while its id — and thus its arc keying — stays
+    /// stable.
+    #[test]
+    fn source_chain_rebuild() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "a");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let b = sdf::Layer::new_in_memory("b.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target, a, b], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+        let a = graph.id_of("a.usda").unwrap();
+        let b = graph.id_of("b.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let t_stack = graph.intern_external(target, src_stack).0;
+        let members = |graph: &LayerGraph, id: LayerStackId| -> Vec<LayerId> {
+            graph.layer_stack(id).iter().map(|&(l, _)| l).collect()
+        };
+        assert!(members(&graph, t_stack).contains(&a), "V=a selects a.usda");
+
+        graph
+            .handle(src)
+            .edit(|e| e.set_expression_variables(expr_vars("V", "b")))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([src])));
+
+        let (resolved, fresh) = graph.intern_external(target, src_stack);
+        assert!(!fresh, "the edit re-keys nothing; the instance is reused");
+        assert_eq!(resolved, t_stack, "the arc still resolves the same instance");
+        assert_eq!(
+            graph.stack_variables(t_stack),
+            &HashMap::from([("V".to_string(), Value::String("b".to_string()))]),
+            "the stored composed set follows the source edit"
+        );
+        let m = members(&graph, t_stack);
+        assert!(
+            m.contains(&b) && !m.contains(&a),
+            "the members re-resolve under the new seed: {m:?}"
+        );
+    }
+
+    /// A graph whose source stack's authored variables were just removed —
+    /// the variable source flipped back to its seed's, re-keying future arcs
+    /// away from the stranded contextual target instance. Returns the graph,
+    /// the source stack, and the stranded pre-flip target instance; the layer
+    /// ids for `target.usda` and `a.usda` are resolvable via `id_of`.
+    fn flipped_source_graph() -> (LayerGraph, LayerStackId, LayerStackId) {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "a");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target, a], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let (old_t, fresh) = graph.intern_external(target, src_stack);
+        assert!(fresh, "the authoring source mints a contextual instance");
+        graph
+            .handle(src)
+            .edit(|e| e.set_expression_variables(HashMap::new()))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([src])));
+        (graph, src_stack, old_t)
+    }
+
+    /// Removing a source's authored variables flips its variable source back to
+    /// its seed's, re-keying future arcs: the previously minted contextual
+    /// target instance is stranded — still interned and rebuilt in place — while
+    /// new arcs resolve the Root-sourced instance.
+    #[test]
+    fn vars_source_flip() {
+        let (mut graph, src_stack, old_t) = flipped_source_graph();
+        let target = graph.id_of("target.usda").unwrap();
+        let a = graph.id_of("a.usda").unwrap();
+
+        let new_t = graph.intern_external(target, src_stack).0;
+        assert_ne!(
+            new_t, old_t,
+            "the flipped source re-keys the arc to the Root-sourced instance"
+        );
+        assert!(
+            !graph.layer_stack(old_t).iter().any(|&(l, _)| l == a),
+            "the stranded instance was still rebuilt: its seed no longer selects a.usda"
+        );
+    }
+
+    /// The `vars_source_flip` fixture with a sweep after the flip: the
+    /// old-keyed instance no arc can reach again is removed, while the marked
+    /// re-keyed instance — and the root stack — survive.
+    #[test]
+    fn sweep_removes_stranded() {
+        let (mut graph, src_stack, old_t) = flipped_source_graph();
+        let target = graph.id_of("target.usda").unwrap();
+        let new_t = graph.intern_external(target, src_stack).0;
+
+        // The flip re-derived the stranded stack's `${V}` entry as an
+        // unresolved pending demand; the stage resolves demands before it
+        // sweeps, so the test drains them the same way — a pending demand is a
+        // mark root and would (correctly) keep its stack.
+        let _ = graph.take_sublayer_demands();
+        let mut marks = StackMarks::default();
+        marks.mark(new_t);
+        graph.sweep_stacks(marks);
+        assert!(
+            !graph.stack_is_live(old_t),
+            "the stranded old-keyed instance is removed"
+        );
+        assert!(graph.stack_is_live(new_t), "the marked instance survives");
+        assert!(
+            graph.stack_is_live(LayerStackId::ROOT),
+            "the root stack is never removed"
+        );
+    }
+
+    /// A live stack's variable-source ancestry survives a sweep even when no
+    /// cached index references the ancestor directly: the mark closure follows
+    /// the key source, so the survivor's rebuild seed stays readable.
+    #[test]
+    fn source_ancestor_kept() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "x");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let t = graph.intern_external(target, src_stack).0;
+
+        let mut marks = StackMarks::default();
+        marks.mark(t);
+        graph.sweep_stacks(marks);
+        assert!(graph.stack_is_live(t));
+        assert!(
+            graph.stack_is_live(src_stack),
+            "the live instance's key-source referent survives"
+        );
+    }
+
+    /// A stack referenced by an unresolved pending sublayer demand survives a
+    /// sweep — the load barrier is about to read its variables — and becomes
+    /// reclaimable once the demand is drained.
+    #[test]
+    fn pending_demand_survives() {
+        let (mut graph, _, old_t) = flipped_source_graph();
+        graph.sweep_stacks(StackMarks::default());
+        assert!(
+            graph.stack_is_live(old_t),
+            "the flip's unresolved `${{V}}` demand keeps its stack"
+        );
+        let _ = graph.take_sublayer_demands();
+        graph.sweep_stacks(StackMarks::default());
+        assert!(!graph.stack_is_live(old_t), "draining the demand releases the stack");
+    }
+
+    /// A reclaimed instance stays gone through a full rebuild pass — the pass
+    /// every on-demand load runs — because the rebuild walks only interned
+    /// instances; only an arc demanding its key composes a successor.
+    #[test]
+    fn rebuild_not_resurrects() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "x");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let t = graph.intern_external(target, src_stack).0;
+        graph.sweep_stacks(StackMarks::default());
+        assert!(!graph.stack_is_live(t));
+
+        graph.recompute_sublayers(None);
+        assert!(
+            !graph.stack_is_live(t),
+            "a full pass does not resurrect the reclaimed instance"
+        );
+    }
+
+    /// An eagerly minted sublayer-DAG-root stack survives every sweep: no
+    /// prim index composes through it, but its layers stay open for the
+    /// graph's life and this one-shot mint is the only holder of its composed
+    /// view and open-time diagnostics.
+    #[test]
+    fn eager_stack_kept() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let extra = sdf::Layer::new_in_memory("extra.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, extra], 0, sdf::LayerRegistry::default());
+        let extra = graph.id_of("extra.usda").unwrap();
+
+        let (stack, fresh) = graph.intern_external(extra, LayerStackId::ROOT);
+        assert!(!fresh, "the DAG root was minted eagerly at finalize");
+        graph.sweep_stacks(StackMarks::default());
+        assert!(graph.stack_is_live(stack), "the eager mint is a permanent sweep mark");
+    }
+
+    /// An arc reaching a reclaimed key comes back as a demand, and interning
+    /// that demand mints a fresh instance — a new id, never the reclaimed one —
+    /// with the same composed members and variables.
+    #[test]
+    fn reclaimed_key_remints() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "x");
+        let target = sdf::Layer::new_in_memory("target.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, src, target], 0, sdf::LayerRegistry::default());
+        let src = graph.id_of("src.usda").unwrap();
+        let target_id = graph.id_of("target.usda").unwrap();
+
+        let src_stack = graph.intern_external(src, LayerStackId::ROOT).0;
+        let t = graph.intern_external(target_id, src_stack).0;
+        let members: Vec<LayerId> = graph.layer_stack(t).iter().map(|&(l, _)| l).collect();
+        let vars = graph.stack_variables(t).clone();
+
+        // Keep the demanding context alive; only the target instance sweeps.
+        let mut marks = StackMarks::default();
+        marks.mark(src_stack);
+        graph.sweep_stacks(marks);
+        assert!(!graph.stack_is_live(t));
+
+        assert!(
+            matches!(graph.external_stack_id(target_id, src_stack), ExternalStack::Demand),
+            "a reclaimed key misses the lookup and demands"
+        );
+        let demand = Demand {
+            asset_path: "target.usda".to_string(),
+            context: src_stack,
+            recheck: false,
+        };
+        assert!(graph.intern_demanded(&[demand]), "the re-mint reports progress");
+        let (reminted, fresh) = graph.intern_external(target_id, src_stack);
+        assert!(!fresh, "the reminted instance now resolves ready");
+        assert_ne!(reminted, t, "the reclaimed id is never reused");
+        assert!(!graph.stack_is_live(t), "the reclaimed handle stays dead");
+        assert_eq!(
+            graph.layer_stack(reminted).iter().map(|&(l, _)| l).collect::<Vec<_>>(),
+            members,
+            "the reminted members match the reclaimed composition"
+        );
+        assert_eq!(
+            graph.stack_variables(reminted),
+            &vars,
+            "the reminted composed variables match the reclaimed set"
+        );
+    }
+
+    /// A back-reference to the stage root layer does not collapse to ROOT when
+    /// session layers are present: the identities differ (the ROOT instance
+    /// carries the session region), so a `{root layer, Root}` instance is minted
+    /// without the session layers.
+    #[test]
+    fn backref_no_session_collapse() {
+        let session = sdf::Layer::new_in_memory("session.usda");
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut graph = LayerGraph::from_layers(vec![session, root], 1, sdf::LayerRegistry::default());
+        let session = graph.id_of("session.usda").unwrap();
+        let root = graph.root_id().unwrap();
+
+        let id = graph.intern_external(root, LayerStackId::ROOT).0;
+        assert_ne!(id, LayerStackId::ROOT, "session layers keep the identities apart");
+        let members: Vec<LayerId> = graph.layer_stack(id).iter().map(|&(l, _)| l).collect();
+        assert!(
+            members.contains(&root) && !members.contains(&session),
+            "the back-reference stack is the root region without the session: {members:?}"
+        );
+    }
+
+    /// A sublayer-DAG root's eagerly minted stack composes under the stage root
+    /// stack's variables: its identity's variable source is the root (C++: an
+    /// identifier with no explicit override source), so a var-authoring stage
+    /// root selects `${V}` sublayers inside plain targets too, and an arc from
+    /// the root stack shares the eager instance instead of minting a duplicate.
+    #[test]
+    fn eager_mint_root_vars() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        set_expr_var(&mut root, "V", "leaf");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, target, leaf], 0, sdf::LayerRegistry::default());
+        let target = graph.id_of("target.usda").unwrap();
+        let leaf = graph.id_of("leaf.usda").unwrap();
+
+        let ids: Vec<LayerId> = graph.sublayer_stack(target).iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&leaf),
+            "the root's V seeds the eager target stack, selecting leaf.usda: {ids:?}"
+        );
+        let (id, fresh) = graph.intern_external(target, LayerStackId::ROOT);
+        assert!(!fresh, "an arc from the root stack resolves the eager instance");
+        assert_eq!(graph.layer_stack(id), &*graph.sublayer_stack(target));
+    }
+
+    /// A `${VAR}` sublayer selected by a reference target's own variable appears
+    /// in the expression ancestry edges: the edge resolves against the target
+    /// stack's composed variables (its root's own overlaid by the seed), so mute
+    /// fanout can find the target root from the selected sublayer.
+    #[test]
+    fn target_own_var_ancestry_edge() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        set_expr_var(&mut target, "V", "sub");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let sub = sdf::Layer::new_in_memory("sub.usda");
+        let graph = LayerGraph::from_layers(vec![root, target, sub], 0, sdf::LayerRegistry::default());
+        let target = graph.id_of("target.usda").unwrap();
+        let sub = graph.id_of("sub.usda").unwrap();
+
+        let edges = graph.expression_ancestry_edges();
+        assert!(
+            edges.get(&target).is_some_and(|children| children.contains(&sub)),
+            "the target's own V resolves the `${{V}}` ancestry edge: {edges:?}"
+        );
+    }
+
+    /// The stage's own root layer is never contextually reopened: a
+    /// context-bearing back-reference to a root with a `${VAR}` sublayer interns
+    /// from the loaded graph instead of demanding a disk re-read, which would
+    /// fail for an in-memory root and discard unsaved edits for a dirty one.
+    #[test]
+    fn root_never_reopened() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let mut src = sdf::Layer::new_in_memory("src.usda");
+        set_expr_var(&mut src, "V", "x");
+        let mut graph = LayerGraph::from_layers(vec![root, src], 0, sdf::LayerRegistry::default());
+        let root = graph.root_id().unwrap();
+        let src = graph.id_of("src.usda").unwrap();
+
+        let ctx = graph.intern_external(src, LayerStackId::ROOT).0;
+        assert!(
+            !graph.needs_contextual_open(root, ctx),
+            "a context-bearing back-reference to the stage root must not trigger a reopen"
+        );
+    }
+
+    /// The arms of a sublayer diamond: `x_arm` and `y_arm` each author a conflicting
+    /// `V` on themselves and sublayer `shared`, whose `${V}` sublayer resolves
+    /// against the stack root's variables — not these sublayer-authored ones. Add
+    /// them under a root that sublayers `[x_arm.usda, y_arm.usda]`.
+    fn diamond_arms() -> Vec<sdf::Layer> {
+        let mut x_arm = sdf::Layer::new_in_memory("x_arm.usda");
+        set_expr_var(&mut x_arm, "V", "x_leaf");
+        edit_layer(&mut x_arm, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["shared.usda"]);
+        });
+        let mut y_arm = sdf::Layer::new_in_memory("y_arm.usda");
+        set_expr_var(&mut y_arm, "V", "y_leaf");
+        edit_layer(&mut y_arm, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["shared.usda"]);
+        });
+        let mut shared = sdf::Layer::new_in_memory("shared.usda");
+        edit_layer(&mut shared, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let x_leaf = sdf::Layer::new_in_memory("x_leaf.usda");
+        let y_leaf = sdf::Layer::new_in_memory("y_leaf.usda");
+        vec![x_arm, y_arm, shared, x_leaf, y_leaf]
+    }
+
+    /// A sublayer diamond whose two arms author conflicting `${V}` values resolves
+    /// to neither leaf: the arms are sublayers, so their `V` is ignored (a stack's
+    /// variables come from its root, C++ `PcpExpressionVariables`) and `shared`'s
+    /// `${V}` has nothing to resolve against. The public `sublayer_stack` query and
+    /// the composed `root_layer_stack` agree, both going through the one stack-level
+    /// expansion.
+    #[test]
+    fn diamond_sublayer_vars_ignored() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["x_arm.usda", "y_arm.usda"]);
+        });
+        let mut layers = vec![root];
+        layers.extend(diamond_arms());
+        let graph = LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::default());
+        let x_leaf = graph.id_of("x_leaf.usda").unwrap();
+        let y_leaf = graph.id_of("y_leaf.usda").unwrap();
+
+        let ids: Vec<LayerId> = graph.root_layer_stack().iter().map(|&(id, _)| id).collect();
+        assert!(
+            !ids.contains(&x_leaf) && !ids.contains(&y_leaf),
+            "the arms' `V` is sublayer-authored, so `${{V}}` resolves to neither leaf: {ids:?}",
+        );
+
+        let root_id = graph.root_id().unwrap();
+        let queried: Vec<LayerId> = graph.sublayer_stack(root_id).iter().map(|&(id, _)| id).collect();
+        assert_eq!(queried, ids, "sublayer_stack matches the composed root stack");
+    }
+
+    /// Overrides win over the stack root's own variables, but an unrelated override
+    /// leaves the root's variable in place (C++ `PcpExpressionVariables`). A
+    /// reference target authoring `V=a` and a `${V}` sublayer resolves to `b` under
+    /// a source authoring `V=b`, and back to `a` under a source authoring an
+    /// unrelated variable.
+    #[test]
+    fn override_precedence() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut over = sdf::Layer::new_in_memory("over.usda");
+        set_expr_var(&mut over, "V", "b");
+        let mut unrelated = sdf::Layer::new_in_memory("unrelated.usda");
+        set_expr_var(&mut unrelated, "OTHER", "z");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        set_expr_var(&mut target, "V", "a");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let a = sdf::Layer::new_in_memory("a.usda");
+        let b = sdf::Layer::new_in_memory("b.usda");
+        let mut graph = LayerGraph::from_layers(
+            vec![root, over, unrelated, target, a, b],
+            0,
+            sdf::LayerRegistry::default(),
+        );
+        let over = graph.id_of("over.usda").unwrap();
+        let unrelated = graph.id_of("unrelated.usda").unwrap();
+        let target = graph.id_of("target.usda").unwrap();
+        let a_id = graph.id_of("a.usda").unwrap();
+        let b_id = graph.id_of("b.usda").unwrap();
+
+        let members = |graph: &LayerGraph, id: LayerStackId| -> Vec<LayerId> {
+            graph.layer_stack(id).iter().map(|&(l, _)| l).collect()
+        };
+
+        let over_stack = graph.intern_external(over, LayerStackId::ROOT).0;
+        let id = graph.intern_external(target, over_stack).0;
+        let m = members(&graph, id);
+        assert!(
+            m.contains(&b_id) && !m.contains(&a_id),
+            "the source's V=b wins over the root's V=a: {m:?}"
+        );
+
+        let unrelated_stack = graph.intern_external(unrelated, LayerStackId::ROOT).0;
+        let id = graph.intern_external(target, unrelated_stack).0;
+        let m = members(&graph, id);
+        assert!(
+            m.contains(&a_id) && !m.contains(&b_id),
+            "an unrelated override keeps the root's V=a: {m:?}"
+        );
+    }
+
+    /// A `${VAR}` sublayer resolved by a **root**-authored variable back to an
+    /// ancestor is a cycle, and it is reported once. The root authors `BACK=root`
+    /// and sublayers `a`, whose `${BACK}` sublayer resolves to `root.usda`, closing a
+    /// `root → a → root` cycle. Each layer still composes once.
+    #[test]
+    fn root_var_sublayer_cycle() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        set_expr_var(&mut root, "BACK", "root");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["a.usda"]);
+        });
+        let mut a = sdf::Layer::new_in_memory("a.usda");
+        edit_layer(&mut a, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${BACK}.usda"`"#]);
+        });
+
+        let graph = LayerGraph::from_layers(vec![root, a], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        let a_id = graph.id_of("a.usda").unwrap();
+
+        let cycles = graph
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, CompositionDiagnostic::SublayerCycle { .. }))
+            .count();
+        assert_eq!(cycles, 1, "the root<->a cycle is reported once: {:?}", graph.errors());
+
+        let ids: Vec<LayerId> = graph.root_layer_stack().iter().map(|&(id, _)| id).collect();
+        assert_eq!(
+            ids.iter().filter(|&&id| id == root_id).count(),
+            1,
+            "root composes once: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&id| id == a_id).count(),
+            1,
+            "a composes once: {ids:?}"
+        );
+    }
+
+    /// Editing the **stack root**'s `expressionVariables` re-resolves its `${V}`
+    /// sublayer: the root is a member of its stack, so the scoped rebuild recomposes
+    /// it. (A sublayer's variables would be ignored; only the root's apply.)
+    #[test]
+    fn edit_root_var_rebuilds() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        set_expr_var(&mut root, "V", "leaf");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+        let leaf2 = sdf::Layer::new_in_memory("leaf2.usda");
+        let mut graph = LayerGraph::from_layers(vec![root, leaf, leaf2], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        let leaf = graph.id_of("leaf.usda").unwrap();
+        let leaf2 = graph.id_of("leaf2.usda").unwrap();
+
+        let ids: Vec<LayerId> = graph.root_layer_stack().iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&leaf) && !ids.contains(&leaf2),
+            "the root's V starts at leaf: {ids:?}"
+        );
+
+        graph
+            .handle(root_id)
+            .edit(|e| e.set_expression_variables(expr_vars("V", "leaf2")))
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([root_id])));
+
+        let ids: Vec<LayerId> = graph.root_layer_stack().iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&leaf2) && !ids.contains(&leaf),
+            "the edit to the root's V re-resolves `${{V}}` to leaf2: {ids:?}",
+        );
+    }
+
+    /// A plain target stack, rebuilt after an edit adds a branch reaching an
+    /// expression sublayer, picks it up: `has_expr_sublayer` gates on the current
+    /// `children`, and the branch's `${V}` resolves against the target root's own
+    /// variable.
+    #[test]
+    fn plain_target_new_branch() {
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut target = sdf::Layer::new_in_memory("target.usda");
+        set_expr_var(&mut target, "V", "leaf");
+        edit_layer(&mut target, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["base.usda"]);
+        });
+        let base = sdf::Layer::new_in_memory("base.usda");
+        let mut expr_mid = sdf::Layer::new_in_memory("expr_mid.usda");
+        edit_layer(&mut expr_mid, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers([r#"`"${V}.usda"`"#]);
+        });
+        let leaf = sdf::Layer::new_in_memory("leaf.usda");
+        let mut graph = LayerGraph::from_layers(
+            vec![root, target, base, expr_mid, leaf],
+            0,
+            sdf::LayerRegistry::default(),
+        );
+        let target_id = graph.id_of("target.usda").unwrap();
+        let base_id = graph.id_of("base.usda").unwrap();
+        let leaf = graph.id_of("leaf.usda").unwrap();
+
+        // `target` is a DAG root, so its plain stack is interned; no expression
+        // sublayer is reachable yet.
+        let ids: Vec<LayerId> = graph.sublayer_stack(target_id).iter().map(|&(id, _)| id).collect();
+        assert!(!ids.contains(&leaf), "no expression branch reachable yet: {ids:?}");
+
+        // Add the expression branch under `base` and rebuild with `base` edited: it
+        // is a member of the interned target stack, so that stack rebuilds.
+        graph
+            .handle(base_id)
+            .edit(|e| {
+                e.pseudo_root_mut()?.set_sublayers(["expr_mid.usda"]);
+                Ok(())
+            })
+            .expect("authored");
+        graph.recompute_sublayers(Some(&HashSet::from([base_id])));
+
+        let ids: Vec<LayerId> = graph.sublayer_stack(target_id).iter().map(|&(id, _)| id).collect();
+        assert!(
+            ids.contains(&leaf),
+            "the rebuilt target reaches `${{V}}` and resolves it against the target root's V: {ids:?}",
+        );
+    }
+
+    /// A sublayer interned after the first edge build is picked up on the next
+    /// rebuild. `resolve_edges` resolves the authored `./leaf.usda` through the
+    /// memoizing [`resolve_sublayer`](LayerGraph::resolve_sublayer) and looks the
+    /// resolved identifier up live, so a target missing at first resolves once it
+    /// is interned — the cache never pins the earlier miss.
+    #[test]
+    fn rebuild_resolves_newly_interned_sublayer() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["./leaf.usda"]);
+        });
+        let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        assert_eq!(
+            graph.sublayer_stack(root_id).len(),
+            1,
+            "the not-yet-interned sublayer contributes no edge"
+        );
+
+        join(&mut graph, sdf::Layer::new_in_memory("leaf.usda"));
+        graph.recompute_sublayers(None);
+        let leaf = graph.id_of("leaf.usda").unwrap();
+        let ids: Vec<LayerId> = graph.sublayer_stack(root_id).iter().map(|&(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![root_id, leaf],
+            "the newly interned sublayer resolves on rebuild"
+        );
+    }
+
+    /// The ids of the stage root stack's members, strongest first.
+    fn root_members(graph: &LayerGraph) -> Vec<LayerId> {
+        graph
+            .layer_stack(LayerStackId::ROOT)
+            .iter()
+            .map(|&(id, _)| id)
+            .collect()
+    }
+
+    /// A join wires a literal sublayer entry that named no loaded layer: the
+    /// parent re-resolves and the stack reaching it recomposes.
+    #[test]
+    fn join_wires_missing_sublayer() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["./leaf.usda"]);
+        });
+        let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+
+        let (leaf, _) = join(&mut graph, sdf::Layer::new_in_memory("leaf.usda"));
+        graph.wire_joined(&HashSet::from([leaf]));
+        assert_eq!(root_members(&graph), vec![root_id, leaf]);
+    }
+
+    /// A join extends a stack through a `${VAR}`-selected entry, which no
+    /// context-free edge names: the stack recomposes because its last
+    /// composition left the entry unresolved.
+    #[test]
+    fn join_extends_expr_stack() {
+        let mut root = sdf::Layer::new_in_memory("root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["`${WHICH}`"]);
+        });
+        set_expr_var(&mut root, "WHICH", "sub.usda");
+        let mut graph = LayerGraph::from_layers(vec![root], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        assert_eq!(root_members(&graph), vec![root_id]);
+
+        let (sub, _) = join(&mut graph, sdf::Layer::new_in_memory("sub.usda"));
+        graph.wire_joined(&HashSet::from([sub]));
+        assert_eq!(root_members(&graph), vec![root_id, sub]);
+    }
+
+    /// A layer joining under an entry's anchored identifier takes over the
+    /// edge the bare in-memory fallback had resolved. On-disk files give the
+    /// parent a location for its relative entry to anchor beside.
+    #[test]
+    fn join_takes_over_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.usda"), b"#usda 1.0\n").unwrap();
+        std::fs::write(tmp.path().join("sub.usda"), b"#usda 1.0\n").unwrap();
+        let canonical = |leaf: &str| {
+            tmp.path()
+                .join(leaf)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut root = sdf::Layer::new(canonical("root.usda"), Box::new(sdf::Data::new()));
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["sub.usda"]);
+        });
+        let bare = sdf::Layer::new("sub.usda", Box::new(sdf::Data::new()));
+        let mut graph = LayerGraph::from_layers(vec![root, bare], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        let bare = graph.id_of("sub.usda").unwrap();
+        assert_eq!(root_members(&graph), vec![root_id, bare]);
+
+        let (anchored, _) = join(
+            &mut graph,
+            sdf::Layer::new(canonical("sub.usda"), Box::new(sdf::Data::new())),
+        );
+        graph.wire_joined(&HashSet::from([anchored]));
+        assert_eq!(root_members(&graph), vec![root_id, anchored]);
+    }
+
+    /// A muted layer rooting a target stack stays while the stack lives, and
+    /// leaves once a sweep retires the stack.
+    #[test]
+    fn muted_stack_root_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = sdf::LayerRegistry::default();
+        let mut graph = LayerGraph::new(registry.clone());
+        let mut open = |name: &str| {
+            let path = tmp.path().join(name);
+            fs::write(&path, b"#usda 1.0\n").unwrap();
+            let handle = registry
+                .find_or_open(path.to_str().unwrap())
+                .unwrap()
+                .expect("the file resolves");
+            graph.ensure_layer(handle.into()).0
+        };
+        let root = open("root.usda");
+        // Sublayered by nothing, it roots an eager target stack.
+        let target = open("target.usda");
+        graph.finalize(0, Some(root));
+        graph.mute_layer(graph.identifier(target).to_owned());
+        assert!(graph.reclaim_due(Reclaim::Muted));
+        let unused = graph
+            .unused_layers(HashSet::new(), &HashSet::new(), &HashSet::new(), Reclaim::Muted)
+            .unused;
+        assert!(unused.is_empty(), "the stack's root stays: {unused:?}");
+        graph.sweep_stacks(StackMarks::default());
+        let unused = graph
+            .unused_layers(HashSet::new(), &HashSet::new(), &HashSet::new(), Reclaim::Muted)
+            .unused;
+        assert_eq!(unused, HashSet::from([target]), "the swept stack's root leaves");
+    }
+
+    /// A joined layer authoring no relocates brings the loaded layers it
+    /// sublayers into one conflict scope, and their same-target relocates are
+    /// reported.
+    #[test]
+    fn join_scopes_relocate_conflict() {
+        let reloc = |id: &str, source: &str, target: &str| {
+            let mut layer = sdf::Layer::new_in_memory(id);
+            edit_layer(&mut layer, |e| {
+                e.set_relocates(vec![(Path::new(source).unwrap(), Path::new(target).unwrap())])
+                    .unwrap();
+            });
+            layer
+        };
+        let same_target = |graph: &LayerGraph| {
+            graph
+                .errors()
+                .iter()
+                .any(|error| matches!(error, CompositionDiagnostic::SameTargetRelocations { .. }))
+        };
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let s1 = reloc("s1.usda", "/W/A", "/W/C");
+        let s2 = reloc("s2.usda", "/W/B", "/W/C");
+        let mut graph = LayerGraph::from_layers(vec![root, s1, s2], 0, sdf::LayerRegistry::default());
+        assert!(!same_target(&graph), "s1 and s2 share no stack yet");
+
+        let mut combo = sdf::Layer::new_in_memory("combo.usda");
+        edit_layer(&mut combo, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["s1.usda", "s2.usda"]);
+        });
+        let (combo, _) = join(&mut graph, combo);
+        graph.wire_joined(&HashSet::from([combo]));
+        assert!(same_target(&graph), "combo's stack holds both relocates");
+    }
+
+    /// Relocate conflicts are scoped to the stack being composed. A layer that is
+    /// weak in one stack can still contribute when referenced as its own stack.
+    #[test]
+    fn mute_keeps_relocate_scope() {
+        let reloc = |id: &str, source: &str, target: &str| {
+            let mut layer = sdf::Layer::new_in_memory(id);
+            edit_layer(&mut layer, |e| {
+                e.set_relocates(vec![(Path::new(source).unwrap(), Path::new(target).unwrap())])
+                    .unwrap();
+            });
+            layer
+        };
+        let root = sdf::Layer::new_in_memory("root.usda");
+        let mut combo = sdf::Layer::new_in_memory("combo.usda");
+        edit_layer(&mut combo, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["s1.usda", "s2.usda"]);
+        });
+        // s1 and s2 relocate different sources to the same target, conflicting
+        // within combo's stack so both are dropped while combo is present.
+        let s1 = reloc("s1.usda", "/W/A", "/W/C");
+        let s2 = reloc("s2.usda", "/W/B", "/W/C");
+        let mut graph = LayerGraph::from_layers(vec![root, combo, s1, s2], 0, sdf::LayerRegistry::default());
+        let combo_id = graph.id_of("combo.usda").unwrap();
+        let s1_id = graph.id_of("s1.usda").unwrap();
+        let s2_id = graph.id_of("s2.usda").unwrap();
+        // The sub-stack handles are minted on demand at the load barrier in
+        // production; these direct relocate queries compose nothing, so mint them
+        // via `intern_external` under the root context. The handles stay valid
+        // across the mute below (the registry refreshes instances in place).
+        let combo_stack = graph.intern_external(combo_id, LayerStackId::ROOT).0;
+        let s1_stack = graph.intern_external(s1_id, LayerStackId::ROOT).0;
+        let s2_stack = graph.intern_external(s2_id, LayerStackId::ROOT).0;
+
+        assert_eq!(
+            graph.relocation_source(combo_stack, &Path::new("/W/C").unwrap()),
+            None,
+            "combo's stack drops the same-target relocates"
+        );
+        assert_eq!(
+            graph.relocation_source(s1_stack, &Path::new("/W/C").unwrap()),
+            Some(Path::new("/W/A").unwrap()),
+            "s1's own stack keeps its authored relocate active"
+        );
+
+        let change = graph
+            .mute_layer("combo.usda".to_string())
+            .expect("muting combo changed the set");
+        assert_eq!(
+            change.stacks,
+            BTreeSet::from([combo_stack]),
+            "muting combo affects only stacks that include combo"
+        );
+        assert_eq!(
+            graph.relocation_source(s2_stack, &Path::new("/W/C").unwrap()),
+            Some(Path::new("/W/B").unwrap()),
+            "s2's own stack keeps its authored relocate active"
+        );
+    }
+
+    /// An authored relative path anchors against its parent's identifier and
+    /// resolves to the layer interned under the canonical (absolute) identifier
+    /// the load path would have produced; an unrelated leaf resolves to `None`.
+    /// On-disk files are used so the resolver canonicalizes the `./` and bare
+    /// spellings to the same absolute identifier the sublayer is interned under.
+    #[test]
+    fn find_relative_resolves_authored() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.usda"), b"#usda 1.0\n").unwrap();
+        std::fs::write(tmp.path().join("sub.usda"), b"#usda 1.0\n").unwrap();
+        let canonical = |leaf: &str| {
+            tmp.path()
+                .join(leaf)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let graph = LayerGraph::from_layers(
+            vec![
+                sdf::Layer::new(canonical("root.usda"), Box::new(sdf::Data::new())),
+                sdf::Layer::new(canonical("sub.usda"), Box::new(sdf::Data::new())),
+            ],
+            0,
+            sdf::LayerRegistry::default(),
+        );
+        let root_id = graph.root_id().unwrap();
+        let sub_id = graph.id_of(&canonical("sub.usda")).unwrap();
+
+        assert_eq!(graph.find_relative("sub.usda", root_id), Some(sub_id));
+        assert_eq!(graph.find_relative("./sub.usda", root_id), Some(sub_id));
+        assert_eq!(graph.find_relative("missing.usda", root_id), None);
+    }
+
+    /// When anchoring finds no interned layer, resolution falls back to the bare
+    /// authored string, so an in-memory graph keyed by literal identifiers still
+    /// composes. A directory-bearing parent (`/proj/root.usda`) anchors the bare
+    /// `sub.usda` to `/proj/sub.usda`; with nothing interned there, the fallback
+    /// matches the child interned under the literal `sub.usda`.
+    #[test]
+    fn find_relative_falls_back_to_bare_interned() {
+        let mut root = sdf::Layer::new_in_memory("/proj/root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["sub.usda"]);
+        });
+        let sub = sdf::Layer::new_in_memory("sub.usda");
+
+        let graph = LayerGraph::from_layers(vec![root, sub], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        let sub_id = graph.id_of("sub.usda").unwrap();
+
+        assert_eq!(graph.find_relative("sub.usda", root_id), Some(sub_id));
+        let ids: Vec<LayerId> = graph.sublayer_stack(root_id).iter().map(|&(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![root_id, sub_id],
+            "the bare-named sublayer edge forms via the bare-id fallback"
+        );
+    }
+
+    /// When both the anchored target and an unrelated layer interned under the
+    /// bare authored string are present, the anchored identifier wins: a relative
+    /// sublayer resolves to the asset USD anchors it to, not to the colliding
+    /// bare-named layer. On-disk files give the parent a real location so its
+    /// relative `sub.usda` canonicalizes to the interned anchored layer.
+    #[test]
+    fn find_relative_prefers_anchored_over_bare_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("root.usda"), b"#usda 1.0\n").unwrap();
+        std::fs::write(tmp.path().join("sub.usda"), b"#usda 1.0\n").unwrap();
+        let canonical = |leaf: &str| {
+            tmp.path()
+                .join(leaf)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let graph = LayerGraph::from_layers(
+            vec![
+                sdf::Layer::new(canonical("root.usda"), Box::new(sdf::Data::new())),
+                sdf::Layer::new(canonical("sub.usda"), Box::new(sdf::Data::new())),
+                // An unrelated layer interned under the bare authored string.
+                sdf::Layer::new("sub.usda", Box::new(sdf::Data::new())),
+            ],
+            0,
+            sdf::LayerRegistry::default(),
+        );
+        let root_id = graph.root_id().unwrap();
+        let anchored_id = graph.id_of(&canonical("sub.usda")).unwrap();
+
+        assert_eq!(
+            graph.find_relative("sub.usda", root_id),
+            Some(anchored_id),
+            "the relative entry resolves to the anchored on-disk asset, not the colliding bare layer",
+        );
+    }
+
+    /// A leading `./` is normalized before resolution, so a dot-relative entry
+    /// resolves to a bare-interned child. Anchoring `./sub.usda` against
+    /// `/proj/root.usda` yields `/proj/sub.usda`; with nothing interned there, the
+    /// normalized bare `sub.usda` matches via the fallback.
+    #[test]
+    fn find_relative_strips_dot() {
+        let mut root = sdf::Layer::new_in_memory("/proj/root.usda");
+        edit_layer(&mut root, |e| {
+            e.pseudo_root_mut().unwrap().set_sublayers(["./sub.usda"]);
+        });
+        let sub = sdf::Layer::new_in_memory("sub.usda");
+
+        let graph = LayerGraph::from_layers(vec![root, sub], 0, sdf::LayerRegistry::default());
+        let root_id = graph.root_id().unwrap();
+        let sub_id = graph.id_of("sub.usda").unwrap();
+
+        assert_eq!(graph.find_relative("./sub.usda", root_id), Some(sub_id));
+        assert_eq!(
+            graph.find_relative("././sub.usda", root_id),
+            Some(sub_id),
+            "repeated leading `./` is normalized too"
+        );
+        let ids: Vec<LayerId> = graph.sublayer_stack(root_id).iter().map(|&(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![root_id, sub_id],
+            "the dot-relative entry resolves to the bare-interned child"
+        );
+    }
+
+    /// `find_relative` follows the resolver's canonicalization rather than raw
+    /// path matching: a resolver that aliases an authored `link.usda` to a fixed
+    /// canonical leaf resolves the authored name to the layer interned under that
+    /// different leaf — what a symlinked or repository-aliased sublayer needs.
+    #[test]
+    fn find_relative_follows_resolver_canonicalization() {
+        let registry = sdf::LayerRegistry::new(Box::new(LinkResolver {
+            inner: ar::DefaultResolver::new(),
+        }));
+        let graph = LayerGraph::from_layers(
+            vec![
+                sdf::Layer::new("/canonical/root.usda", Box::new(sdf::Data::new())),
+                sdf::Layer::new("/canonical/real.usda", Box::new(sdf::Data::new())),
+            ],
+            0,
+            registry,
+        );
+        let root_id = graph.root_id().unwrap();
+        let real_id = graph.id_of("/canonical/real.usda").unwrap();
+
+        assert_eq!(
+            graph.find_relative("link.usda", root_id),
+            Some(real_id),
+            "the authored leaf resolves through the resolver to the canonical layer"
+        );
+    }
+
+    /// A graph over in-memory layers named `names`, the first one the root.
+    fn named_graph(names: &[&str], resolver: impl ar::Resolver + 'static) -> LayerGraph {
+        let layers = names.iter().map(|name| sdf::Layer::new_in_memory(*name)).collect();
+        LayerGraph::from_layers(layers, 0, sdf::LayerRegistry::new(Box::new(resolver)))
+    }
+
+    /// Under a resolver that leaves the trait's defaults, an authored path is
+    /// looked up as written: the two separator spellings name two layers, and
+    /// a `./` entry does not reach the layer named without it.
+    #[test]
+    fn opaque_resolver_keeps_spelling() {
+        let mut graph = named_graph(
+            &["root.usda", r"a\b.usda", "a/b.usda", "sub.usda"],
+            ar::tests::TestResolver(|| Err(io::Error::from(io::ErrorKind::NotFound))),
+        );
+        let root = graph.root_id().unwrap();
+        let back = graph.id_of(r"a\b.usda").unwrap();
+        let forward = graph.id_of("a/b.usda").unwrap();
+        assert_ne!(back, forward);
+
+        assert_eq!(graph.refresh_demanded_sublayer(root, r"a\b.usda"), Ok(back));
+        assert_eq!(graph.refresh_demanded_sublayer(root, "a/b.usda"), Ok(forward));
+        assert!(graph.refresh_demanded_sublayer(root, "./sub.usda").is_err());
+        assert_eq!(graph.find_relative("./sub.usda", root), None);
+    }
+
+    /// A resolver that gives `./sub.usda` the in-memory identifier `sub.usda`
+    /// reaches the layer of that name.
+    #[test]
+    fn in_memory_identifier_override() {
+        let mut graph = named_graph(&["root.usda", "sub.usda"], DotResolver);
+        let root = graph.root_id().unwrap();
+        let sub = graph.id_of("sub.usda").unwrap();
+
+        assert_eq!(graph.refresh_demanded_sublayer(root, "./sub.usda"), Ok(sub));
+        assert_eq!(graph.find_relative("./sub.usda", root), Some(sub));
+    }
+
+    /// Under the default resolver every spelling of a relative path names
+    /// the one in-memory layer, as a sublayer entry of any parent and as an
+    /// arc target.
+    #[test]
+    fn separator_spellings_share_layer() {
+        let mut graph = named_graph(
+            &["root.usda", "p1.usda", "p2.usda", "sub/layer.usda"],
+            ar::DefaultResolver::new(),
+        );
+        let target = graph.id_of("sub/layer.usda").unwrap();
+        let spellings = [r"sub\layer.usda", "sub/layer.usda", r".\sub\layer.usda"];
+        for (parent, spelling) in ["root.usda", "p1.usda", "p2.usda"].into_iter().zip(spellings) {
+            let parent = graph.id_of(parent).unwrap();
+            assert_eq!(
+                graph.refresh_demanded_sublayer(parent, spelling),
+                Ok(target),
+                "{spelling}"
+            );
+            assert_eq!(graph.find_relative(spelling, parent), Some(target), "{spelling}");
+        }
+    }
+
+    /// A resolver that wraps the default one and forwards its identifier
+    /// rules keeps them: every spelling still names the one in-memory layer.
+    #[test]
+    fn wrapper_forwards_identifier_rules() {
+        let mut graph = named_graph(
+            &["root.usda", "sub/layer.usda"],
+            LinkResolver {
+                inner: ar::DefaultResolver::new(),
+            },
+        );
+        let root = graph.root_id().unwrap();
+        let target = graph.id_of("sub/layer.usda").unwrap();
+        for spelling in [r"sub\layer.usda", r".\sub\layer.usda", "./sub/layer.usda"] {
+            assert_eq!(
+                graph.refresh_demanded_sublayer(root, spelling),
+                Ok(target),
+                "{spelling}"
+            );
+        }
+        assert!(graph.layer_registry().is_context_dependent_path("lib/sub.usda"));
+    }
+
+    /// A resolver under which an asset path is its own identifier wherever
+    /// it is authored, and an in-memory layer's identifier is the path
+    /// without its leading `./` segments.
+    struct DotResolver;
+
+    impl ar::Resolver for DotResolver {
+        fn create_identifier(&self, asset_path: &str, _anchor: Option<&ResolvedPath>) -> String {
+            asset_path.to_string()
+        }
+        fn resolve(&self, asset_path: &str) -> Option<ResolvedPath> {
+            Some(ResolvedPath::new(asset_path))
+        }
+        fn resolve_for_new_asset(&self, asset_path: &str) -> Option<ResolvedPath> {
+            self.resolve(asset_path)
+        }
+        fn open_asset(&self, resolved_path: &ResolvedPath) -> io::Result<Box<dyn ar::Asset>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, resolved_path.to_string()))
+        }
+        fn in_memory_identifier<'a>(&self, asset_path: &'a str) -> Cow<'a, str> {
+            Cow::Borrowed(asset_path.trim_start_matches("./"))
+        }
+    }
+
+    /// A resolver whose `create_identifier` aliases an authored `link.usda` to a
+    /// fixed canonical leaf, modeling a symlinked or repository-aliased asset the
+    /// resolver canonicalizes away. Every other path falls through to the default
+    /// filesystem behavior.
+    struct LinkResolver {
+        inner: ar::DefaultResolver,
+    }
+
+    impl ar::Resolver for LinkResolver {
+        fn create_identifier(&self, asset_path: &str, anchor: Option<&ResolvedPath>) -> String {
+            if asset_path.ends_with("link.usda") {
+                "/canonical/real.usda".to_string()
+            } else {
+                self.inner.create_identifier(asset_path, anchor)
+            }
+        }
+        fn resolve(&self, asset_path: &str) -> Option<ResolvedPath> {
+            self.inner.resolve(asset_path)
+        }
+        fn resolve_for_new_asset(&self, asset_path: &str) -> Option<ResolvedPath> {
+            self.inner.resolve_for_new_asset(asset_path)
+        }
+        fn open_asset(&self, resolved_path: &ResolvedPath) -> io::Result<Box<dyn ar::Asset>> {
+            self.inner.open_asset(resolved_path)
+        }
+        fn is_context_dependent_path(&self, asset_path: &str) -> bool {
+            self.inner.is_context_dependent_path(asset_path)
+        }
+        fn in_memory_identifier<'a>(&self, asset_path: &'a str) -> Cow<'a, str> {
+            self.inner.in_memory_identifier(asset_path)
+        }
+    }
+}

@@ -1,0 +1,75 @@
+//! Integration tests for the UsdMedia schema views against a fixture.
+
+use openusd::{Result, vt};
+
+use openusd::sdf;
+use openusd::tf::Token;
+use openusd::usd::Stage;
+use openusd_schemas::media::{AssetPreviewsAPI, AuralMode, PlaybackMode, SpatialAudio, SpatialAudioSchema};
+
+const FIXTURE: &str = "fixtures/usdMedia_scene.usda";
+
+#[test]
+fn spatial_audio_from_fixture() -> Result<()> {
+    let stage = Stage::builder()
+        .schema_registry(openusd_schemas::schema_registry())
+        .open(FIXTURE)?;
+    let a = SpatialAudio::get(&stage, sdf::path("/World/Ambient")?)?.expect("SpatialAudio");
+
+    assert_eq!(
+        a.file_path_attr().get::<vt::Value>()?,
+        Some(vt::Value::AssetPath("./ambient.wav".into()))
+    );
+    assert_eq!(
+        a.aural_mode_attr()
+            .get::<Token>()?
+            .as_deref()
+            .and_then(AuralMode::from_token),
+        Some(AuralMode::NonSpatial)
+    );
+    assert_eq!(
+        a.playback_mode_attr()
+            .get::<Token>()?
+            .as_deref()
+            .and_then(PlaybackMode::from_token),
+        Some(PlaybackMode::LoopFromStart)
+    );
+    // startTime / endTime are `timecode`-valued.
+    assert_eq!(a.start_time()?, Some(sdf::TimeCode(24.0)));
+    assert_eq!(a.end_time()?, Some(sdf::TimeCode(48.0)));
+    assert_eq!(a.media_offset()?, Some(2.5));
+    assert_eq!(a.gain()?, Some(0.5));
+
+    // A non-SpatialAudio prim reads back as None.
+    assert!(SpatialAudio::get(&stage, sdf::path("/World")?)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn asset_preview_thumbnail_from_fixture() -> Result<()> {
+    let stage = Stage::builder()
+        .schema_registry(openusd_schemas::schema_registry())
+        .open(FIXTURE)?;
+    let previews = AssetPreviewsAPI::get(&stage, sdf::path("/World/Chair")?)?.expect("AssetPreviewsAPI");
+    let thumbnails = previews.default_thumbnails()?.expect("default thumbnails");
+    assert_eq!(thumbnails.default_image.asset_path(), "./chair_thumb.jpg");
+
+    // A prim without the API applied is not wrapped.
+    assert!(AssetPreviewsAPI::get(&stage, sdf::path("/World/Ambient")?)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn token_round_trips() {
+    assert_eq!(AuralMode::default(), AuralMode::Spatial);
+    assert_eq!(AuralMode::NonSpatial.as_token(), "nonSpatial");
+    assert_eq!(AuralMode::from_token("spatial"), Some(AuralMode::Spatial));
+    assert_eq!(AuralMode::from_token("bogus"), None);
+
+    assert_eq!(PlaybackMode::default(), PlaybackMode::OnceFromStart);
+    assert_eq!(
+        PlaybackMode::from_token("loopFromStage"),
+        Some(PlaybackMode::LoopFromStage)
+    );
+    assert_eq!(PlaybackMode::LoopFromStartToEnd.as_token(), "loopFromStartToEnd");
+}

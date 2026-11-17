@@ -1,0 +1,15559 @@
+//! Integration tests for `usd::Stage` exercised purely through its public
+//! API: opening composed stages, querying composition results, value
+//! resolution, prim/attribute/relationship handles, instancing, value
+//! clips, and stage-tier authoring.
+
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path as FsPath;
+use std::rc::Rc;
+use std::slice;
+use std::sync::Arc;
+use std::time::Duration;
+
+use openusd::Result;
+use openusd::ar::Resolver as _;
+use openusd::usd::{
+    CommittedChange, EditTarget, EditTargetArc, InitialLoadSet, LoadPolicy, PrimPredicate, PrimStatus, Resynced, Stage,
+    StageAuthoringError, StagePopulationMask, StageSink,
+};
+use openusd::usdz::ArchiveWriter;
+use openusd::{ar, gf, kind, pcp, sdf, tf, usd, vt};
+
+/// A [`StageSink`] for tests: holds optional closures for the composed-change and
+/// lifecycle hooks a test cares about, recording into shared state it inspects
+/// afterward.
+#[derive(Default)]
+#[allow(clippy::type_complexity)]
+struct RecordingSink {
+    after: Option<Box<dyn Fn(&Stage, &CommittedChange<'_>)>>,
+    edit_target: Option<Box<dyn Fn(&Stage)>>,
+    muting: Option<Box<dyn Fn(&Stage, &str, bool, Resynced<'_>)>>,
+    load_rules: Option<Box<dyn Fn(&Stage, Resynced<'_>)>>,
+    loads_retried: Option<Box<dyn Fn(&Stage, Resynced<'_>)>>,
+    recomposed: Option<Box<dyn Fn(&Stage, Resynced<'_>)>>,
+}
+
+impl StageSink for RecordingSink {
+    fn after_commit(&self, stage: &Stage, change: &CommittedChange<'_>) {
+        if let Some(f) = &self.after {
+            f(stage, change);
+        }
+    }
+    fn edit_target_changed(&self, stage: &Stage) {
+        if let Some(f) = &self.edit_target {
+            f(stage);
+        }
+    }
+    fn layer_muting_changed(&self, stage: &Stage, layer: &str, muted: bool, resynced: Resynced<'_>) {
+        if let Some(f) = &self.muting {
+            f(stage, layer, muted, resynced);
+        }
+    }
+    fn load_rules_changed(&self, stage: &Stage, resynced: Resynced<'_>) {
+        if let Some(f) = &self.load_rules {
+            f(stage, resynced);
+        }
+    }
+    fn loads_retried(&self, stage: &Stage, resynced: Resynced<'_>) {
+        if let Some(f) = &self.loads_retried {
+            f(stage, resynced);
+        }
+    }
+    fn recomposed(&self, stage: &Stage, resynced: Resynced<'_>) {
+        if let Some(f) = &self.recomposed {
+            f(stage, resynced);
+        }
+    }
+}
+
+/// An [`sdf::LayerSink`] for tests: optional closures for the layer-tier
+/// pre-commit (with veto) and post-commit hooks.
+#[allow(clippy::type_complexity)]
+#[derive(Default)]
+struct RecordingLayerSink {
+    before: Option<Box<dyn Fn(&sdf::PendingLayerChange<'_>) -> Result<(), sdf::sink::Error>>>,
+    after: Option<Box<dyn Fn(&str, &sdf::ChangeList)>>,
+}
+
+impl sdf::LayerSink for RecordingLayerSink {
+    fn before_commit(&self, change: &sdf::PendingLayerChange<'_>) -> Result<(), sdf::sink::Error> {
+        match &self.before {
+            Some(f) => f(change),
+            None => Ok(()),
+        }
+    }
+    fn after_commit(&self, change: &sdf::CommittedLayerChange<'_>) {
+        if let Some(f) = &self.after {
+            f(change.layer_identifier, change.change_list);
+        }
+    }
+}
+
+const VENDOR_COMPOSITION: &str = concat!(
+    env!("CARGO_WORKSPACE_DIR"),
+    "vendor/usd-wg-assets/test_assets/foundation/stage_composition"
+);
+
+fn manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap()
+}
+
+fn composition_path(relative: &str) -> String {
+    format!("{VENDOR_COMPOSITION}/{relative}")
+}
+
+fn fixture_path(relative: &str) -> String {
+    format!("{}/fixtures/{relative}", manifest_dir())
+}
+
+// Composed-scene query shims used throughout these tests: each routes
+// through the handle that now owns the query so the assertions stay terse.
+fn child_names(stage: &Stage, path: impl sdf::IntoPath) -> Result<Vec<String>> {
+    Ok(stage.prim(path)?.child_names()?.into_iter().map(String::from).collect())
+}
+
+/// Writes `text` as the root layer of a stage in `dir` and opens it.
+fn open_text(dir: &tempfile::TempDir, text: &str) -> Result<Stage> {
+    let root = dir.path().join("root.usda");
+    fs::write(&root, text)?;
+    Stage::open(root.to_str().unwrap())
+}
+
+fn prop_names(stage: &Stage, path: impl sdf::IntoPath) -> Result<Vec<String>> {
+    Ok(stage
+        .prim(path)?
+        .property_names()?
+        .into_iter()
+        .map(String::from)
+        .collect())
+}
+
+fn connections(stage: &Stage, attr: &sdf::Path) -> Result<Vec<sdf::Path>> {
+    stage.attribute(attr)?.connections()
+}
+
+fn rel_targets(stage: &Stage, rel: &sdf::Path) -> Result<Vec<sdf::Path>> {
+    stage.relationship(rel)?.targets()
+}
+
+fn fwd_targets(stage: &Stage, rel: &sdf::Path) -> Result<Vec<sdf::Path>> {
+    stage.relationship(rel)?.forwarded_targets()
+}
+
+/// Number of `UnresolvedSublayer` collection diagnostics the stage reports for
+/// `asset_path` — the assertion the muted-diagnostic tests share.
+fn unresolved_sublayer_count(stage: &Stage, asset_path: &str) -> usize {
+    stage
+        .composition_errors()
+        .iter()
+        .filter(
+            |e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path: a, .. } if a == asset_path),
+        )
+        .count()
+}
+
+/// How many unresolved-layer errors the stage reports for `asset_path`.
+fn unresolved_layer_count(stage: &Stage, asset_path: &str) -> usize {
+    stage
+        .composition_errors()
+        .iter()
+        .filter(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedLayer { asset_path: a, .. } if a == asset_path))
+        .count()
+}
+
+/// Whether the stage reports an `UnresolvedSublayer` for `asset_path`.
+fn reports_unresolved_sublayer(stage: &Stage, asset_path: &str) -> bool {
+    unresolved_sublayer_count(stage, asset_path) > 0
+}
+
+/// Every path channel a stage publishes, accumulated across the notices one
+/// edit or toggle produces.
+#[derive(Default, Debug)]
+struct Notices {
+    resynced: Vec<sdf::Path>,
+    changed_info_only: Vec<sdf::Path>,
+    asset_paths_resynced: Vec<sdf::Path>,
+    /// What a layer mute/unmute invalidated.
+    muting: Vec<sdf::Path>,
+    /// What a load-rules edit resynced, as subtrees.
+    load_rules: Vec<sdf::Path>,
+    /// What a load-rules edit recomposed in place.
+    load_rules_prims: Vec<sdf::Path>,
+}
+
+/// Installs a sink recording every channel, for tests asserting exactly what an
+/// edit or toggle publishes.
+fn capture_notices(stage: &Stage) -> Rc<RefCell<Notices>> {
+    let notices = Rc::new(RefCell::new(Notices::default()));
+    let (commit, muting, load_rules) = (notices.clone(), notices.clone(), notices.clone());
+    stage
+        .add_sink(RecordingSink {
+            after: Some(Box::new(move |_stage: &Stage, change: &CommittedChange<'_>| {
+                let mut n = commit.borrow_mut();
+                n.resynced.extend(change.resynced.iter().cloned());
+                n.changed_info_only.extend(change.changed_info_only.iter().cloned());
+                n.asset_paths_resynced
+                    .extend(change.asset_paths_resynced.iter().cloned());
+            })),
+            muting: Some(Box::new(
+                move |_stage: &Stage, _layer: &str, _muted, resynced: Resynced<'_>| {
+                    muting.borrow_mut().muting.extend(resynced.subtrees.iter().cloned());
+                },
+            )),
+            load_rules: Some(Box::new(move |_stage: &Stage, resynced: Resynced<'_>| {
+                let mut notices = load_rules.borrow_mut();
+                notices.load_rules.extend(resynced.subtrees.iter().cloned());
+                notices.load_rules_prims.extend(resynced.prims.iter().cloned());
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+    notices
+}
+
+/// The stage's first prototype by path. Instancing tests ask the stage for it
+/// rather than naming `/__Prototype_1`, whose number depends on which instance
+/// registered first.
+fn first_prototype(stage: &Stage) -> Result<sdf::Path> {
+    Ok(stage
+        .prototypes()?
+        .first()
+        .cloned()
+        .expect("the scene instances no prim"))
+}
+
+/// Parses each of `paths`, for comparing a captured channel against literals.
+fn paths(paths: &[&str]) -> Vec<sdf::Path> {
+    paths.iter().map(|p| sdf::path(p).expect("valid path")).collect()
+}
+
+/// The identifier of the loaded layer whose file name is `leaf`.
+fn identifier_by_leaf(stage: &Stage, leaf: &str) -> String {
+    stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|id| FsPath::new(id).ends_with(leaf))
+        .expect("layer is loaded")
+}
+
+// --- Basic stage opening (vendor/usd-wg-assets) ---
+
+/// Holding a stage's root layer, as a handle, a live spec handle or a
+/// borrow, does not stop a traversal from loading the layers its references
+/// and payloads target, and each stays readable inside it (issue #184).
+#[test]
+fn layer_held_across_loads() -> Result<()> {
+    let path = concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "vendor/usd-wg-assets/docs/CompositionPuzzles/PayloadAndReference/solution/shot.usda"
+    );
+    let expected = {
+        let stage = Stage::open(path)?;
+        let mut prims = Vec::new();
+        stage.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.to_string()))?;
+        prims
+    };
+    assert!(expected.iter().any(|p| p == "/World/Character"), "{expected:?}");
+
+    let stage = Stage::open(path)?;
+    let loaded = stage.layer_identifiers().len();
+    let root = stage.root_layer();
+    let world = root.prim("/World")?.expect("authored on the root layer");
+    let guard = root.try_borrow()?;
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |p| {
+        assert!(world.specifier().expect("a live read").is_some());
+        assert!(guard.prim("/World").expect("a prim path").is_some());
+        prims.push(p.to_string());
+    })?;
+    assert_eq!(prims, expected);
+    assert!(
+        stage.layer_identifiers().len() > loaded,
+        "the traversal loads the arc targets"
+    );
+    assert_eq!(root.default_prim()?.as_deref(), Some("World"));
+    Ok(())
+}
+
+/// A live handle to a stage's layer reads the layer as it is at each query:
+/// holding it stops no authoring, and a value read before an edit keeps
+/// what it read.
+#[test]
+fn layer_held_handle_reads() -> Result<()> {
+    let stage = Stage::builder().in_memory("root.usda")?;
+    stage.define_prim("/P")?;
+    stage.create_attribute("/P.x", sdf::ValueTypeName::DOUBLE)?.set(1.0)?;
+    let root = stage.root_layer();
+    let attr = root.attribute("/P.x")?.expect("authored on the root layer");
+
+    let before = attr.default()?;
+    stage.attribute("/P.x")?.set(42.0)?;
+    let after = attr.default()?;
+    let double = |value: Option<vt::Value>| value.map(|value| value.try_as_double().expect("a double"));
+    assert_eq!(double(before), Some(1.0));
+    assert_eq!(double(after), Some(42.0));
+
+    stage.remove_prim("/P")?;
+    assert_eq!(attr.spec_type()?, None, "the removed attribute reads as absent");
+    assert_eq!(attr.default()?, None);
+    Ok(())
+}
+
+/// A root layer with a sublayer and a reference, written to `dir`.
+fn borrow_fixture(dir: &FsPath) -> Result<String> {
+    fs::write(
+        dir.join("sub.usda"),
+        "#usda 1.0
+",
+    )?;
+    fs::write(
+        dir.join("ref.usda"),
+        "#usda 1.0
+def \"Model\" {
+    def \"Child\" {}
+}
+",
+    )?;
+    let root = dir.join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+(
+    subLayers = [@./sub.usda@]
+)
+def \"Ref\" (references = @./ref.usda@</Model>) {}
+",
+    )?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
+/// Whether `result` failed because a layer it would change is borrowed.
+fn borrowed<T>(result: &Result<T, StageAuthoringError>) -> bool {
+    matches!(result, Err(StageAuthoringError::Registry(sdf::LayerError::Busy)))
+}
+
+/// Authoring on a borrowed layer fails with `Busy` and composes nothing,
+/// while authoring on another layer of the stage succeeds. Once the guard
+/// drops, the first edit lands.
+#[test]
+fn layer_held_blocks_edit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = Stage::open(&borrow_fixture(dir.path())?)?;
+    let root = stage.root_layer();
+    let sub = identifier_by_leaf(&stage, "sub.usda");
+
+    let guard = root.try_borrow()?;
+    let defined = stage.define_prim("/Blocked");
+    assert!(borrowed(&defined), "{defined:?}");
+    assert!(
+        !stage.prim("/Blocked")?.is_valid()?,
+        "the refused edit composes nothing"
+    );
+    stage.set_edit_target(stage.edit_target_for_local_layer(&sub).expect("sub is local"))?;
+    stage.define_prim("/OnSub")?;
+    assert!(stage.prim("/OnSub")?.is_valid()?);
+    drop(guard);
+
+    let target = stage
+        .edit_target_for_local_layer(root.identifier())
+        .expect("root is local");
+    stage.set_edit_target(target)?;
+    stage.define_prim("/Blocked")?;
+    assert!(stage.prim("/Blocked")?.is_valid()?);
+    Ok(())
+}
+
+/// A batch edit naming a borrowed layer fails as a whole, leaving its other
+/// layers as they were.
+#[test]
+fn layer_held_batch_edit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = Stage::open(&borrow_fixture(dir.path())?)?;
+    let root = stage.root_layer();
+    let sub = identifier_by_leaf(&stage, "sub.usda");
+
+    let guard = root.try_borrow()?;
+    let edited = stage.batch_edit(&[&sub, root.identifier()], |edits| {
+        for edit in edits.iter_mut() {
+            sdf::PrimSpec::new(edit.data_mut(), "/Batch", sdf::Specifier::Def, "")?;
+        }
+        Ok(())
+    });
+    assert!(borrowed(&edited), "{edited:?}");
+    drop(guard);
+    let sub = stage.layer(&sub)?.expect("sub is loaded");
+    assert!(sub.prim("/Batch")?.is_none(), "the sublayer is unchanged");
+    assert!(!stage.prim("/Batch")?.is_valid()?);
+    Ok(())
+}
+
+/// A borrowed layer the stage stops composing leaves the stage at once and
+/// stays readable through its guard. The registry frees it once the guard
+/// drops.
+#[test]
+fn layer_held_reclaim() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let registry = sdf::LayerRegistry::default();
+    let stage = Stage::builder()
+        .registry(registry.clone())
+        .open(&borrow_fixture(dir.path())?)?;
+    assert!(stage.prim("/Ref/Child")?.is_valid()?);
+    let reference = identifier_by_leaf(&stage, "ref.usda");
+    let layer = stage.layer(&reference)?.expect("the reference is loaded");
+    let sentinel = Rc::new(());
+    let freed = Rc::downgrade(&sentinel);
+    layer.add_sink(move |_: &str, _: &sdf::ChangeList| {
+        let _ = &sentinel;
+    })?;
+    let guard = layer.try_borrow()?;
+    drop(layer);
+
+    assert!(stage.remove_prim("/Ref")?);
+    assert!(!stage.prim("/Ref/Child")?.is_valid()?);
+    assert!(stage.layer(&reference)?.is_none(), "the layer left the stage");
+    assert!(guard.prim("/Model/Child")?.is_some(), "the guard still reads its layer");
+    assert!(registry.find(&reference)?.is_some(), "the guard keeps the layer open");
+    assert!(freed.upgrade().is_some(), "the guard keeps the layer in memory");
+    drop(guard);
+    registry.sweep();
+    assert!(registry.find(&reference)?.is_none(), "the layer left the registry");
+    assert!(freed.upgrade().is_none(), "the registry freed the layer");
+    Ok(())
+}
+
+/// `Stage::layer` finds the root and session layers by identifier, and a
+/// session sublayer through the layer graph.
+#[test]
+fn layer_lookup_spellings() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+",
+    )?;
+    fs::write(
+        &session,
+        "#usda 1.0
+(
+    subLayers = [@./extra.usda@]
+)
+",
+    )?;
+    fs::write(
+        dir.path().join("extra.usda"),
+        "#usda 1.0
+",
+    )?;
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    for layer in [stage.root_layer(), stage.session_layer().expect("session layer")] {
+        assert_eq!(stage.layer(layer.identifier())?.as_ref(), Some(&layer));
+    }
+    let extra = identifier_by_leaf(&stage, "extra.usda");
+    assert_eq!(stage.layer(&extra)?.expect("sublayer is loaded").identifier(), extra);
+    assert!(stage.layer("missing.usda")?.is_none());
+    Ok(())
+}
+
+/// A prim stack's site reads its layer live, and keeps that layer open after
+/// the stage lets it go: reading it again finds the held layer, and the site
+/// reads it after the stage drops.
+#[test]
+fn site_keeps_layer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = Stage::open(&borrow_fixture(dir.path())?)?;
+    let site = stage
+        .prim("/Ref/Child")?
+        .prim_stack()?
+        .into_iter()
+        .find(|site| site.layer.identifier().ends_with("ref.usda"))
+        .expect("the reference contributes a spec");
+    assert!(site.layer.prim(&site.path)?.is_some(), "the site reads its spec");
+
+    assert!(stage.remove_prim("/Ref")?);
+    assert!(
+        stage.layer(site.layer.identifier())?.is_none(),
+        "the layer left the stage"
+    );
+    assert!(site.layer.prim(&site.path)?.is_some(), "the site keeps its layer");
+
+    let (prim, model) = (sdf::path("/Ref")?, sdf::path("/Model")?);
+    stage.root_layer().edit(|e| {
+        sdf::PrimSpec::new(e.data_mut(), "/Ref", sdf::Specifier::Def, "")?;
+        e.data_mut().set_field(
+            &prim,
+            sdf::FieldKey::References.as_str(),
+            vt::Value::ReferenceListOp(sdf::ReferenceListOp::prepended([sdf::Reference {
+                asset_path: "./ref.usda".into(),
+                prim_path: model.clone(),
+                ..Default::default()
+            }])),
+        );
+        Ok(())
+    })?;
+    let again = stage
+        .prim("/Ref/Child")?
+        .prim_stack()?
+        .into_iter()
+        .find(|again| again.layer.identifier().ends_with("ref.usda"))
+        .expect("the reference contributes again");
+    assert_eq!(again.layer, site.layer, "the stage reads the held layer");
+
+    drop((again, stage));
+    assert!(site.layer.prim(&site.path)?.is_some(), "the site outlives the stage");
+    Ok(())
+}
+
+/// A reference or payload to a prim missing from the stage's own root layer
+/// names that root layer as the target layer, not the session layer ahead of
+/// it in the root stack.
+#[test]
+fn internal_target_root_diagnostic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&session, "#usda 1.0\n")?;
+    for field in ["references", "payload"] {
+        for target in ["/Missing", "/Present/Missing"] {
+            fs::write(
+                &root,
+                format!("#usda 1.0\ndef \"Present\" {{}}\ndef \"Root\" ({field} = <{target}>) {{}}\n"),
+            )?;
+            let stage = Stage::builder()
+                .session_layer(session.to_str().unwrap())
+                .open(root.to_str().unwrap())?;
+            assert!(stage.prim("/Root")?.is_valid()?);
+            let errors = stage.composition_errors();
+            let target_layer = errors
+                .iter()
+                .find_map(|error| match error {
+                    pcp::CompositionDiagnostic::UnresolvedPrimPath { target_layer, .. } => Some(target_layer),
+                    _ => None,
+                })
+                .expect("missing target diagnostic");
+            assert_eq!(target_layer, stage.root_layer().identifier(), "{field} = <{target}>");
+        }
+    }
+    Ok(())
+}
+
+/// A stage opened on a layer already read composes it as it stands, an
+/// unsaved edit included, with the sublayers it names.
+#[test]
+fn open_layer_unsaved() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(dir.path().join("sub.usda"), "#usda 1.0\ndef \"FromSub\" {}\n")?;
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@./sub.usda@]\n)\ndef \"Saved\" {}\n",
+    )?;
+    let mut layer = sdf::Layer::open(root.to_str().unwrap())?;
+    layer.edit(|e| {
+        sdf::PrimSpec::new(e.data_mut(), "/Unsaved", sdf::Specifier::Def, "")?;
+        Ok(())
+    })?;
+    let identifier = layer.identifier().to_string();
+
+    let stage = Stage::builder().open_layer(layer)?;
+    assert_eq!(stage.root_layer().identifier(), identifier);
+    for path in ["/Saved", "/Unsaved", "/FromSub"] {
+        assert!(stage.prim(path)?.is_valid()?, "{path}");
+    }
+    Ok(())
+}
+
+/// A stage opened on an anonymous layer opens the sublayer it names by an
+/// absolute path, which resolves without an anchor.
+#[test]
+fn open_layer_anonymous() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sub = dir.path().join("sub.usda");
+    fs::write(&sub, "#usda 1.0\ndef \"FromSub\" {}\n")?;
+    let mut layer = sdf::Layer::new_anonymous("root.usda");
+    let sub = sub.to_str().unwrap().to_string();
+    layer.edit(|e| {
+        e.pseudo_root_mut()?.set_sublayers([sub]);
+        Ok(())
+    })?;
+
+    let stage = Stage::builder().open_layer(layer)?;
+    assert!(stage.root_layer().is_anonymous());
+    assert!(stage.prim("/FromSub")?.is_valid()?);
+    Ok(())
+}
+
+/// A stage opened on a layer under a mask holds what the mask admits.
+#[test]
+fn open_layer_masked() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\ndef \"A\" {\n    def \"Child\" {}\n}\ndef \"B\" {}\n")?;
+    let layer = sdf::Layer::open(root.to_str().unwrap())?;
+    let stage = Stage::builder()
+        .mask(usd::StagePopulationMask::new(["/A/__No_Such_Prim__"])?)
+        .open_layer(layer)?;
+    assert!(stage.prim("/A")?.is_valid()?);
+    assert!(!stage.prim("/A/Child")?.is_valid()?);
+    assert!(!stage.prim("/B")?.is_valid()?);
+    Ok(())
+}
+
+#[test]
+fn missing_sublayer_retained() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\ndef \"Root\" {}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.composition_errors().iter().any(|error| matches!(
+        error,
+        pcp::CompositionDiagnostic::UnresolvedSublayer {
+            asset_path,
+            introduced_by,
+        } if asset_path == "missing.usda" && introduced_by.ends_with("root.usda")
+    )));
+    assert!(stage.prim("/Root")?.is_valid()?);
+    Ok(())
+}
+
+/// A missing sublayer under a muted branch raises no diagnostic: the muted layer
+/// and its whole subtree contribute nothing to composition, so its absent
+/// descendants are not stage errors. The same missing sublayer that surfaces as
+/// `UnresolvedSublayer` without the mute is filtered out with it.
+#[test]
+fn muted_branch_suppresses_missing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let muted = dir.path().join("muted.usda");
+    // `root` sublayers `muted`, which in turn sublayers a file that does not exist.
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@muted.usda@]\n)\n")?;
+    fs::write(&muted, "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n")?;
+    let root_path = root.to_str().unwrap();
+
+    // Without muting, the missing sublayer under `muted` is reported.
+    let plain = Stage::open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&plain, "missing.usda"),
+        "an unmuted missing sublayer must be reported, got {:?}",
+        plain.composition_errors()
+    );
+
+    // Muting `muted.usda` prunes its subtree, so its missing sublayer is silent.
+    let muted_stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&muted_stage, "missing.usda"),
+        "a missing sublayer under a muted branch must raise no diagnostic, got {:?}",
+        muted_stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a layer that is itself a missing sublayer suppresses its
+/// `UnresolvedSublayer` diagnostic — a muted layer contributes nothing whether it
+/// resolves or not, so its absence is not reported.
+#[test]
+fn muted_missing_sublayer_suppressed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@gone.usda@]\n)\n")?;
+    let root_path = root.to_str().unwrap();
+
+    let plain = Stage::open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&plain, "gone.usda"),
+        "an unmuted missing sublayer is reported"
+    );
+
+    let muted = Stage::builder().mute(["gone.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&muted, "gone.usda"),
+        "muting the missing sublayer suppresses its diagnostic, got {:?}",
+        muted.composition_errors()
+    );
+    Ok(())
+}
+
+/// A missing sublayer reached through both a muted and an unmuted branch of one
+/// stack is still reported. The muted branch is declared (and loaded) first, but
+/// the diagnostic decision is made from the graph's reachability, not the load
+/// order, so the unmuted branch that genuinely needs it keeps its
+/// `UnresolvedSublayer`.
+#[test]
+fn muted_diamond_keeps_active() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // `root` sublayers `muted` (declared first, so walked first) then `active`;
+    // both sublayer the same missing layer.
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@, @active.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared_missing.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("active.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared_missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    // With `muted.usda` muted, its reference to the missing layer is suppressed,
+    // but `active.usda` still contributes it, so the diagnostic must survive.
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "shared_missing.usda"),
+        1,
+        "the unmuted branch's missing sublayer must be reported exactly once, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A *readable, shared* layer reached through both a muted and an unmuted branch
+/// keeps the diagnostics for its own missing descendants. `shared` loads once
+/// (deduplicated by identity), and its missing sublayer is reported because
+/// `shared` is reachable through the unmuted `active` branch, regardless of which
+/// branch reaches it first.
+#[test]
+fn muted_diamond_keeps_descendant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Both `muted` (walked first) and `active` sublayer the same readable `shared`
+    // layer, which in turn sublayers a missing one.
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@, @active.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("active.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("shared.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the shared layer is reachable through the unmuted branch, so its missing sublayer must be reported, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a branch suppresses its missing-sublayer diagnostic and unmuting
+/// restores it. The loader records the raw diagnostic once; filtering happens at
+/// report time against the current composed state, so the one-shot error is never
+/// discarded and reappears when the branch rejoins composition.
+#[test]
+fn unmute_restores_diagnostic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@muted.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("muted.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::builder().mute(["muted.usda"]).open(root_path)?;
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "while muted the missing sublayer must be silent, got {:?}",
+        stage.composition_errors()
+    );
+
+    stage.unmute_layer("muted.usda");
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "unmuting the branch must restore its missing-sublayer diagnostic, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// `composition_errors()` reflects the current composition: an unrelated mute
+/// composes the prim that references a target again, which still reaches the
+/// target's missing sublayer, and deleting the prim releases the target
+/// stack's last owner, so the sweep at that edit retires the stack and its
+/// diagnostic together.
+#[test]
+fn retired_prim_retires_diagnostic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // `/A` references `target` (which has a missing sublayer); the unrelated
+    // sublayer `s` also contributes an opinion to `/A`, so muting `s` evicts `/A`'s
+    // index without touching the `/A -> target` arc authored in the root.
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@s.usda@]\n)\ndef \"A\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("s.usda"),
+        "#usda 1.0\nover \"A\" {\n    custom int x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("target.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n    defaultPrim = \"T\"\n)\ndef \"T\" {}\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::open(root_path)?;
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the reached target's missing sublayer is reported"
+    );
+
+    // Muting the unrelated `s` composes `/A` again, which still reaches the
+    // target.
+    stage.mute_layer("s.usda");
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the recomposed prim still reaches the target, got {:?}",
+        stage.composition_errors()
+    );
+
+    // Deleting `/A` retires it, the target stack's only owner, so the edit's
+    // sweep retires the stack and its diagnostic together.
+    let root = stage.root_layer().identifier().to_owned();
+    stage.edit_layer(&root, |e| {
+        e.remove_spec(&sdf::path("/A")?)?;
+        Ok(())
+    })?;
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the orphaned target's diagnostic retires with its stack, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting a reference target that has already loaded suppresses the target's own
+/// missing-sublayer diagnostic: the muted target root resolves to an empty stack,
+/// so it drops out of the composed-stack effective set and no longer counts as an
+/// effective referrer.
+#[test]
+fn mute_loaded_target_suppresses() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"A\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("target.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n    defaultPrim = \"T\"\n)\ndef \"T\" {}\n",
+    )?;
+    let root_path = dir.path().join("root.usda");
+    let root_path = root_path.to_str().unwrap();
+
+    let stage = Stage::open(root_path)?;
+    // Composing `/A` loads the target and records its missing sublayer.
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the loaded target's missing sublayer is reported"
+    );
+
+    stage.mute_layer("target.usda");
+    // Recompose `/A` so it records the now-muted target as an external target.
+    let _ = child_names(&stage, "/A")?;
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "muting the target suppresses its own sublayer diagnostic, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A layer that authors the same missing sublayer twice reports it once. The
+/// loader deduplicates failures per referrer, so a duplicate `subLayers` entry
+/// does not double the diagnostic — while a genuinely separate referrer still
+/// reports its own (see `muted_diamond_keeps_active`).
+#[test]
+fn duplicate_missing_reported_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@, @missing.usda@]\n)\n",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "missing.usda"),
+        1,
+        "a duplicate missing sublayer is reported once, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A missing sublayer of a reference target opened on demand surfaces the same
+/// `UnresolvedSublayer` diagnostic as a missing root sublayer: composition reaches
+/// the target lazily, so the load barrier records it. The target still loads, so
+/// the reference composes (`/P.x` resolves).
+#[test]
+fn lazy_ref_missing_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @target.usda@\n) {}\n")?;
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0)),
+        "the reference target loads despite its missing sublayer"
+    );
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, introduced_by }
+                if asset_path == "missing.usda" && introduced_by.ends_with("target.usda")
+        )),
+        "expected UnresolvedSublayer, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A reference target that resolves but cannot be parsed is reported
+/// `MalformedLayer` (carrying the parse error) rather than silently dropped, and
+/// composition still completes — the demanding prim composes without the arc
+/// instead of looping on the unreadable target.
+#[test]
+fn lazy_ref_unreadable_target() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("broken.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @broken.usda@\n) {}\n")?;
+    // Resolves (the file exists) but the parser rejects the body.
+    fs::write(&target, "#usda 1.0\ndef Broken {{{ not valid\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?, "/P still composes without the arc");
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::CompositionDiagnostic::MalformedLayer { asset_path, reason, .. }
+                if asset_path.contains("broken.usda") && !reason.is_empty()
+        )),
+        "expected MalformedLayer carrying the parse error, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A reference target that failed to read stays failed through an unrelated
+/// edit, and an explicit retry loads it once repaired.
+#[test]
+fn failed_load_retried_explicitly() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @target.usda@\n) {}\n")?;
+    fs::write(&target, "#usda 1.0\ndef Broken {{{ not valid\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    let malformed = |stage: &Stage| {
+        stage.composition_errors().iter().any(|e| {
+            matches!(
+                e,
+                pcp::CompositionDiagnostic::MalformedLayer { asset_path, .. } if asset_path.contains("target.usda")
+            )
+        })
+    };
+    assert!(malformed(&stage), "the unreadable target is reported malformed");
+
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom double x = 7\n}\n",
+    )?;
+    stage.define_prim("/Trigger")?;
+    assert!(malformed(&stage), "an unrelated edit leaves the failure");
+
+    stage.retry_loads()?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0)),
+        "the repaired reference composes once retried"
+    );
+    assert!(!malformed(&stage));
+    Ok(())
+}
+
+/// What the stage's sinks heard, in order: each transaction's resyncs as
+/// `("commit", paths)`, each retry's as `("retried", paths)` and each
+/// recomposed notice's subtrees as `("recomposed", paths)`.
+type Heard = Rc<RefCell<Vec<(&'static str, Vec<sdf::Path>)>>>;
+
+/// Opens `root.usda` in `dir`, whose `/P` references each of the unreadable
+/// `targets`, composes `/P` so the failures are recorded, and installs a
+/// sink recording what it hears.
+fn open_broken_targets(dir: &FsPath, targets: &[&str]) -> Result<(Stage, Heard)> {
+    let references: Vec<String> = targets.iter().map(|target| format!("@{target}@")).collect();
+    fs::write(
+        dir.join("root.usda"),
+        format!(
+            "#usda 1.0\ndef \"P\" (\n    references = [{}]\n) {{}}\n",
+            references.join(", ")
+        ),
+    )?;
+    for target in targets {
+        fs::write(dir.join(target), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    }
+    let stage = Stage::open(dir.join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    let heard: Heard = Rc::new(RefCell::new(Vec::new()));
+    let (commits, retried, recomposed) = (Rc::clone(&heard), Rc::clone(&heard), Rc::clone(&heard));
+    stage.add_sink(RecordingSink {
+        after: Some(Box::new(move |_, change| {
+            commits.borrow_mut().push(("commit", change.resynced.to_vec()));
+        })),
+        loads_retried: Some(Box::new(move |_, resynced| {
+            retried.borrow_mut().push(("retried", resynced.subtrees.to_vec()));
+        })),
+        recomposed: Some(Box::new(move |_, resynced| {
+            recomposed.borrow_mut().push(("recomposed", resynced.subtrees.to_vec()));
+        })),
+        ..Default::default()
+    })?;
+    Ok((stage, heard))
+}
+
+/// Repairs `target` in `dir` to supply the child `name`.
+fn repair(dir: &FsPath, target: &str, name: &str) -> Result<()> {
+    fs::write(
+        dir.join(target),
+        format!("#usda 1.0\n(\n    defaultPrim = \"T\"\n)\ndef \"T\" {{\n    def \"{name}\" {{}}\n}}\n"),
+    )?;
+    Ok(())
+}
+
+/// An unrelated edit leaves a repaired target unloaded and reports
+/// nothing for it.
+#[test]
+fn unrelated_edit_skips_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (stage, heard) = open_broken_targets(dir.path(), &["target.usda"])?;
+    repair(dir.path(), "target.usda", "Child")?;
+
+    stage.define_prim("/Trigger")?;
+    assert_eq!(*heard.borrow(), [("commit", paths(&["/Trigger"]))]);
+    assert!(!stage.prim("/P/Child")?.is_valid()?);
+    Ok(())
+}
+
+/// An explicit retry reports the prims it recomposes, one whose targets are
+/// only partly repaired included.
+#[test]
+fn retry_reports_recovery() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (stage, heard) = open_broken_targets(dir.path(), &["a.usda", "b.usda"])?;
+    repair(dir.path(), "a.usda", "Child")?;
+
+    stage.retry_loads()?;
+    assert_eq!(*heard.borrow(), [("retried", paths(&["/P"]))]);
+    assert!(stage.prim("/P/Child")?.is_valid()?);
+    Ok(())
+}
+
+/// A mute that drops a prim with a failed load retries that load for every
+/// prim that recorded it, and the toggle's notice names them all.
+#[test]
+fn mute_names_other_referrers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (\n    references = @ref.usda@</R>\n) {}\n\
+         def \"Q\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\n(\n    subLayers = [@sub.usda@]\n)\ndef \"R\" {}\n",
+    )?;
+    fs::write(
+        dir.path().join("sub.usda"),
+        "#usda 1.0\nover \"R\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(dir.path().join("target.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()? && stage.prim("/Q")?.is_valid()?);
+    let heard: Heard = Rc::new(RefCell::new(Vec::new()));
+    let (muted, recomposed) = (Rc::clone(&heard), Rc::clone(&heard));
+    stage.add_sink(RecordingSink {
+        muting: Some(Box::new(move |_, _, _, resynced| {
+            muted.borrow_mut().push(("muted", resynced.subtrees.to_vec()));
+        })),
+        recomposed: Some(Box::new(move |_, resynced| {
+            recomposed.borrow_mut().push(("recomposed", resynced.subtrees.to_vec()));
+        })),
+        ..Default::default()
+    })?;
+    let sub = stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|identifier| identifier.ends_with("sub.usda"))
+        .expect("the sublayer");
+
+    stage.mute_layer(sub);
+    assert_eq!(*heard.borrow(), [("muted", paths(&["/P", "/Q"]))]);
+    Ok(())
+}
+
+/// A retry from inside an edit of the registry's layers fails with `Busy`
+/// and keeps the failures, so a later retry loads the repaired sublayer.
+#[test]
+fn busy_retry_keeps_failures() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@late.usda@]\n)\n")?;
+    fs::write(dir.path().join("late.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(!stage.prim("/L")?.is_valid()?);
+    fs::write(dir.path().join("late.usda"), "#usda 1.0\ndef \"L\" {}\n")?;
+
+    let mut inside = None;
+    stage.root_layer().edit(|_| {
+        inside = Some(stage.retry_loads());
+        Ok(())
+    })?;
+    let inside = inside.expect("the edit ran");
+    assert!(
+        matches!(inside, Err(openusd::Error::Layer(sdf::LayerError::Busy))),
+        "{inside:?}"
+    );
+    stage.retry_loads()?;
+    assert!(stage.prim("/L")?.is_valid()?, "the repaired sublayer loads");
+    Ok(())
+}
+
+/// A retry whose target still fails composes the prim as before, with the
+/// failure reported again.
+#[test]
+fn retry_still_broken() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (stage, heard) = open_broken_targets(dir.path(), &["target.usda"])?;
+    let errors = stage.composition_errors();
+
+    stage.retry_loads()?;
+    assert_eq!(*heard.borrow(), [("retried", paths(&["/P"]))]);
+    assert!(stage.prim("/P")?.is_valid()?);
+    assert_eq!(stage.composition_errors(), errors);
+    Ok(())
+}
+
+/// A reference an edit authors to an asset that failed before resolves it
+/// afresh: a repaired asset loads with no retry, for the prim that recorded
+/// the failure too, which the drain reports after the edit.
+#[test]
+fn new_reference_escapes_failure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (stage, heard) = open_broken_targets(dir.path(), &["target.usda"])?;
+    repair(dir.path(), "target.usda", "Child")?;
+    let q = stage.define_prim("/Q")?;
+    heard.borrow_mut().clear();
+
+    q.references().add(sdf::Reference {
+        asset_path: "target.usda".into(),
+        ..Default::default()
+    })?;
+    assert!(stage.prim("/Q/Child")?.is_valid()?);
+    assert!(stage.prim("/P/Child")?.is_valid()?, "the prim that failed recovers");
+    assert_eq!(
+        *heard.borrow(),
+        [("commit", paths(&["/Q"])), ("recomposed", paths(&["/P"]))]
+    );
+    Ok(())
+}
+
+/// An expression reference an edit authors to an asset that failed before
+/// resolves it afresh, as a literal one does.
+#[test]
+fn expression_reference_escapes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    expressionVariables = { string T = \"target\" }\n)\ndef \"P\" (references = \
+         @target.usda@) {}\ndef \"Q\" {}\n",
+    )?;
+    fs::write(dir.path().join("target.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()? && stage.prim("/Q")?.is_valid()?);
+    repair(dir.path(), "target.usda", "Child")?;
+
+    stage.prim("/Q")?.references().add(sdf::Reference {
+        asset_path: "`\"./${T}.usda\"`".into(),
+        ..Default::default()
+    })?;
+    assert!(stage.prim("/Q/Child")?.is_valid()?);
+    assert!(stage.prim("/P/Child")?.is_valid()?);
+    Ok(())
+}
+
+/// A variable edit that selects an asset again, after it failed and was
+/// repaired, resolves it afresh.
+#[test]
+fn variable_escapes_failure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"a\" }\n)\ndef \"P\" (\n    references = \
+         @`\"./${V}.usda\"`@\n) {}\n",
+    )?;
+    fs::write(dir.path().join("a.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    repair(dir.path(), "b.usda", "B")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    let select = |value: &str| HashMap::from([("V".to_string(), vt::Value::String(value.to_string()))]);
+
+    stage.set_expression_variables(select("b"))?;
+    assert!(stage.prim("/P/B")?.is_valid()?);
+    repair(dir.path(), "a.usda", "A")?;
+    stage.set_expression_variables(select("a"))?;
+    assert!(stage.prim("/P/A")?.is_valid()?, "the repaired asset loads");
+    Ok(())
+}
+
+/// A variant switched away from a broken reference and back, once the
+/// asset is repaired, composes it: the prim composed again tries it again.
+#[test]
+fn variant_back_retries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (\n    variants = { string v = \"a\" }\n    prepend variantSets = \"v\"\n)\n{\n    \
+         variantSet \"v\" = {\n        \"a\" (references = @a.usda@) {}\n        \"b\" {}\n    }\n}\n",
+    )?;
+    fs::write(dir.path().join("a.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+
+    stage.prim("/P")?.variant_sets().set_selection("v", "b")?;
+    repair(dir.path(), "a.usda", "A")?;
+    stage.prim("/P")?.variant_sets().set_selection("v", "a")?;
+    assert!(stage.prim("/P/A")?.is_valid()?);
+    Ok(())
+}
+
+/// An edit that composes one prim with a repaired target again recomposes
+/// every other prim that recorded the same failure.
+#[test]
+fn other_referrer_recovers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (references = @t.usda@) {}\ndef \"Q\" (references = @t.usda@) {}\ndef \"E\" {}\n",
+    )?;
+    fs::write(dir.path().join("t.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()? && stage.prim("/Q")?.is_valid()?);
+    repair(dir.path(), "t.usda", "Child")?;
+
+    stage.prim("/P")?.set_instanceable(true)?;
+    assert!(stage.prim("/Q/Child")?.is_valid()?, "the other referrer recovers");
+    Ok(())
+}
+
+/// A variant switched back to a repaired target composes it, though
+/// another prim recorded the target's failure again in between.
+#[test]
+fn variant_back_past_referrer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (\n    variants = { string v = \"a\" }\n    prepend variantSets = \"v\"\n)\n{\n    \
+         variantSet \"v\" = {\n        \"a\" (references = @a.usda@) {}\n        \"b\" {}\n    }\n}\ndef \"Q\" \
+         (references = @a.usda@) {}\n",
+    )?;
+    fs::write(dir.path().join("a.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()? && stage.prim("/Q")?.is_valid()?);
+
+    stage.prim("/P")?.variant_sets().set_selection("v", "b")?;
+    assert!(stage.prim("/Q")?.is_valid()?);
+    repair(dir.path(), "a.usda", "A")?;
+    stage.prim("/P")?.variant_sets().set_selection("v", "a")?;
+    assert!(stage.prim("/P/A")?.is_valid()?);
+    assert!(stage.prim("/Q/A")?.is_valid()?);
+    Ok(())
+}
+
+/// A sublayer edit that loads a repaired asset recomposes a prim whose
+/// reference to the same asset recorded its failure.
+#[test]
+fn sublayer_retry_recomposes_referrer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (references = @t.usda@) {}\ndef \"Q\" (references = @e.usda@) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("e.usda"),
+        "#usda 1.0\n(\n    defaultPrim = \"E\"\n    subLayers = [@t.usda@]\n)\ndef \"E\" {}\n",
+    )?;
+    fs::write(dir.path().join("t.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()? && stage.prim("/Q")?.is_valid()?);
+    repair(dir.path(), "t.usda", "Child")?;
+
+    let e = stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|id| id.ends_with("e.usda"))
+        .expect("e.usda is loaded");
+    stage.layer(&e)?.expect("loaded").edit(|e| {
+        e.pseudo_root_mut().unwrap().set_sublayers(["./t.usda"]);
+        Ok(())
+    })?;
+    assert!(stage.prim("/P/Child")?.is_valid()?, "the reference recovers");
+    Ok(())
+}
+
+/// A broken payload unloaded, repaired and loaded again composes.
+#[test]
+fn reloaded_payload_retries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (payload = @p.usda@) {}\n",
+    )?;
+    fs::write(dir.path().join("p.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+
+    stage.unload("/P")?;
+    repair(dir.path(), "p.usda", "C")?;
+    stage.load("/P", LoadPolicy::WithDescendants)?;
+    assert!(stage.prim("/P/C")?.is_valid()?);
+    Ok(())
+}
+
+/// A variable edit that selects a repaired sublayer again loads it.
+#[test]
+fn variable_reselects_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"a\" }\n    subLayers = [@`\"./${V}.usda\"`@]\n)\n",
+    )?;
+    fs::write(dir.path().join("a.usda"), "#usda 1.0\ndef Broken {{{ not valid\n")?;
+    fs::write(dir.path().join("b.usda"), "#usda 1.0\ndef \"B\" {}\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    let select = |value: &str| HashMap::from([("V".to_string(), vt::Value::String(value.to_string()))]);
+
+    stage.set_expression_variables(select("b"))?;
+    assert!(stage.prim("/B")?.is_valid()?);
+    fs::write(dir.path().join("a.usda"), "#usda 1.0\ndef \"A\" {}\n")?;
+    stage.set_expression_variables(select("a"))?;
+    assert!(stage.prim("/A")?.is_valid()?, "the repaired sublayer loads");
+    Ok(())
+}
+
+/// A referenced stack's sublayer diagnostic survives a resync of the prim
+/// that uses the stack, and goes once nothing uses it.
+#[test]
+fn stack_diagnostic_lifetime() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"P\" (\n    references = @ref.usda@</R>\n) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@]\n)\ndef \"R\" {}\n",
+    )?;
+    fs::write(dir.path().join("other.usda"), "#usda 1.0\ndef \"O\" {}\n")?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    let prim = stage.prim("/P")?;
+    assert!(prim.is_valid()?);
+    assert_eq!(unresolved_sublayer_count(&stage, "missing.usda"), 1);
+
+    let other = sdf::Reference {
+        asset_path: "other.usda".into(),
+        prim_path: sdf::Path::new("/O")?,
+        ..Default::default()
+    };
+    prim.references().add(other.clone())?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "missing.usda"),
+        1,
+        "the stack survives the resync"
+    );
+
+    stage.prim("/P")?.references().set([other])?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "missing.usda"),
+        0,
+        "nothing uses the stack"
+    );
+    Ok(())
+}
+
+/// Removing the instance a prototype was composed from keeps the prototype
+/// for the instances left (C++ `Usd_InstanceCache` assigns it a new source):
+/// they stay on `/__Prototype_1`, and the notice resyncs the prototype.
+#[test]
+fn prototype_outlives_source() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "A" (
+    references = </Source>
+    instanceable = true
+) {}
+def "B" (
+    references = </Source>
+    instanceable = true
+) {}
+def "Source" {
+    def "Child" { custom double x = 1 }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = sdf::path("/__Prototype_1")?;
+    assert_eq!(stage.prim("/A")?.prototype()?, Some(prototype.clone()));
+    assert_eq!(stage.prim("/B")?.prototype()?, Some(prototype.clone()));
+
+    let resynced = Rc::new(RefCell::new(Vec::new()));
+    let sink = resynced.clone();
+    stage.add_sink(move |_: &Stage, change: &usd::CommittedChange<'_>| {
+        sink.borrow_mut().extend(change.resynced.iter().cloned());
+    })?;
+    stage.remove_prim("/A")?;
+
+    assert_eq!(stage.prim("/B")?.prototype()?, Some(prototype.clone()));
+    assert_eq!(stage.prototypes()?, slice::from_ref(&prototype));
+    assert_eq!(
+        stage
+            .attribute("/B/Child.x")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0))
+    );
+    assert!(resynced.borrow().contains(&prototype), "{:?}", resynced.borrow());
+    Ok(())
+}
+
+/// An instance moving onto a prototype whose own source goes in the same edit
+/// keeps that prototype's work: the moved instance takes the root back, and
+/// the work the retired prototype held there settles, so its composition
+/// errors stay reported without a query.
+#[test]
+fn prototype_root_taken_back() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+def "A" (
+    references = </S1>
+    instanceable = true
+) {}
+def "B" (
+    references = </S2>
+    instanceable = true
+) {}
+def "S1" {
+    def "C" {}
+}
+def "S2" {
+    def "C" (
+        references = @missing.usda@</X>
+    ) {}
+}
+"#,
+    )?;
+    assert!(stage.prim("/A/C")?.is_valid()?);
+    assert!(stage.prim("/B/C")?.is_valid()?);
+    let kept = stage.prim("/B")?.prototype()?.expect("an instance");
+    assert_eq!(unresolved_layer_count(&stage, "missing.usda"), 1);
+
+    let root_id = stage.root_layer().identifier().to_owned();
+    stage.edit_layer(&root_id, |e| {
+        let references = sdf::ReferenceListOp::explicit([sdf::Reference {
+            prim_path: sdf::Path::new("/S2")?,
+            ..Default::default()
+        }]);
+        e.prim_mut("/A")?
+            .expect("/A is authored")
+            .set("references", vt::Value::ReferenceListOp(references));
+        e.remove_spec(&sdf::Path::new("/B")?)?;
+        Ok(())
+    })?;
+
+    assert_eq!(
+        unresolved_layer_count(&stage, "missing.usda"),
+        1,
+        "the prototype's work settles where it was"
+    );
+    assert_eq!(stage.prim("/A")?.prototype()?, Some(kept));
+    Ok(())
+}
+
+/// The same move onto the first prototype, whose source holds the error: the
+/// root taken back is the one whose instance goes, and its work still
+/// settles.
+#[test]
+fn prototype_root_kept_reversed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+def "A" (
+    references = </S1>
+    instanceable = true
+) {}
+def "B" (
+    references = </S2>
+    instanceable = true
+) {}
+def "S1" {
+    def "C" (
+        references = @missing.usda@</X>
+    ) {}
+}
+def "S2" {
+    def "C" {}
+}
+"#,
+    )?;
+    assert!(stage.prim("/A/C")?.is_valid()?);
+    assert!(stage.prim("/B/C")?.is_valid()?);
+    let kept = stage.prim("/A")?.prototype()?.expect("an instance");
+    assert_eq!(unresolved_layer_count(&stage, "missing.usda"), 1);
+
+    let root_id = stage.root_layer().identifier().to_owned();
+    stage.edit_layer(&root_id, |e| {
+        let references = sdf::ReferenceListOp::explicit([sdf::Reference {
+            prim_path: sdf::Path::new("/S1")?,
+            ..Default::default()
+        }]);
+        e.prim_mut("/B")?
+            .expect("/B is authored")
+            .set("references", vt::Value::ReferenceListOp(references));
+        e.remove_spec(&sdf::Path::new("/A")?)?;
+        Ok(())
+    })?;
+
+    assert_eq!(
+        unresolved_layer_count(&stage, "missing.usda"),
+        1,
+        "the prototype's work settles where it was"
+    );
+    assert_eq!(stage.prim("/B")?.prototype()?, Some(kept));
+    Ok(())
+}
+
+/// An instance of a removed prototype's key that nothing has queried yet
+/// does not take the root back: settlement registers only the instances it
+/// knows, so `/Z` gets a fresh prototype and the old one's cached error goes
+/// until `/Z`'s descendant composes. C++ keeps the root, composing every prim
+/// within the change (see the `TODO` in `IndexCache::settle_pass`).
+#[test]
+fn prototype_late_instance() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+def "A" (
+    references = </S1>
+    instanceable = true
+) {}
+def "S1" {
+    def "C" (
+        references = @missing.usda@</X>
+    ) {}
+}
+"#,
+    )?;
+    assert!(stage.prim("/A/C")?.is_valid()?);
+    let first = stage.prim("/A")?.prototype()?.expect("an instance");
+    assert_eq!(unresolved_layer_count(&stage, "missing.usda"), 1);
+
+    let root_id = stage.root_layer().identifier().to_owned();
+    stage.edit_layer(&root_id, |e| {
+        e.remove_spec(&sdf::Path::new("/A")?)?;
+        let mut z = sdf::PrimSpec::new(e.data_mut(), "/Z", sdf::Specifier::Def, "")?;
+        z.set(
+            "references",
+            vt::Value::ReferenceListOp(sdf::ReferenceListOp::explicit([sdf::Reference {
+                prim_path: sdf::Path::new("/S1")?,
+                ..Default::default()
+            }])),
+        );
+        z.set("instanceable", true);
+        Ok(())
+    })?;
+
+    assert_eq!(
+        unresolved_layer_count(&stage, "missing.usda"),
+        0,
+        "the retired root's error goes with it"
+    );
+    assert_ne!(
+        stage.prim("/Z")?.prototype()?,
+        Some(first),
+        "/Z mints a fresh prototype"
+    );
+    assert!(stage.prim("/Z/C")?.is_valid()?);
+    assert_eq!(
+        unresolved_layer_count(&stage, "missing.usda"),
+        1,
+        "composing /Z's descendant reports the error again"
+    );
+    Ok(())
+}
+
+/// A cold direct query into a descendant of an instanceable reference (no prior
+/// traversal) composes through the prototype, not an empty namespace: the
+/// instance-proxy redirect is not memoized while the reference layer is still
+/// being demanded.
+#[test]
+fn instance_proxy_cold_query() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Child\" {\n        custom double x = 3\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    // The first query is the descendant read; it must demand proto.usda, compose
+    // the instance, and resolve through the prototype rather than memoizing an
+    // identity redirect against the not-yet-loaded reference.
+    assert_eq!(
+        stage
+            .attribute("/World/Inst/Child.x")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(3.0))
+    );
+    Ok(())
+}
+
+/// A reference target's `subLayers` expression resolves against the *referencing*
+/// layer stack's variables: the root sets `${V}` but the target only authors the
+/// expression, so the on-demand load must carry the referrer's composed
+/// expression variables into the target's sublayer evaluation (the closer-to-root
+/// referrer wins). Without them `${V}` is unresolved and the sublayer never loads.
+#[test]
+fn lazy_ref_inherited_expr_var() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("prod"))?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    let over = dir.path().join("prod").join("over.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"prod\" }\n)\ndef \"P\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    subLayers = [@`\"${V}/over.usda\"`@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(&over, "#usda 1.0\ndef \"P\" {\n    custom double x = 9\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(9.0)),
+        "the target's `${{V}}` sublayer resolves against the referrer's variable"
+    );
+    Ok(())
+}
+
+/// A root-layer `subLayers` expression composes the layer it names: the
+/// expression resolves against the root layer's own `expressionVariables`, so the
+/// sublayer edge forms and its prims contribute (the demand path is exercised by
+/// [`lazy_ref_inherited_expr_var`]; this covers the root-stack build).
+#[test]
+fn expr_sublayer_composes() -> Result<()> {
+    let stage = Stage::open(&fixture_path("expr_sublayer.usda"))?;
+    assert_eq!(stage.layer_count(), 2, "root + the expression-resolved sublayer");
+    assert_eq!(
+        stage.root_prims()?.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        ["World"],
+        "the expression sublayer's prim composes onto the stage"
+    );
+    Ok(())
+}
+
+/// A layer stack's expression variables come from its root layer, not its
+/// sublayers (C++ `PcpExpressionVariables`): a variable authored on a *sublayer*
+/// is ignored. The root sublayers `a`; `a` defines `V` and sublayers `b`; `b`'s
+/// `${V}` sublayer therefore does not resolve, so `leaf` never composes and `/P`
+/// has no opinion.
+#[test]
+fn sublayer_expr_var_ignored() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let a = dir.path().join("a.usda");
+    let b = dir.path().join("b.usda");
+    let leaf = dir.path().join("leaf.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@a.usda@]\n)\n")?;
+    fs::write(
+        &a,
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"leaf\" }\n    subLayers = [@b.usda@]\n)\n",
+    )?;
+    fs::write(&b, "#usda 1.0\n(\n    subLayers = [@`\"${V}.usda\"`@]\n)\n")?;
+    fs::write(&leaf, "#usda 1.0\ndef \"P\" {\n    custom double x = 7\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None,
+        "`a` is a sublayer, so its `V` is ignored and `b`'s expression sublayer does not resolve"
+    );
+    Ok(())
+}
+
+/// A reference target's `${VAR}` sublayer resolves against a variable authored on
+/// a *non-root* referencing layer. The root references `mid`; `mid` defines `V`
+/// and references `target`; `target`'s `${V}` sublayer must resolve against
+/// `mid`'s value — the variable is on neither `target` nor the root, so the
+/// referrer's composed variables carried across the arc are what resolve it.
+#[test]
+fn cross_ref_expr_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let mid = dir.path().join("mid.usda");
+    let target = dir.path().join("target.usda");
+    let over = dir.path().join("over.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @mid.usda@\n) {}\n")?;
+    fs::write(
+        &mid,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    expressionVariables = { string V = \"over\" }\n)\ndef \"P\" (\n    references = @target.usda@\n) {}\n",
+    )?;
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    subLayers = [@`\"${V}.usda\"`@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(&over, "#usda 1.0\ndef \"P\" {\n    custom double x = 9\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(9.0)),
+        "the referrer's variable resolves the target's `${{V}}` sublayer"
+    );
+    Ok(())
+}
+
+/// One prim's two references reach the same not-yet-loaded target under
+/// different expression-variable contexts, so both demands land in a single
+/// load-barrier pass. The barrier opens the target for the first demand only;
+/// the second context's instance must not intern against the half-wired graph —
+/// its `${V}` sublayer would be silently dropped from the members forever — so
+/// it waits a pass and reopens the target with its own variables.
+#[test]
+fn dual_context_same_pass() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"M\" (\n    references = [@s1.usda@, @s2.usda@]\n) {}\n",
+    )?;
+    for (name, sel) in [("s1.usda", "x"), ("s2.usda", "y")] {
+        fs::write(
+            dir.path().join(name),
+            format!(
+                "#usda 1.0\n(\n    defaultPrim = \"P\"\n    expressionVariables = {{ string V = \"{sel}\" }}\n)\ndef \"P\" (\n    references = @t.usda@\n) {{}}\n",
+            ),
+        )?;
+    }
+    fs::write(
+        dir.path().join("t.usda"),
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    subLayers = [@`\"${V}.usda\"`@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(
+        dir.path().join("x.usda"),
+        "#usda 1.0\ndef \"P\" {\n    custom double vx = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("y.usda"),
+        "#usda 1.0\ndef \"P\" {\n    custom double vy = 2\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/M.vx")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0)),
+        "s1's V=x resolves the target's sublayer under the first arc"
+    );
+    assert_eq!(
+        stage.attribute("/M.vy")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(2.0)),
+        "s2's V=y resolves the target's sublayer under the second arc"
+    );
+    Ok(())
+}
+
+/// A variant selection written as a `${VAR}` expression follows an edit to the
+/// variable: the prim that authors it and the child its variant defines both
+/// recompose onto the newly selected variant.
+#[test]
+fn var_edit_reselects_variant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+(
+    expressionVariables = { string SEL = "hi" }
+)
+def "World" (
+    variantSets = "v"
+    variants = { string v = "`${SEL}`" }
+)
+{
+    variantSet "v" = {
+        "hi" {
+            custom double x = 1
+            def "Child" { custom double y = 1 }
+        }
+        "lo" {
+            custom double x = 2
+            def "Child" { custom double y = 2 }
+        }
+    }
+}
+"#,
+    )?;
+    assert_eq!(stage.attribute("/World.x")?.get::<f64>()?, Some(1.0));
+    assert_eq!(stage.attribute("/World/Child.y")?.get::<f64>()?, Some(1.0));
+
+    stage.root_layer().edit(|e| {
+        e.set_expression_variables(HashMap::from([(
+            "SEL".to_string(),
+            vt::Value::String("lo".to_string()),
+        )]))
+    })?;
+
+    assert_eq!(
+        stage.attribute("/World.x")?.get::<f64>()?,
+        Some(2.0),
+        "the prim reselects"
+    );
+    assert_eq!(
+        stage.attribute("/World/Child.y")?.get::<f64>()?,
+        Some(2.0),
+        "the child composes through the newly selected variant"
+    );
+    Ok(())
+}
+
+/// A runtime `expressionVariables` edit on the session layer newly selects a
+/// root `${VAR}` sublayer that was never opened: the recompose records a
+/// sublayer demand and the load barrier opens `b.usda` from disk, so the edit
+/// alone swaps the composed selection.
+#[test]
+fn session_var_edit_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\n")?;
+    fs::write(
+        &session,
+        "#usda 1.0\n(\n    expressionVariables = { string WHICH = \"a\" }\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("b.usda"),
+        "#usda 1.0\ndef \"B\" {\n    custom double y = 2\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/A.x")?.get::<f64>()?, Some(1.0), "WHICH=a at open");
+    assert_eq!(stage.attribute("/B.y")?.get::<f64>()?, None, "b.usda is not loaded");
+
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    stage.layer(&session_id)?.expect("session layer is live").edit(|e| {
+        e.set_expression_variables(HashMap::from([(
+            "WHICH".to_string(),
+            vt::Value::String("b".to_string()),
+        )]))
+    })?;
+    assert_eq!(
+        stage.attribute("/B.y")?.get::<f64>()?,
+        Some(2.0),
+        "the edit loads the newly selected b.usda"
+    );
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        None,
+        "a.usda's selection dropped"
+    );
+    Ok(())
+}
+
+/// A runtime `expressionVariables` edit on a reference target's root layer
+/// re-selects its `${V}` sublayer: the target stack's recompose demands the
+/// newly named layer and the load barrier opens it from disk.
+#[test]
+fn target_var_edit_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @t.usda@\n) {}\n")?;
+    fs::write(
+        dir.path().join("t.usda"),
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    expressionVariables = { string V = \"a\" }\n    subLayers = [@`\"${V}.usda\"`@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("b.usda"),
+        "#usda 1.0\ndef \"P\" {\n    custom double y = 2\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/P.x")?.get::<f64>()?, Some(1.0), "V=a selects a.usda");
+
+    let target_id = stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|id| FsPath::new(id).ends_with("t.usda"))
+        .expect("t.usda is loaded");
+    stage
+        .layer(&target_id)?
+        .expect("target layer is live")
+        .edit(|e| e.set_expression_variables(HashMap::from([("V".to_string(), vt::Value::String("b".to_string()))])))?;
+    assert_eq!(
+        stage.attribute("/P.y")?.get::<f64>()?,
+        Some(2.0),
+        "the edit loads the newly selected b.usda into the target stack"
+    );
+    Ok(())
+}
+
+/// An `expressionVariables` edit that changes a composed variable no prim
+/// depends on drops no index and resyncs nothing, yet still names the affected
+/// subtrees on the asset-path channel — the untracked value-time expression
+/// reads. The root stack's users are every composed prim, so that channel
+/// reports the pseudo-root.
+#[test]
+fn vars_edit_notifies_assets() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    expressionVariables = { string FREE = "x" }
+)
+def "Other" {
+    custom double o = 1
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/Other.o")?.get::<f64>()?, Some(1.0));
+    let other = stage.index_revision(&sdf::path("/Other")?);
+    assert!(other.is_some());
+
+    let notices = capture_notices(&stage);
+    stage.set_expression_variables(HashMap::from([(
+        "FREE".to_string(),
+        vt::Value::String("y".to_string()),
+    )]))?;
+
+    {
+        let notices = notices.borrow();
+        assert!(
+            notices.resynced.is_empty(),
+            "no prim recorded the variable, so nothing resynced, got {:?}",
+            notices.resynced
+        );
+        assert_eq!(
+            notices.asset_paths_resynced,
+            paths(&["/"]),
+            "the root stack's asset values may re-resolve stage-wide"
+        );
+        assert_eq!(
+            notices.changed_info_only,
+            paths(&["/"]),
+            "the edit is an ordinary layer-metadata info change on the pseudo-root"
+        );
+    }
+    assert_eq!(
+        stage.index_revision(&sdf::path("/Other")?),
+        other,
+        "no prim recorded the variable, so its index survives the edit"
+    );
+    Ok(())
+}
+
+/// Authoring `expressionVariables` on a sublayer changes no stack's composed
+/// set — only a stack root's variables contribute — so the edit publishes
+/// nothing on either the resync or the asset-path channel and drops no index
+/// (the C++ five-step diff's step-1 no-op).
+#[test]
+fn sublayer_vars_no_notice() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@sub.usda@]\n)\n")?;
+    fs::write(
+        dir.path().join("sub.usda"),
+        "#usda 1.0\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/P.x")?.get::<f64>()?, Some(1.0));
+    let before = stage.index_revision(&sdf::path("/P")?);
+    assert!(before.is_some());
+
+    let notices = capture_notices(&stage);
+    let sub_id = identifier_by_leaf(&stage, "sub.usda");
+    stage
+        .layer(&sub_id)?
+        .expect("sublayer is live")
+        .edit(|e| e.set_expression_variables(HashMap::from([("V".to_string(), vt::Value::String("x".to_string()))])))?;
+
+    // Reading drains the pending edit, delivering the composed change notice.
+    assert_eq!(
+        stage.index_revision(&sdf::path("/P")?),
+        before,
+        "no composed variable changed, so the index survives"
+    );
+    let notices = notices.borrow();
+    assert!(
+        notices.resynced.is_empty() && notices.asset_paths_resynced.is_empty(),
+        "a vars edit that changed no composed set publishes nothing, got {notices:?}"
+    );
+    Ok(())
+}
+
+/// A referenced stack's own `expressionVariables` edit changes only that
+/// stack's composed set, so the asset-path channel names exactly the prims
+/// composing against it rather than the whole stage. Nothing resyncs — no prim
+/// read the variable during composition — and the channel is load-bearing: the
+/// value-time expression re-evaluates on the next read, so the prim the notice
+/// named really does resolve to a different asset.
+#[test]
+fn target_vars_notify_referrer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "Ref" (
+    references = @t.usda@
+) {}
+def "Other" {
+    custom double o = 1
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("t.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "P"
+    expressionVariables = { string NAME = "a" }
+)
+def "P" {
+    asset inputs:file = @`"./${NAME}.png"`@
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let evaluated = |stage: &Stage| -> Result<Option<String>> {
+        Ok(stage
+            .attribute("/Ref.inputs:file")?
+            .get::<sdf::AssetPath>()?
+            .and_then(|a| a.evaluated_path().map(str::to_string)))
+    };
+    assert_eq!(evaluated(&stage)?.as_deref(), Some("./a.png"));
+    assert_eq!(stage.attribute("/Other.o")?.get::<f64>()?, Some(1.0));
+
+    let notices = capture_notices(&stage);
+    let target_id = identifier_by_leaf(&stage, "t.usda");
+    stage.layer(&target_id)?.expect("target layer is live").edit(|e| {
+        e.set_expression_variables(HashMap::from([(
+            "NAME".to_string(),
+            vt::Value::String("b".to_string()),
+        )]))
+    })?;
+
+    assert_eq!(
+        evaluated(&stage)?.as_deref(),
+        Some("./b.png"),
+        "the value-time expression re-evaluates against the edited variables"
+    );
+    {
+        let notices = notices.borrow();
+        assert_eq!(
+            notices.asset_paths_resynced,
+            paths(&["/Ref"]),
+            "only the prims composing against the edited stack may re-resolve"
+        );
+        assert!(
+            notices.resynced.is_empty(),
+            "no prim read the variable during composition, got {:?}",
+            notices.resynced
+        );
+    }
+    Ok(())
+}
+
+/// Instancing: the channel names the composed cache keys, so two instances
+/// sharing a prototype contribute their own roots and the shared
+/// `/__Prototype_N` (C++ reports prototype paths the same way). A nested
+/// instance whose prototype composes no content from the edited stack is
+/// correctly absent, and so is any prototype no proxy query has materialized —
+/// it has produced no asset value to re-read.
+#[test]
+fn instance_vars_notify_prototype() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "A" (
+    references = @t.usda@
+    instanceable = true
+) {}
+def "B" (
+    references = @t.usda@
+    instanceable = true
+) {}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("t.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "P"
+    expressionVariables = { string NAME = "a" }
+)
+def "P" {
+    def "Inner" { custom double y = 2 }
+    def "Nested" (
+        references = @u.usda@
+        instanceable = true
+    ) {}
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("u.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Q"
+)
+def "Q" {
+    custom double z = 3
+}
+"#,
+    )?;
+
+    // Set `NAME` on `t.usda`, whose stack both instances compose against.
+    let edit_target_vars = |stage: &Stage| -> Result<()> {
+        let target_id = identifier_by_leaf(stage, "t.usda");
+        stage.layer(&target_id)?.expect("target layer is live").edit(|e| {
+            e.set_expression_variables(HashMap::from([(
+                "NAME".to_string(),
+                vt::Value::String("b".to_string()),
+            )]))
+        })?;
+        Ok(())
+    };
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    // Query through both proxies so the shared prototype — and the nested
+    // instance's own prototype — materialize.
+    assert_eq!(stage.attribute("/A/Inner.y")?.get::<f64>()?, Some(2.0));
+    assert_eq!(stage.attribute("/B/Inner.y")?.get::<f64>()?, Some(2.0));
+    assert_eq!(stage.attribute("/A/Nested.z")?.get::<f64>()?, Some(3.0));
+
+    let notices = capture_notices(&stage);
+    edit_target_vars(&stage)?;
+    // Reading drains the pending edit, delivering the composed change notice.
+    assert!(stage.prim("/A")?.is_valid()?);
+    assert_eq!(
+        notices.borrow().asset_paths_resynced,
+        paths(&["/A", "/B", "/__Prototype_1"]),
+        "both instance roots and the shared prototype compose against the edited stack; \
+         the nested prototype holds only u.usda content, so it is untouched"
+    );
+
+    // A stage where no proxy was ever queried materializes no prototype, so the
+    // channel names only the instance roots that have composed.
+    let cold = Stage::open(root.to_str().unwrap())?;
+    assert!(cold.prim("/A")?.is_valid()?);
+    assert!(cold.prim("/B")?.is_valid()?);
+    let cold_notices = capture_notices(&cold);
+    edit_target_vars(&cold)?;
+    assert!(cold.prim("/A")?.is_valid()?);
+    assert_eq!(cold_notices.borrow().asset_paths_resynced, paths(&["/A", "/B"]));
+    Ok(())
+}
+
+/// A runtime session `expressionVariables` edit re-selects the session
+/// region's own `${VAR}` sublayer: the session region re-resolves like any
+/// stack region, so the newly selected layer loads on demand and the old
+/// selection drops out of the membership.
+#[test]
+fn session_var_swap_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&root, "#usda 1.0\n")?;
+    fs::write(
+        &session,
+        "#usda 1.0\n(\n    expressionVariables = { string S = \"sa\" }\n    subLayers = [@`\"${S}.usda\"`@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("sa.usda"),
+        "#usda 1.0\ndef \"SA\" {\n    custom double a = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("sb.usda"),
+        "#usda 1.0\ndef \"SB\" {\n    custom double b = 2\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/SA.a")?.get::<f64>()?, Some(1.0), "S=sa at open");
+    assert_eq!(stage.attribute("/SB.b")?.get::<f64>()?, None, "sb.usda is not loaded");
+
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    stage.layer(&session_id)?.expect("session layer is live").edit(|e| {
+        e.set_expression_variables(HashMap::from([("S".to_string(), vt::Value::String("sb".to_string()))]))
+    })?;
+
+    assert_eq!(
+        stage.attribute("/SB.b")?.get::<f64>()?,
+        Some(2.0),
+        "the edit loads the newly selected session sublayer"
+    );
+    assert_eq!(
+        stage.attribute("/SA.a")?.get::<f64>()?,
+        None,
+        "the old selection drops out of the session region"
+    );
+    Ok(())
+}
+
+/// `insert_layer` under the session root joins the session region at the next
+/// rebuild — the region's membership is a sublayer walk, not the open-time
+/// layer list — so the inserted layer's opinion composes.
+#[test]
+fn session_insert_layer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&root, "#usda 1.0\n")?;
+    fs::write(&session, "#usda 1.0\n")?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    let extra = opinion_layer("extra.usda", 7.0)?;
+    stage.insert_layer(&session_id, 0, extra, sdf::LayerOffset::IDENTITY)?;
+
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0)),
+        "the inserted session sublayer's opinion composes"
+    );
+    Ok(())
+}
+
+/// A session sublayer missing at open reports once and heals: the session
+/// region re-derives the diagnostic per rebuild, so once the file appears and
+/// a retry clears the failure memo, the layer loads and the report stops.
+#[test]
+fn session_missing_heals() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&root, "#usda 1.0\n")?;
+    fs::write(&session, "#usda 1.0\n(\n    subLayers = [@late.usda@]\n)\n")?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    let errors = stage.composition_errors();
+    assert_eq!(
+        errors.len(),
+        1,
+        "one missing session sublayer, one diagnostic: {errors:?}"
+    );
+    assert!(matches!(
+        &errors[0],
+        pcp::CompositionDiagnostic::UnresolvedSublayer { .. }
+    ));
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double x = 4\n}\n",
+    )?;
+    // A retry clears the failure memo, requeueing the entry for the barrier.
+    stage.retry_loads()?;
+    assert_eq!(
+        stage.attribute("/L.x")?.get::<f64>()?,
+        Some(4.0),
+        "the repaired session sublayer loads and composes"
+    );
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the healed entry stops reporting, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Muting the session layer exposes the stage root's own `${VAR}` value, whose
+/// selection was never opened: the mute's recompose demands it and the load
+/// barrier brings it in.
+#[test]
+fn mute_exposes_selection_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    expressionVariables = { string WHICH = \"b\" }\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\n",
+    )?;
+    fs::write(
+        &session,
+        "#usda 1.0\n(\n    expressionVariables = { string WHICH = \"a\" }\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("b.usda"),
+        "#usda 1.0\ndef \"B\" {\n    custom double y = 2\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "the session's WHICH=a wins"
+    );
+    assert_eq!(stage.attribute("/B.y")?.get::<f64>()?, None, "b.usda is not loaded");
+
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    assert!(stage.is_indexed(&sdf::path("/A")?), "reading /A.x composed its index");
+    let notices = capture_notices(&stage);
+    stage.mute_layer(session_id);
+    // A session mute reaches the root layer and so every cached index. It names
+    // each one rather than the pseudo-root: `/` stands for the whole cache only
+    // when it was itself composed, and nothing here queried it. `/B` is on the
+    // list because the miss above cached it.
+    assert_eq!(notices.borrow().muting, paths(&["/A", "/B"]));
+    // Muting a session layer is the one toggle that can move a stack's composed
+    // expression variables, and it reaches every index composing against the root
+    // layer stack — /A among them, though its own opinion comes from a sublayer.
+    // That blanket is what lets the mute path discard its variable deltas without
+    // losing the asset-path channel a composed-variable move would publish (see
+    // `LayerGraph::recompose_for_mute`).
+    assert!(!stage.is_indexed(&sdf::path("/A")?), "the mute dropped /A's index");
+    assert_eq!(
+        stage.attribute("/B.y")?.get::<f64>()?,
+        Some(2.0),
+        "muting the session exposes the root's WHICH=b and loads its selection"
+    );
+    Ok(())
+}
+
+/// A reference target that already joined the graph as a root-stack sublayer is
+/// demanded under the empty root context: no contextual reopen runs, but the
+/// mint's own recompose demands the `${V}` sublayer the target's own variables
+/// select, and the load barrier opens it.
+#[test]
+fn self_selected_sublayer_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@t.usda@]\n)\ndef \"R\" (\n    references = @t.usda@</P>\n) {}\n",
+    )?;
+    fs::write(
+        dir.path().join("t.usda"),
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"a\" }\n    subLayers = [@`\"${V}.usda\"`@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\nover \"P\" {\n    custom double x = 3\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/R.x")?.get::<f64>()?,
+        Some(3.0),
+        "the target's own V selects a.usda for its reference stack"
+    );
+    Ok(())
+}
+
+/// A runtime `subLayers` edit naming a not-yet-loaded literal layer loads it —
+/// and its own nested sublayer — through the same demand path as a `${VAR}`
+/// selection: the recompose demands `extra.usda` and the load barrier opens its
+/// whole subtree.
+#[test]
+fn literal_sublayer_edit_loads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\ndef \"W\" {}\n")?;
+    fs::write(
+        dir.path().join("extra.usda"),
+        "#usda 1.0\n(\n    subLayers = [@nested.usda@]\n)\ndef \"E\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("nested.usda"),
+        "#usda 1.0\ndef \"N\" {\n    custom double y = 2\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    stage.root_layer().edit(|e| {
+        e.pseudo_root_mut()
+            .expect("pseudo-root")
+            .insert_sublayer(0, "extra.usda", sdf::LayerOffset::IDENTITY);
+        Ok(())
+    })?;
+    assert_eq!(
+        stage.attribute("/E.x")?.get::<f64>()?,
+        Some(1.0),
+        "the authored literal sublayer loads"
+    );
+    assert_eq!(
+        stage.attribute("/N.y")?.get::<f64>()?,
+        Some(2.0),
+        "its nested sublayer loads with it"
+    );
+    Ok(())
+}
+
+/// A `${VAR}` selection naming a file that does not exist fails gracefully: the
+/// stage composes without it, the failure is reported once as an
+/// `UnresolvedSublayer` diagnostic, repeated queries stay stable, and a later
+/// edit retries the (now-present) selection, loads it, and drops the obsolete
+/// diagnostic.
+#[test]
+fn failed_selection_terminates() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\ndef \"W\" {\n    custom double w = 0\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    stage.set_expression_variables(HashMap::from([(
+        "WHICH".to_string(),
+        vt::Value::String("missing".to_string()),
+    )]))?;
+    assert_eq!(
+        stage.attribute("/W.w")?.get::<f64>()?,
+        Some(0.0),
+        "the stage composes without the missing selection"
+    );
+    let errors = stage.composition_errors();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path == "missing.usda")),
+        "the failed open is reported: {errors:?}"
+    );
+    assert_eq!(
+        stage.attribute("/W.w")?.get::<f64>()?,
+        Some(0.0),
+        "the failure is terminal, not re-demanded per query"
+    );
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double z = 5\n}\n",
+    )?;
+    stage.set_expression_variables(HashMap::from([(
+        "WHICH".to_string(),
+        vt::Value::String("late".to_string()),
+    )]))?;
+    assert_eq!(
+        stage.attribute("/L.z")?.get::<f64>()?,
+        Some(5.0),
+        "the retried selection loads once the edit re-demands it"
+    );
+    // The failure diagnostic is regenerated per rebuild, so once the stack no
+    // longer selects the missing layer it stops being reported.
+    let errors = stage.composition_errors();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path == "missing.usda")),
+        "the obsolete failure is dropped once the selection changes: {errors:?}"
+    );
+    Ok(())
+}
+
+/// Two loaded layers each author a `subLayers` entry naming the same missing
+/// asset: the open is attempted once, but each referrer gets its own
+/// diagnostic, and muting one referrer drops only its own.
+#[test]
+fn shared_missing_per_referrer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@p1.usda@, @p2.usda@]\n)\n")?;
+    fs::write(dir.path().join("p1.usda"), "#usda 1.0\ndef \"A\" {}\n")?;
+    fs::write(dir.path().join("p2.usda"), "#usda 1.0\ndef \"B\" {}\n")?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    let layer_named = |name: &str| {
+        stage
+            .layer_identifiers()
+            .into_iter()
+            .find(|id| FsPath::new(id).ends_with(name))
+            .expect("sublayer is loaded")
+    };
+    for name in ["p1.usda", "p2.usda"] {
+        stage.layer(&layer_named(name))?.expect("layer is live").edit(|e| {
+            e.pseudo_root_mut().expect("pseudo-root").insert_sublayer(
+                0,
+                "shared_missing.usda",
+                sdf::LayerOffset::IDENTITY,
+            );
+            Ok(())
+        })?;
+    }
+    let referrers = |stage: &Stage| -> Vec<String> {
+        stage
+            .composition_errors()
+            .into_iter()
+            .filter_map(|e| match e {
+                pcp::CompositionDiagnostic::UnresolvedSublayer {
+                    asset_path,
+                    introduced_by,
+                } if asset_path == "shared_missing.usda" => Some(introduced_by),
+                _ => None,
+            })
+            .collect()
+    };
+    let both = referrers(&stage);
+    assert_eq!(both.len(), 2, "one diagnostic per referrer: {both:?}");
+
+    stage.mute_layer(layer_named("p1.usda"));
+    let remaining = referrers(&stage);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "the unmuted referrer keeps its diagnostic: {remaining:?}"
+    );
+    assert!(
+        FsPath::new(&remaining[0]).ends_with("p2.usda"),
+        "the surviving diagnostic names the unmuted referrer: {remaining:?}"
+    );
+    Ok(())
+}
+
+/// One edit re-seeds two reference target stacks to the same `${V}` selection,
+/// so both demand `shared.usda` in a single load-barrier round: the first
+/// demand opens it and the second finds it interned — and its stack must still
+/// recompose to pick the member up.
+#[test]
+fn same_round_shared_selection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    expressionVariables = { string V = \"a\" }\n)\ndef \"P1\" (\n    references = @t1.usda@</P>\n) {}\ndef \"P2\" (\n    references = @t2.usda@</P>\n) {}\n",
+    )?;
+    for name in ["t1.usda", "t2.usda"] {
+        fs::write(
+            dir.path().join(name),
+            "#usda 1.0\n(\n    subLayers = [@`\"${V}.usda\"`@]\n)\ndef \"P\" {}\n",
+        )?;
+    }
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\nover \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("shared.usda"),
+        "#usda 1.0\nover \"P\" {\n    custom double y = 7\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/P1.x")?.get::<f64>()?, Some(1.0));
+    assert_eq!(stage.attribute("/P2.x")?.get::<f64>()?, Some(1.0));
+
+    stage.set_expression_variables(HashMap::from([(
+        "V".to_string(),
+        vt::Value::String("shared".to_string()),
+    )]))?;
+    assert_eq!(
+        stage.attribute("/P1.y")?.get::<f64>()?,
+        Some(7.0),
+        "the stack whose demand opened the layer recomposes"
+    );
+    assert_eq!(
+        stage.attribute("/P2.y")?.get::<f64>()?,
+        Some(7.0),
+        "the stack whose demand found the layer interned recomposes too"
+    );
+    Ok(())
+}
+
+/// A recorded sublayer resolve-failure does not block the same asset's later
+/// arc load: once the file appears, a reference to it composes on the next
+/// query with no edit in between, and the healed sublayer diagnostic drops.
+#[test]
+fn sublayer_failure_keeps_arc_loadable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@late.usda@]\n)\ndef \"P\" (\n    references = @late.usda@</L>\n) {}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let errors = stage.composition_errors();
+    assert!(
+        errors.iter().any(
+            |e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path == "late.usda")
+        ),
+        "the missing sublayer is reported at open: {errors:?}"
+    );
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double z = 5\n}\n",
+    )?;
+    assert_eq!(
+        stage.attribute("/P.z")?.get::<f64>()?,
+        Some(5.0),
+        "the appeared file loads through the reference with no edit"
+    );
+    let errors = stage.composition_errors();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { .. })),
+        "the healed sublayer diagnostic drops: {errors:?}"
+    );
+    Ok(())
+}
+
+/// Repairing a missing sublayer on disk and then retrying the loads, which
+/// rebuilds no layer stack, loads it: clearing the failure memo requeues
+/// the failure diagnostics as demands, so the repaired layer joins and its
+/// obsolete diagnostic drops.
+#[test]
+fn repaired_sublayer_reloads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@late.usda@]\n)\ndef \"W\" {}\n")?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let errors = stage.composition_errors();
+    assert!(
+        errors.iter().any(
+            |e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path == "late.usda")
+        ),
+        "the missing sublayer is reported at open: {errors:?}"
+    );
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double z = 5\n}\n",
+    )?;
+    // A retry rebuilds no layer stack, so only the requeue loads it.
+    stage.retry_loads()?;
+    assert_eq!(
+        stage.attribute("/L.z")?.get::<f64>()?,
+        Some(5.0),
+        "the repaired sublayer loads on the retry"
+    );
+    let errors = stage.composition_errors();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { .. })),
+        "the healed diagnostic drops: {errors:?}"
+    );
+    Ok(())
+}
+
+/// A stack rebuild that does not clear the failure memo — muting an unrelated
+/// layer — still retries a resolve failure once the asset has appeared: the
+/// rebuild probes resolvability instead of treating the failure as terminal.
+#[test]
+fn mute_retries_resolvable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@other.usda@, @late.usda@]\n)\ndef \"W\" {}\n",
+    )?;
+    fs::write(dir.path().join("other.usda"), "#usda 1.0\ndef \"O\" {}\n")?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.composition_errors().iter().any(
+            |e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path == "late.usda")
+        ),
+        "the missing sublayer is reported at open"
+    );
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double z = 5\n}\n",
+    )?;
+    let other = stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|id| FsPath::new(id).ends_with("other.usda"))
+        .expect("other.usda is loaded");
+    stage.mute_layer(other);
+    assert_eq!(
+        stage.attribute("/L.z")?.get::<f64>()?,
+        Some(5.0),
+        "the mute's rebuild retries the now-resolvable sublayer"
+    );
+    Ok(())
+}
+
+/// Two authored spellings of one missing sublayer — `./missing.usda` and
+/// `././missing.usda`, both file-relative — resolve to the same canonical
+/// identifier and report one diagnostic, at open and across a runtime retry,
+/// matching open-time collection's per-canonical dedup.
+#[test]
+fn dual_spelling_reports_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@./missing.usda@, @././missing.usda@]\n)\ndef \"W\" {}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let count = |stage: &Stage| {
+        stage
+            .composition_errors()
+            .into_iter()
+            .filter(
+                |e| matches!(e, pcp::CompositionDiagnostic::UnresolvedSublayer { asset_path, .. } if asset_path.contains("missing.usda")),
+            )
+            .count()
+    };
+    assert_eq!(count(&stage), 1, "one canonical failure, one diagnostic at open");
+
+    // A retry clears and requeues the failure; it still fails and must still
+    // report once.
+    stage.retry_loads()?;
+    assert_eq!(count(&stage), 1, "one diagnostic after the runtime retry");
+    Ok(())
+}
+
+/// A search-path spelling (`missing.usda`) and a file-relative one
+/// (`./missing.usda`) are different identifiers while the asset is missing —
+/// the first may yet resolve through a search directory, the second only
+/// beside its author (C++ `ArDefaultResolver`'s look-here-first rule) — so each
+/// reports its own diagnostic. Once the file appears beside the root, both
+/// anchor to it and load one layer.
+#[test]
+fn search_and_file_relative_spellings_differ() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@missing.usda@, @./missing.usda@]\n)\ndef \"W\" {}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "missing.usda"),
+        1,
+        "the search path reports"
+    );
+    assert_eq!(
+        unresolved_sublayer_count(&stage, "./missing.usda"),
+        1,
+        "the file-relative path reports"
+    );
+
+    fs::write(
+        dir.path().join("missing.usda"),
+        "#usda 1.0\ndef \"L\" {\n    custom double z = 5\n}\n",
+    )?;
+    stage.retry_loads()?;
+    assert_eq!(
+        stage.attribute("/L.z")?.get::<f64>()?,
+        Some(5.0),
+        "the appeared file loads"
+    );
+    assert!(
+        !reports_unresolved_sublayer(&stage, "missing.usda"),
+        "the search path heals"
+    );
+    assert!(
+        !reports_unresolved_sublayer(&stage, "./missing.usda"),
+        "the file-relative path heals"
+    );
+    let loaded = stage
+        .layer_identifiers()
+        .into_iter()
+        .filter(|id| FsPath::new(id).ends_with("missing.usda"))
+        .count();
+    assert_eq!(loaded, 1, "both spellings anchor to the one file beside the root");
+    Ok(())
+}
+
+/// A failing bare `${VAR}` sublayer expression is one failure and reports one
+/// diagnostic — the loader's open-time copy and the graph's regenerable copy
+/// are the same error — and authoring the variable clears it.
+#[test]
+fn expr_failure_reported_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@`${WHICH}`@]\n)\ndef \"W\" {}\n")?;
+    fs::write(
+        dir.path().join("fix.usda"),
+        "#usda 1.0\ndef \"F\" {\n    custom double q = 3\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let errors = stage.composition_errors();
+    assert_eq!(errors.len(), 1, "one failing expression, one diagnostic: {errors:?}");
+    assert!(matches!(
+        &errors[0],
+        pcp::CompositionDiagnostic::InvalidExpression { .. }
+    ));
+
+    stage.set_expression_variables(HashMap::from([(
+        "WHICH".to_string(),
+        vt::Value::String("fix.usda".to_string()),
+    )]))?;
+    assert_eq!(
+        stage.attribute("/F.q")?.get::<f64>()?,
+        Some(3.0),
+        "the fixed expression selects and loads"
+    );
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the healed expression stops reporting"
+    );
+    Ok(())
+}
+
+/// A reference authored inside a `.usdz` package targets a sibling layer in the
+/// same archive: it resolves package-relative (not against the host
+/// filesystem), so the sibling's opinion composes onto the prim and no
+/// composition error is reported.
+#[test]
+fn lazy_ref_inside_usdz_resolves() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("package.usdz");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
+    // The package's first (root) layer references a sibling layer inside the
+    // same archive, which authors an opinion on the prim.
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "scene.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @other.usda@\n) {}\n",
+        )?;
+        writer.add_layer(
+            "other.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom int probe = 7\n}\n",
+        )?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?, "/P composes from the package");
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the in-package reference should resolve cleanly, got {:?}",
+        stage.composition_errors()
+    );
+    assert_eq!(
+        stage
+            .attribute("/P.probe")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Int(7)),
+        "the sibling layer's opinion composes through the in-package reference"
+    );
+    Ok(())
+}
+
+/// A reference authored inside a `.usdz` package targets a sibling layer that
+/// is not present in the archive: the search path falls through to the
+/// resolver, as C++ `SdfComputeAssetPathRelativeToLayer` does, finds nothing,
+/// and composition reports
+/// [`UnresolvedLayer`](pcp::CompositionDiagnostic::UnresolvedLayer) while the
+/// rest of the prim still composes.
+#[test]
+fn lazy_ref_inside_usdz_missing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("package.usdz");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
+    // The package's first layer references a sibling that is never added.
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "scene.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @other.usda@\n) {}\n",
+        )?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.prim("/P")?.is_valid()?,
+        "/P still composes from the package layer"
+    );
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::CompositionDiagnostic::UnresolvedLayer { asset_path, .. } if asset_path == "other.usda"
+        )),
+        "expected UnresolvedLayer for the missing in-package target, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A reference to a present-but-empty `.usdz` (no packaged USD layer) reports a
+/// [`MalformedLayer`](pcp::CompositionDiagnostic::MalformedLayer) carrying the real reason —
+/// the package resolved but could not be read — rather than being silently
+/// dropped as a missing asset or surfacing a "failed to resolve" diagnostic.
+#[test]
+fn lazy_ref_empty_usdz_malformed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("empty.usdz");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @empty.usdz@\n) {}\n")?;
+    // A valid ZIP archive with no packaged USD layer.
+    ArchiveWriter::create(&package)?.finish()?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.prim("/P")?.is_valid()?, "/P still composes from its own opinion");
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::CompositionDiagnostic::MalformedLayer { asset_path, reason, .. }
+                if asset_path.ends_with("empty.usdz") && reason.contains("USDZ archive")
+        )),
+        "expected MalformedLayer with the package read reason, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A `.usdz` whose default (first) layer sits in a sub-directory references a
+/// sibling by a relative path. The reference must anchor against the package's
+/// real path (the package-relative default layer,
+/// `pkg.usdz[Scenes/root.usda]`),
+/// not the bare package identifier, so the sibling resolves at
+/// `pkg.usdz[Scenes/other.usda]` and its opinion composes.
+#[test]
+fn usdz_subdir_first_layer_anchors() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("package.usdz");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @package.usdz@\n) {}\n")?;
+    // Both packaged layers live under `Scenes/`; the first is the default layer.
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "Scenes/root.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @other.usda@\n) {}\n",
+        )?;
+        writer.add_layer(
+            "Scenes/other.usda",
+            b"#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom int probe = 9\n}\n",
+        )?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the sub-directory in-package reference should resolve cleanly, got {:?}",
+        stage.composition_errors()
+    );
+    assert_eq!(
+        stage
+            .attribute("/P.probe")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Int(9)),
+        "the sibling under Scenes/ composes through the in-package reference"
+    );
+    Ok(())
+}
+
+/// An `asset`-valued attribute pointing at a `.usdz` package resolves to the
+/// package path itself, not a path anchored into the package's first layer:
+/// the asset is the package, and consumers key on the package path.
+#[test]
+fn asset_value_usdz_is_package_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let package = dir.path().join("model.usdz");
+    fs::write(&root, "#usda 1.0\ndef \"P\" {\n    custom asset a = @model.usdz@\n}\n")?;
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer("root.usda", b"#usda 1.0\ndef \"M\" {}\n")?;
+        writer.finish()?;
+    }
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let value = stage
+        .attribute("/P.a")?
+        .get_at::<vt::Value>(usd::TimeCode::new(0.0))?
+        .expect("asset value resolves");
+    let asset = value.try_as_asset_path().expect("attribute is asset-typed");
+    let resolved = asset.resolved_path().expect("asset path is resolved");
+    assert!(
+        resolved.ends_with("model.usdz"),
+        "asset value should resolve to the bare package path, got {resolved:?}",
+    );
+    assert!(
+        !resolved.contains('['),
+        "asset value must not be anchored into the package, got {resolved:?}",
+    );
+    Ok(())
+}
+
+/// A reference target's present-but-corrupt sublayer is dropped on its own —
+/// reported [`MalformedSublayer`](pcp::CompositionDiagnostic::MalformedSublayer) — while the
+/// target itself still composes (its own opinion resolves). The bad sublayer
+/// must not fail the whole reference target.
+#[test]
+fn lazy_ref_corrupt_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    let broken = dir.path().join("broken.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @target.usda@\n) {}\n")?;
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    subLayers = [@broken.usda@]\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+    // Resolves (the file exists) but the parser rejects the body.
+    fs::write(&broken, "#usda 1.0\ndef Broken {{{ not valid\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0)),
+        "the target composes despite its corrupt sublayer"
+    );
+    assert!(
+        stage.composition_errors().iter().any(|error| matches!(
+            error,
+            pcp::CompositionDiagnostic::MalformedSublayer { asset_path, introduced_by, reason }
+                if asset_path == "broken.usda" && introduced_by.ends_with("target.usda") && !reason.is_empty()
+        )),
+        "expected MalformedSublayer carrying the parse error, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// A not-yet-loaded reference target under a nested referrer is muted by the
+/// path that resolves, from the stage root, to its canonical identifier (C++
+/// `Pcp_MutedLayers`): the model under `sub/` is muted as `"sub/model.usda"` and
+/// never opened.
+#[test]
+fn mute_nested_reference_target() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("sub"))?;
+    let root = dir.path().join("root.usda");
+    let mid = dir.path().join("sub").join("mid.usda");
+    let model = dir.path().join("sub").join("model.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @sub/mid.usda@\n) {}\n")?;
+    fs::write(
+        &mid,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" (\n    references = @model.usda@\n) {}\n",
+    )?;
+    fs::write(
+        &model,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .mute(["sub/model.usda"])
+        .open(root.to_str().unwrap())?;
+
+    // Compose /P, following the nested reference to mid.usda and reaching the
+    // muted model reference; its identifier matches the muted one, so it is
+    // recognized at the demand point and never read.
+    assert!(stage.prim("/P")?.is_valid()?);
+    let opened_has = |needle: &str| opened.borrow().iter().any(|p| p.contains(needle));
+    assert!(opened_has("mid.usda"), "the nested referrer must load");
+    assert!(
+        !opened_has("model.usda"),
+        "the muted nested target must never be opened, got {:?}",
+        opened.borrow()
+    );
+    Ok(())
+}
+
+/// The arc's authoring layer is consulted, not only the root: a reference
+/// authored in `detail/extra.usda` (a sublayer of the referenced `target.usda`)
+/// resolves `@model.usda@` under `detail/`, so muting `"detail/model.usda"` — the
+/// path resolving from the root to that target's canonical identifier — mutes it.
+#[test]
+fn mute_target_under_nested_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("detail"))?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    let extra = dir.path().join("detail").join("extra.usda");
+    let model = dir.path().join("detail").join("model.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @target.usda@\n) {}\n")?;
+    // target.usda sublayers a layer in detail/, which authors the relative model
+    // reference — so the arc's authoring layer is not the stack's root layer.
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    subLayers = [@detail/extra.usda@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(&extra, "#usda 1.0\ndef \"P\" (\n    references = @model.usda@\n) {}\n")?;
+    fs::write(
+        &model,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n)\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .mute(["detail/model.usda"])
+        .open(root.to_str().unwrap())?;
+
+    assert!(stage.prim("/P")?.is_valid()?);
+    let opened_has = |needle: &str| opened.borrow().iter().any(|p| p.contains(needle));
+    assert!(opened_has("extra.usda"), "the authoring sublayer must load");
+    assert!(
+        !opened_has("model.usda"),
+        "the muted target under the nested sublayer must not be opened, got {:?}",
+        opened.borrow()
+    );
+    Ok(())
+}
+
+/// Muting keys on the canonical identifier: a layer muted by a relative spelling
+/// is the same entry as its absolute spelling, so re-muting the absolute is a
+/// no-op, both spellings read as muted, and unmuting through either fully restores
+/// it — and every notice carries the canonical identifier, whatever spelling was
+/// passed, so a listener mirroring the muted set by identifier stays in sync.
+#[test]
+fn mute_alternate_spelling() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let weak = dir.path().join("weak.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@weak.usda@]\n)\ndef \"P\" {}\n")?;
+    fs::write(&weak, "#usda 1.0\ndef \"P\" {\n    custom double x = 1\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let abs = weak.to_str().unwrap();
+    // The identifier both spellings resolve to (what muting stores and notifies).
+    let canonical = ar::DefaultResolver::new().create_identifier(abs, None);
+    let read_x = || stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0));
+
+    let muted = Rc::new(RefCell::new(Vec::<String>::new()));
+    let unmuted = Rc::new(RefCell::new(Vec::<String>::new()));
+    let _token = {
+        let (muted, unmuted) = (muted.clone(), unmuted.clone());
+        stage.add_sink(RecordingSink {
+            muting: Some(Box::new(move |_stage, layer, is_muted, _resynced: Resynced<'_>| {
+                if is_muted {
+                    muted.borrow_mut().push(layer.to_string());
+                } else {
+                    unmuted.borrow_mut().push(layer.to_string());
+                }
+            })),
+            ..Default::default()
+        })?
+    };
+
+    assert_eq!(
+        read_x()?,
+        Some(vt::Value::Double(1.0)),
+        "weak contributes x until muted"
+    );
+
+    // Mute by the relative spelling, then the absolute spelling names the same
+    // canonical identifier, so re-muting it is a no-op.
+    stage.mute_layer("weak.usda");
+    assert!(
+        stage.is_layer_muted(abs),
+        "the absolute spelling reads the same muted layer"
+    );
+    stage.mute_layer(abs);
+    assert_eq!(
+        stage.muted_layers(),
+        vec![canonical.clone()],
+        "both spellings are one canonical entry"
+    );
+    assert_eq!(read_x()?, None, "the muted weak layer contributes nothing");
+
+    // Unmute through the other spelling; the layer is fully restored.
+    stage.unmute_layer(abs);
+    assert!(
+        !stage.is_layer_muted("weak.usda"),
+        "unmuting any spelling unmutes the layer"
+    );
+    assert!(stage.muted_layers().is_empty());
+    assert_eq!(
+        read_x()?,
+        Some(vt::Value::Double(1.0)),
+        "the unmuted weak layer contributes again"
+    );
+
+    // One notice each, both carrying the canonical identifier (not the spelling
+    // passed): the redundant mute fired nothing.
+    assert_eq!(*muted.borrow(), vec![canonical.clone()]);
+    assert_eq!(*unmuted.borrow(), vec![canonical]);
+    Ok(())
+}
+
+/// Open-time muting dedups co-resolving spellings the same way the runtime path
+/// does: seeding one loaded layer under both a relative and an absolute spelling
+/// lists it once and mutes it.
+#[test]
+fn mute_open_dedup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let weak = dir.path().join("weak.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@weak.usda@]\n)\ndef \"P\" {}\n")?;
+    fs::write(&weak, "#usda 1.0\ndef \"P\" {\n    custom double x = 1\n}\n")?;
+    let abs = weak.to_str().unwrap();
+
+    let stage = Stage::builder().mute(["weak.usda", abs]).open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.muted_layers().len(),
+        1,
+        "two spellings of one loaded layer seed a single mute, got {:?}",
+        stage.muted_layers()
+    );
+    assert!(stage.is_layer_muted("weak.usda") && stage.is_layer_muted(abs));
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None,
+        "the muted weak layer contributes nothing"
+    );
+    Ok(())
+}
+
+/// A nested sublayer is muted by the path that resolves, from the stage root, to
+/// its canonical identifier: `sub/weak.usda` drops from the stack and unmutes
+/// through its absolute spelling (the same identifier).
+#[test]
+fn mute_nested_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("sub"))?;
+    let root = dir.path().join("root.usda");
+    let mid = dir.path().join("sub").join("mid.usda");
+    let weak = dir.path().join("sub").join("weak.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@sub/mid.usda@]\n)\ndef \"P\" {}\n",
+    )?;
+    fs::write(&mid, "#usda 1.0\n(\n    subLayers = [@weak.usda@]\n)\n")?;
+    fs::write(&weak, "#usda 1.0\ndef \"P\" {\n    custom double x = 1\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let abs = weak.to_str().unwrap();
+    let read_x = || stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0));
+    assert_eq!(
+        read_x()?,
+        Some(vt::Value::Double(1.0)),
+        "the nested sublayer contributes x"
+    );
+
+    // Mute by the root-relative path; `weak.usda` lives under `sub/`.
+    stage.mute_layer("sub/weak.usda");
+    assert!(
+        stage.is_layer_muted(abs),
+        "the muted nested layer reads as muted by absolute path"
+    );
+    assert_eq!(read_x()?, None, "the muted nested sublayer drops from the stack");
+
+    stage.unmute_layer(abs);
+    assert!(
+        !stage.is_layer_muted("sub/weak.usda"),
+        "unmuting by an alternate spelling unmutes it"
+    );
+    assert_eq!(
+        read_x()?,
+        Some(vt::Value::Double(1.0)),
+        "the unmuted nested sublayer contributes again"
+    );
+    Ok(())
+}
+
+/// An unevaluable expression `subLayers` entry drops only that sublayer: the
+/// reference target still composes its own opinions and its valid sublayer,
+/// rather than the bad expression failing the whole target load.
+#[test]
+fn bad_expr_sublayer_dropped() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    let over = dir.path().join("over.usda");
+    fs::write(&root, "#usda 1.0\ndef \"P\" (\n    references = @target.usda@\n) {}\n")?;
+    // The second sublayer uses an undefined expression variable; the first is valid.
+    fs::write(
+        &target,
+        "#usda 1.0\n(\n    defaultPrim = \"P\"\n    subLayers = [@over.usda@, @`\"${UNDEFINED}.usda\"`@]\n)\ndef \"P\" {\n    custom double x = 1\n}\n",
+    )?;
+    fs::write(&over, "#usda 1.0\ndef \"P\" {\n    custom double y = 2\n}\n")?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0)),
+        "the target's own opinion composes despite the bad expression sublayer"
+    );
+    assert_eq!(
+        stage.attribute("/P.y")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(2.0)),
+        "the valid sublayer still composes"
+    );
+    assert!(
+        !stage.composition_errors().is_empty(),
+        "the dropped expression sublayer is reported"
+    );
+    Ok(())
+}
+
+/// A single-layer .usda file should load with correct defaultPrim and
+/// root prim list.
+#[test]
+fn open_single_layer() -> Result<()> {
+    let path = composition_path("active.usda");
+    let stage = Stage::open(&path)?;
+
+    assert_eq!(stage.layer_count(), 1);
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+    assert_eq!(
+        stage.root_prims()?.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        ["World"]
+    );
+
+    Ok(())
+}
+
+/// Default traversal should visit active, loaded, defined, non-abstract prims.
+#[test]
+fn traverse_uses_default_predicate() -> Result<()> {
+    let path = composition_path("active.usda");
+    let stage = Stage::open(&path)?;
+
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.as_str().to_string()))?;
+
+    assert_eq!(prims, vec!["/World", "/World/CubeActive"]);
+
+    Ok(())
+}
+
+/// Exhaustive traversal should preserve raw composed hierarchy traversal.
+#[test]
+fn traverse_all_visits_every_composed_prim() -> Result<()> {
+    let path = composition_path("active.usda");
+    let stage = Stage::open(&path)?;
+
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |p| prims.push(p.as_str().to_string()))?;
+
+    assert_eq!(prims, vec!["/World", "/World/CubeInactive", "/World/CubeActive"]);
+
+    Ok(())
+}
+
+/// A prim defined only in the stronger sublayer should appear in composed
+/// children alongside prims from the weaker layer.
+#[test]
+fn sublayer_children_union() -> Result<()> {
+    let path = fixture_path("sublayer_override.usda");
+    let stage = Stage::open(&path)?;
+
+    let children = child_names(&stage, "/World")?;
+    // Override layer adds Sphere; base layer defines Cube.
+    assert!(children.contains(&"Cube".to_string()), "Cube from base layer");
+    assert!(children.contains(&"Sphere".to_string()), "Sphere from override layer");
+
+    Ok(())
+}
+
+/// The `sublayer_same_folder` vendor test asset should open correctly with
+/// 2 layers and expose the sublayer's prims through composition.
+#[test]
+fn sublayer_prims_from_weaker_layer() -> Result<()> {
+    let path = composition_path("subLayer/sublayer_same_folder.usda");
+    let stage = Stage::open(&path)?;
+
+    assert_eq!(stage.layer_count(), 2);
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+
+    // The weaker sublayer (_stage.usda) defines /World/Cube.
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.as_str().to_string()))?;
+    assert!(prims.contains(&"/World/Cube".to_string()));
+
+    Ok(())
+}
+
+/// Vendor test: `reference_same_folder.usda` references _stage.usda with
+/// defaultPrim. The referenced layer's /World/Cube should appear under the
+/// referencing prim.
+#[test]
+fn reference_default_prim_from_external_layer() -> Result<()> {
+    let path = composition_path("references/reference_same_folder.usda");
+    let stage = Stage::open(&path)?;
+
+    // /World references _stage.usda's defaultPrim ("World"),
+    // so /World/Cube should come from the referenced layer.
+    let children = child_names(&stage, "/World")?;
+    assert!(
+        children.contains(&"Cube".to_string()),
+        "Cube from referenced layer should appear under /World"
+    );
+
+    Ok(())
+}
+
+/// An external reference with an explicit prim path should remap the
+/// target prim into the referencing prim's namespace.
+/// `ref_prim.usda`: /World/RefPrim references @`ref_target.usda`@</Source>.
+#[test]
+fn reference_explicit_prim_path() -> Result<()> {
+    let path = fixture_path("ref_prim.usda");
+    let stage = Stage::open(&path)?;
+
+    // /Source/Child in ref_target.usda should appear as /World/RefPrim/Child.
+    let children = child_names(&stage, "/World/RefPrim")?;
+    assert!(
+        children.contains(&"Child".to_string()),
+        "referenced children should be namespace-remapped"
+    );
+
+    Ok(())
+}
+
+// --- Inherit composition ---
+
+/// `class_inherit.usda`: cubeWithoutSetColor inherits from /_myClass which
+/// defines displayColor = green. The prim should pick up the class property.
+#[test]
+fn inherit_from_class() -> Result<()> {
+    let path = composition_path("class_inherit.usda");
+    let stage = Stage::open(&path)?;
+
+    // The inherited property should be visible.
+    let props = prop_names(&stage, "/World/cubeWithoutSetColor")?;
+    assert!(
+        props.contains(&"primvars:displayColor".to_string()),
+        "inherited property should be visible"
+    );
+
+    Ok(())
+}
+
+// --- Property specs ---
+
+fn attr_paths(stage: &Stage, path: impl sdf::IntoPath) -> Result<Vec<String>> {
+    Ok(stage
+        .prim(path)?
+        .attributes()?
+        .iter()
+        .map(|attr| attr.path().as_str().to_owned())
+        .collect())
+}
+
+/// A property authored in a layer that held no spec for its prim is listed
+/// and read once the prim's spec stack gains that layer, and removing it falls
+/// back to the sublayer's opinion.
+#[test]
+fn attr_in_new_layer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join("weak.usda"), "#usda 1.0\ndef \"A\" { double x = 1 }\n")?;
+    let stage = open_text(&dir, "#usda 1.0\n(\n    subLayers = [@./weak.usda@]\n)\n")?;
+    assert_eq!(attr_paths(&stage, "/A")?, ["/A.x"]);
+    assert_eq!(stage.attribute("/A.x")?.get::<f64>()?, Some(1.0));
+
+    // The root layer gains `over "A"` with both opinions.
+    stage.prim("/A")?.create_attribute("y", "double")?.set(2.0)?;
+    stage.attribute("/A.x")?.set(3.0)?;
+    assert_eq!(attr_paths(&stage, "/A")?, ["/A.x", "/A.y"]);
+    assert_eq!(stage.attribute("/A.x")?.get::<f64>()?, Some(3.0));
+    assert_eq!(stage.attribute("/A.y")?.get::<f64>()?, Some(2.0));
+
+    assert!(stage.remove_property("/A.y")?);
+    assert!(stage.remove_property("/A.x")?);
+    assert_eq!(attr_paths(&stage, "/A")?, ["/A.x"]);
+    assert_eq!(stage.attribute("/A.x")?.get::<f64>()?, Some(1.0));
+    assert_eq!(stage.attribute("/A.y")?.get::<f64>()?, None);
+    Ok(())
+}
+
+/// A name the weaker layer authors as an attribute and the stronger as a
+/// relationship lists as a relationship only: the strongest spec decides the
+/// kind.
+#[test]
+fn strongest_kind_wins() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0\ndef \"A\" {\n    double p = 1\n    double q = 1\n}\n",
+    )?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\n(\n    subLayers = [@./weak.usda@]\n)\nover \"A\" {\n    rel p\n}\n",
+    )?;
+    assert_eq!(attr_paths(&stage, "/A")?, ["/A.q"]);
+    let relationships: Vec<String> = stage
+        .prim("/A")?
+        .relationships()?
+        .iter()
+        .map(|rel| rel.path().as_str().to_owned())
+        .collect();
+    assert_eq!(relationships, ["/A.p"]);
+    Ok(())
+}
+
+// --- Payload composition ---
+
+/// Vendor test: `payload_same_folder.usda` has a payload to _stage.usda.
+/// The payload's prim hierarchy should be composed into the stage.
+#[test]
+fn payload_pulls_children() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::open(&path)?;
+
+    // The payload target layer has /World/Cube. Since /World is the payload
+    // target, /World/Cube should appear.
+    let children = child_names(&stage, "/World")?;
+    assert!(
+        children.contains(&"Cube".to_string()),
+        "Cube from payload layer should appear under /World"
+    );
+
+    Ok(())
+}
+
+// --- Session layer ---
+
+/// Opens a stage with `session_layer.usda` over `session_root.usda`.
+fn open_with_session() -> Result<Stage> {
+    let root = fixture_path("session_root.usda");
+    let session = fixture_path("session_layer.usda");
+    Stage::builder().session_layer(&session).open(&root)
+}
+
+/// A `${VAR}` sublayer in the root layer resolves against an expression variable
+/// authored only on the session layer, and the named layer is loaded from disk:
+/// the session is part of the root layer stack, so its variables seed the root's
+/// sublayer collection, not just an already-interned lookup.
+#[test]
+fn session_var_loads_sublayer() -> Result<()> {
+    let root = fixture_path("session_expr_sublayer/root.usda");
+    let session = fixture_path("session_expr_sublayer/session.usda");
+    let stage = Stage::builder().session_layer(&session).open(&root)?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "the session WHICH variable loads and resolves the root's expression sublayer"
+    );
+    Ok(())
+}
+
+/// A stage's expression variables come from the session layer's *root*, not its
+/// sublayers: a `${VAR}` authored on a session *sublayer* is ignored, while the
+/// same variable on the session root applies. C++ `PcpExpressionVariables`
+/// composes only the stage root and session root layers' own metadata.
+#[test]
+fn session_sublayer_var_ignored() -> Result<()> {
+    let resolves = |session_body: &str| -> Result<Option<f64>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root.usda");
+        let session = dir.path().join("session.usda");
+        fs::write(&root, "#usda 1.0\n(\n    subLayers = [@`\"${WHICH}.usda\"`@]\n)\n")?;
+        fs::write(&session, session_body)?;
+        fs::write(
+            dir.path().join("sub.usda"),
+            "#usda 1.0\n(\n    expressionVariables = { string WHICH = \"a\" }\n)\n",
+        )?;
+        fs::write(
+            dir.path().join("a.usda"),
+            "#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n",
+        )?;
+        let stage = Stage::builder()
+            .session_layer(session.to_str().expect("utf-8 temp path"))
+            .open(root.to_str().expect("utf-8 temp path"))?;
+        stage.attribute("/A.x")?.get::<f64>()
+    };
+    // WHICH authored on a session sublayer is ignored, so the root's expression
+    // sublayer does not resolve and `/A` never composes.
+    assert_eq!(
+        resolves("#usda 1.0\n(\n    subLayers = [@sub.usda@]\n)\n")?,
+        None,
+        "a session sublayer's WHICH must not resolve the root's expression sublayer",
+    );
+    // WHICH authored on the session root applies, selecting a.usda.
+    assert_eq!(
+        resolves("#usda 1.0\n(\n    expressionVariables = { string WHICH = \"a\" }\n)\n")?,
+        Some(1.0),
+        "the session root's WHICH resolves the root's expression sublayer",
+    );
+    Ok(())
+}
+
+/// A session layer's `${VAR}` sublayer resolves against a variable authored on the
+/// *stage root* layer: the root and session form one layer stack sharing a single
+/// expression-variable context (C++ `PcpExpressionVariables`), so `strong.usda` — named
+/// only through the stage root's `CHILD` — is loaded and composed.
+#[test]
+fn session_sublayer_root_var() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    expressionVariables = { string CHILD = \"strong\" }\n)\n",
+    )?;
+    fs::write(&session, "#usda 1.0\n(\n    subLayers = [@`\"${CHILD}.usda\"`@]\n)\n")?;
+    fs::write(
+        dir.path().join("strong.usda"),
+        "#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().expect("utf-8 temp path"))
+        .open(root.to_str().expect("utf-8 temp path"))?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "the session sublayer resolves the stage root's CHILD to strong.usda",
+    );
+    Ok(())
+}
+
+/// Muting then unmuting the session root prunes and restores a session descendant its
+/// `${VAR}` sublayer selects through a variable authored on the stage root. The subtree
+/// walk and mute fanout resolve session sublayers against the combined root+session
+/// context, so `strong.usda`'s `/A/Child` disappears while muted and returns on unmute.
+#[test]
+fn unmute_session_root_subtree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    expressionVariables = { string CHILD = \"strong\" }\n)\ndef \"A\" {\n    custom double z = 0\n}\n",
+    )?;
+    fs::write(&session, "#usda 1.0\n(\n    subLayers = [@`\"${CHILD}.usda\"`@]\n)\n")?;
+    fs::write(
+        dir.path().join("strong.usda"),
+        "#usda 1.0\ndef \"A\" {\n    def \"Child\" {\n        custom double y = 5\n    }\n}\n",
+    )?;
+
+    let stage = Stage::builder()
+        .session_layer(session.to_str().expect("utf-8 temp path"))
+        .open(root.to_str().expect("utf-8 temp path"))?;
+    assert!(
+        stage.prim("/A/Child")?.is_valid()?,
+        "the stage root's CHILD selects strong.usda in the session"
+    );
+
+    stage.mute_layer(session.to_str().expect("utf-8 temp path"));
+    assert!(
+        !stage.prim("/A/Child")?.is_valid()?,
+        "muting the session root prunes the selected strong.usda"
+    );
+
+    stage.unmute_layer(session.to_str().expect("utf-8 temp path"));
+    assert!(
+        stage.prim("/A/Child")?.is_valid()?,
+        "unmuting restores the pruned session subtree"
+    );
+    Ok(())
+}
+
+/// Open-time muted session paths are anchored against the resolved root layer,
+/// not the bare package path. A packaged root whose default layer is
+/// `dir/root.usda` therefore mutes `dir/strong.usda` for a relative
+/// `mute("strong.usda")` request, dropping its stronger `/A.x` opinion so the
+/// weaker session sublayer wins.
+#[test]
+fn packaged_root_mute_anchor() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer("dir/root.usda", b"#usda 1.0\n")?;
+        writer.add_layer(
+            "dir/session.usda",
+            b"#usda 1.0\n(\n    subLayers = [@strong.usda@, @weak.usda@]\n)\n",
+        )?;
+        writer.add_layer(
+            "dir/strong.usda",
+            b"#usda 1.0\ndef \"A\" {\n    custom double x = 2\n}\n",
+        )?;
+        writer.add_layer("dir/weak.usda", b"#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n")?;
+        writer.finish()?;
+    }
+
+    let package = package.to_string_lossy();
+    let session = format!("{package}[dir/session.usda]");
+    let stage = Stage::builder()
+        .session_layer(session)
+        .mute(["strong.usda"])
+        .open(&package)?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "mute(\"strong.usda\") is anchored relative to the packaged root layer, dropping strong's opinion"
+    );
+    Ok(())
+}
+
+/// A mute keys the layer a search path names as composition anchors it: a
+/// sublayer whose search path falls back beside the package's root layer is
+/// the layer the root's mute of that path names.
+#[test]
+fn muted_search_path_in_package() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    {
+        let mut writer = ArchiveWriter::create(&package)?;
+        writer.add_layer(
+            "dir/root.usda",
+            b"#usda 1.0\n(\n    subLayers = [@sub/a.usda@, @weak.usda@]\n)\n",
+        )?;
+        writer.add_layer("dir/sub/a.usda", b"#usda 1.0\n(\n    subLayers = [@x.usda@]\n)\n")?;
+        writer.add_layer("dir/x.usda", b"#usda 1.0\ndef \"A\" {\n    custom double x = 2\n}\n")?;
+        writer.add_layer("dir/weak.usda", b"#usda 1.0\ndef \"A\" {\n    custom double x = 1\n}\n")?;
+        writer.finish()?;
+    }
+    let package = package.to_string_lossy();
+
+    let stage = Stage::open(&package)?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(2.0),
+        "x.usda falls back to dir/"
+    );
+    let stage = Stage::builder().mute(["x.usda"]).open(&package)?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "the open-time mute drops x"
+    );
+    let stage = Stage::open(&package)?;
+    stage.mute_layer("x.usda");
+    assert_eq!(
+        stage.attribute("/A.x")?.get::<f64>()?,
+        Some(1.0),
+        "the runtime mute drops x"
+    );
+    Ok(())
+}
+
+/// An anonymous root has no location, so a sublayer it names relatively
+/// loads from the working directory; a mute of that path, at open or later,
+/// names the same layer.
+#[test]
+fn mute_unanchored_relative() -> Result<()> {
+    let sublayer = "./fixtures/collections_weak.usda";
+    let root = || -> Result<sdf::Layer> {
+        let mut layer = sdf::Layer::new_anonymous("root.usda");
+        layer.edit(|e| {
+            e.pseudo_root_mut()?.set_sublayers([sublayer]);
+            Ok(())
+        })?;
+        Ok(layer)
+    };
+
+    let stage = Stage::builder().open_layer(root()?)?;
+    assert!(stage.prim("/Sets")?.is_valid()?, "the sublayer composes");
+    stage.mute_layer(sublayer);
+    assert!(stage.is_layer_muted(sublayer));
+    assert!(!stage.prim("/Sets")?.is_valid()?, "the runtime mute drops the sublayer");
+    stage.mute_layer(sublayer);
+    assert_eq!(stage.muted_layers().len(), 1, "a second mute adds nothing");
+    stage.unmute_layer(sublayer);
+    assert!(!stage.is_layer_muted(sublayer));
+    assert!(stage.prim("/Sets")?.is_valid()?, "one unmute restores the sublayer");
+
+    let stage = Stage::builder().mute([sublayer]).open_layer(root()?)?;
+    assert!(stage.is_layer_muted(sublayer));
+    assert!(
+        !stage.prim("/Sets")?.is_valid()?,
+        "the open-time mute drops the sublayer"
+    );
+    Ok(())
+}
+
+/// `package.usdz` holding `root.usda`, `sub/a.usda` (whose `/P` references
+/// the search path `x.usda`), and the `x.usda` entries `extra` names, each
+/// defining `/X.probe` as its value. A package written over another is
+/// dated after it, so a reload reads it however coarse the file times.
+fn write_search_package(path: &FsPath, extra: &[(&str, i32)]) -> Result<()> {
+    let before = fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let mut writer = ArchiveWriter::create(path)?;
+    writer.add_layer("root.usda", b"#usda 1.0\n")?;
+    writer.add_layer(
+        "sub/a.usda",
+        b"#usda 1.0\ndef \"P\" (\n    references = @x.usda@</X>\n) {}\n",
+    )?;
+    for (name, probe) in extra {
+        let layer = format!("#usda 1.0\ndef \"X\" {{\n    custom int probe = {probe}\n}}\n");
+        writer.add_layer(name, layer.as_bytes())?;
+    }
+    writer.finish()?;
+    if let Some(before) = before {
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(before + Duration::from_secs(2))?;
+    }
+    Ok(())
+}
+
+/// A stage whose `/P` references `/P` of `sub/a.usda` in the package at
+/// `package`.
+fn search_stage(dir: &FsPath, package: &FsPath) -> Result<Stage> {
+    let root = dir.join("root.usda");
+    let reference = ar::join_package_relative_path(&package.to_string_lossy(), "sub/a.usda");
+    fs::write(
+        &root,
+        format!("#usda 1.0\ndef \"P\" (\n    references = @{reference}@</P>\n) {{}}\n"),
+    )?;
+    Stage::open(root.to_str().unwrap())
+}
+
+/// A package that gains the entry a search path prefers retargets the
+/// reference on a reload.
+#[test]
+fn package_entry_added() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    write_search_package(&package, &[("x.usda", 1)])?;
+    let stage = search_stage(dir.path(), &package)?;
+    assert_eq!(
+        stage.attribute("/P.probe")?.get::<i32>()?,
+        Some(1),
+        "beside the root layer"
+    );
+
+    write_search_package(&package, &[("x.usda", 1), ("sub/x.usda", 2)])?;
+    stage.reload()?;
+    assert_eq!(stage.attribute("/P.probe")?.get::<i32>()?, Some(2), "beside the layer");
+    Ok(())
+}
+
+/// A search path no entry of its package answered resolves once a reload
+/// finds the entry added.
+#[test]
+fn missing_candidate_appears() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    write_search_package(&package, &[])?;
+    let stage = search_stage(dir.path(), &package)?;
+    assert_eq!(stage.attribute("/P.probe")?.get::<i32>()?, None, "x.usda is nowhere");
+
+    write_search_package(&package, &[("sub/x.usda", 2)])?;
+    stage.reload()?;
+    assert_eq!(stage.attribute("/P.probe")?.get::<i32>()?, Some(2));
+    Ok(())
+}
+
+/// A package that loses the entry a search path named falls back beside
+/// its root layer on a reload.
+#[test]
+fn package_entry_removed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let package = dir.path().join("package.usdz");
+    write_search_package(&package, &[("x.usda", 1), ("sub/x.usda", 2)])?;
+    let stage = search_stage(dir.path(), &package)?;
+    assert_eq!(stage.attribute("/P.probe")?.get::<i32>()?, Some(2));
+
+    write_search_package(&package, &[("x.usda", 1)])?;
+    // The layer the entry held no longer resolves, which the reload reports
+    // once the rest have reloaded.
+    let reloaded = stage.reload();
+    assert!(
+        matches!(reloaded, Err(openusd::Error::UnresolvedAsset(_))),
+        "{reloaded:?}"
+    );
+    assert_eq!(stage.attribute("/P.probe")?.get::<i32>()?, Some(1));
+    Ok(())
+}
+
+/// A stage opened without a session layer should report no session layer.
+#[test]
+fn no_session_layer_by_default() -> Result<()> {
+    let stage = Stage::open(&fixture_path("session_root.usda"))?;
+
+    assert!(!stage.has_session_layer());
+    assert!(stage.session_layer().is_none());
+    assert_eq!(stage.layer_count(), 1);
+
+    Ok(())
+}
+
+/// `defaultPrim` should come from the root layer, not the session layer.
+#[test]
+fn session_layer_does_not_affect_default_prim() -> Result<()> {
+    let stage = open_with_session()?;
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+    Ok(())
+}
+
+/// Children defined only in the root layer should still be visible
+/// when a session layer is present.
+#[test]
+fn session_layer_preserves_children() -> Result<()> {
+    let stage = open_with_session()?;
+
+    let children = child_names(&stage, "/World")?;
+    assert!(
+        children.contains(&"Child".to_string()),
+        "root layer's children should be visible: got {children:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn api_schemas_returns_applied_schemas() -> Result<()> {
+    let stage = Stage::open("fixtures/api_schemas.usda")?;
+    let geo = sdf::Path::new("/World/Geo")?;
+    let schemas = stage.prim(geo.clone())?.api_schemas()?;
+    assert!(schemas.contains(&tf::Token::from("MaterialBindingAPI")));
+    assert!(schemas.contains(&tf::Token::from("SkelBindingAPI")));
+    Ok(())
+}
+
+#[test]
+fn api_schemas_compose_list_ops() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def Xform "World"
+{
+    def Mesh "Geo" (
+        append apiSchemas = ["WeakAPI", "RemovedAPI"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("middle.usda"),
+        r#"#usda 1.0
+(
+    subLayers = [
+        @weak.usda@
+    ]
+)
+
+over "World"
+{
+    over "Geo" (
+        prepend apiSchemas = ["StrongAPI"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    subLayers = [
+        @middle.usda@
+    ]
+)
+
+over "World"
+{
+    over "Geo" (
+        delete apiSchemas = ["RemovedAPI"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let schemas = stage.prim(sdf::Path::new("/World/Geo")?)?.api_schemas()?;
+    assert_eq!(schemas, vec![tf::Token::from("StrongAPI"), tf::Token::from("WeakAPI")]);
+    Ok(())
+}
+
+#[test]
+fn api_schemas_compose_reorder_list_op() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def Xform "World"
+{
+    def Mesh "Geo" (
+        apiSchemas = ["A", "B", "C"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    subLayers = [
+        @weak.usda@
+    ]
+)
+
+over "World"
+{
+    over "Geo" (
+        reorder apiSchemas = ["C", "A"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let schemas = stage.prim(sdf::Path::new("/World/Geo")?)?.api_schemas()?;
+    assert_eq!(
+        schemas,
+        vec![tf::Token::from("C"), tf::Token::from("A"), tf::Token::from("B")]
+    );
+    Ok(())
+}
+
+/// Inherit arc: a class authoring `apiSchemas` contributes to the
+/// inheriting prim's composed list, with the local prim's edits applied
+/// on top. `has_api_schema` (the surface physics / skel readers depend
+/// on) sees both opinions.
+#[test]
+fn api_schemas_via_inherit() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+class "_Base" (
+    prepend apiSchemas = ["BaseAPI"]
+)
+{
+}
+
+def Xform "World"
+{
+    def Mesh "Geo" (
+        inherits = </_Base>
+        prepend apiSchemas = ["LocalAPI"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let geo = sdf::Path::new("/World/Geo")?;
+    assert_eq!(
+        stage.prim(geo.clone())?.api_schemas()?,
+        vec![tf::Token::from("LocalAPI"), tf::Token::from("BaseAPI")],
+    );
+    assert!(stage.prim(geo.clone())?.has_api_schema("BaseAPI")?);
+    assert!(stage.prim(geo.clone())?.has_api_schema("LocalAPI")?);
+    Ok(())
+}
+
+/// Reference arc: a referenced asset's `apiSchemas` compose into the
+/// referencing prim's list, with the local layer's edits applied on top.
+#[test]
+fn api_schemas_via_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("asset.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Source"
+)
+
+def Mesh "Source" (
+    prepend apiSchemas = ["AssetAPI"]
+)
+{
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def Xform "World"
+{
+    def "Geo" (
+        references = @asset.usda@
+        prepend apiSchemas = ["LocalAPI"]
+    )
+    {
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let geo = sdf::Path::new("/World/Geo")?;
+    assert_eq!(
+        stage.prim(geo.clone())?.api_schemas()?,
+        vec![tf::Token::from("LocalAPI"), tf::Token::from("AssetAPI")],
+    );
+    Ok(())
+}
+
+/// Variant arc: a selected variant authoring `apiSchemas` contributes to
+/// the variant-set-owning prim's composed list.
+#[test]
+fn api_schemas_via_variant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def Xform "World"
+{
+    def Mesh "Geo" (
+        variants = {
+            string mode = "full"
+        }
+        prepend variantSets = "mode"
+        prepend apiSchemas = ["LocalAPI"]
+    )
+    {
+        variantSet "mode" = {
+            "full" (
+                prepend apiSchemas = ["VariantAPI"]
+            ) {
+            }
+            "empty" {
+            }
+        }
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let geo = sdf::Path::new("/World/Geo")?;
+    let schemas = stage.prim(geo.clone())?.api_schemas()?;
+    assert!(
+        schemas.contains(&tf::Token::from("VariantAPI")),
+        "variant contribution missing: {schemas:?}",
+    );
+    assert!(
+        schemas.contains(&tf::Token::from("LocalAPI")),
+        "local contribution missing: {schemas:?}",
+    );
+    Ok(())
+}
+
+/// A path that names no prim gives the invalid prim, as C++
+/// `GetPrimAtPath` does, even where its owning prim is composed.
+#[test]
+fn prim_at_non_prim_path() -> Result<()> {
+    let stage = Stage::open("fixtures/api_schemas.usda")?;
+    assert!(stage.prim("/World/Geo")?.is_valid()?);
+    for path in [
+        "/World/Geo.points",
+        "/World/Geo{v=a}",
+        "/World{v=a}Geo",
+        "World/Geo",
+        ".",
+    ] {
+        let prim = stage.prim(path)?;
+        assert!(prim.path().is_empty(), "{path}");
+        assert!(!prim.is_valid()?, "{path}");
+        assert!(prim.api_schemas()?.is_empty(), "{path}");
+    }
+    let root = stage.prim("/")?;
+    assert!(root.path().is_abs_root());
+    assert!(root.is_valid()?);
+    assert_eq!(root.children()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn connection_paths_compose_list_ops() -> Result<()> {
+    // Stack: weak sublayer authors `append`; root layer authors
+    // `prepend`. `connection_paths` must fold edits across both
+    // layers, not return only the strongest layer's list op.
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def Shader "Mat"
+{
+    color3f outputs:out
+    append color3f inputs:in.connect = [</Mat.outputs:out>]
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    subLayers = [
+        @weak.usda@
+    ]
+)
+
+over "Mat"
+{
+    prepend color3f inputs:in.connect = [</Mat.outputs:strong>]
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let conns = connections(&stage, &sdf::Path::new("/Mat.inputs:in")?)?;
+    assert_eq!(
+        conns,
+        vec![
+            sdf::Path::new("/Mat.outputs:strong")?,
+            sdf::Path::new("/Mat.outputs:out")?
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn relationship_targets_compose_list_ops() -> Result<()> {
+    // Weak sublayer appends a target; root prepends one. Raw targets must
+    // fold list-op edits across both layers (spec 12.2.6, 12.4).
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Set"
+{
+    def "A" {}
+    def "B" {}
+    append rel members = [</Set/B>]
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    subLayers = [
+        @weak.usda@
+    ]
+)
+
+over "Set"
+{
+    prepend rel members = [</Set/A>]
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let targets = rel_targets(&stage, &sdf::Path::new("/Set.members")?)?;
+    assert_eq!(targets, vec![sdf::Path::new("/Set/A")?, sdf::Path::new("/Set/B")?]);
+    Ok(())
+}
+
+#[test]
+fn relationship_targets_remap_reference() -> Result<()> {
+    // Targets authored in a referenced asset's namespace resolve into the
+    // referencing prim's namespace (spec 12.4 raw targets across arcs).
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("asset.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Source"
+)
+
+def "Source"
+{
+    def "Child" {}
+    rel members = [</Source/Child>]
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def "Inst" (
+    references = @asset.usda@
+)
+{
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let targets = rel_targets(&stage, &sdf::Path::new("/Inst.members")?)?;
+    assert_eq!(targets, vec![sdf::Path::new("/Inst/Child")?]);
+    Ok(())
+}
+
+#[test]
+fn forwarded_targets_honor_mask() -> Result<()> {
+    // Forwarding must not read a relationship on a masked-out prim, so the
+    // chain stops at /Hidden.rel, which is returned as authored (C++ follows
+    // a relationship only through a valid prim); a direct prim target to the
+    // masked prim is returned too (raw target value, not a query).
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def "Vis"
+{
+    rel chain = [</Hidden.rel>]
+    rel direct = [</Hidden>]
+}
+
+def "Hidden"
+{
+    rel rel = [</Hidden/Geom>]
+    def "Geom" {}
+}
+"#,
+    )?;
+
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Vis"])?)
+        .open(root.to_str().expect("utf-8 temp path"))?;
+
+    // /Hidden is masked out: its relationship is not followed.
+    assert_eq!(
+        fwd_targets(&stage, &sdf::Path::new("/Vis.chain")?)?,
+        paths(&["/Hidden.rel"])
+    );
+    // A direct prim target is still returned, matching raw targets.
+    assert_eq!(
+        fwd_targets(&stage, &sdf::Path::new("/Vis.direct")?)?,
+        vec![sdf::Path::new("/Hidden")?]
+    );
+    Ok(())
+}
+
+#[test]
+fn connection_paths_remap_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("asset.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Source"
+)
+
+def Shader "Source"
+{
+    color3f outputs:out
+    color3f inputs:in.connect = [</Source.outputs:out>]
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def Shader "Mat" (
+    references = @asset.usda@
+)
+{
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let input = sdf::Path::new("/Mat.inputs:in")?;
+    let output = sdf::Path::new("/Mat.outputs:out")?;
+    assert_eq!(connections(&stage, &input)?, vec![output.clone()]);
+
+    let graph = usd::ConnectionGraph::from_stage(&stage)?;
+    assert_eq!(graph.sources(&input), std::slice::from_ref(&output));
+    assert_eq!(graph.sinks(&output), &[input]);
+    Ok(())
+}
+
+#[test]
+fn api_schemas_empty_for_prim_without_schemas() -> Result<()> {
+    let stage = Stage::open("fixtures/api_schemas.usda")?;
+    let props = sdf::Path::new("/World/Props")?;
+    assert!(stage.prim(props)?.api_schemas()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn has_api_schema_matches_applied() -> Result<()> {
+    let stage = Stage::open("fixtures/api_schemas.usda")?;
+    let geo = sdf::Path::new("/World/Geo")?;
+    assert!(stage.prim(geo.clone())?.has_api_schema("MaterialBindingAPI")?);
+    assert!(!stage.prim(geo.clone())?.has_api_schema("SkelRootAPI")?);
+    Ok(())
+}
+
+#[test]
+fn type_name_returns_prim_type() -> Result<()> {
+    let stage = Stage::open("fixtures/api_schemas.usda")?;
+    assert_eq!(
+        stage.prim(sdf::Path::new("/World/Geo")?)?.type_name()?.as_deref(),
+        Some("Mesh")
+    );
+    assert_eq!(
+        stage.prim(sdf::Path::new("/World")?)?.type_name()?.as_deref(),
+        Some("Xform")
+    );
+    Ok(())
+}
+
+fn open_stage_queries_fixture() -> Result<Stage> {
+    Stage::open("fixtures/stage_queries.usda")
+}
+
+#[test]
+fn active_loaded() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    assert!(stage.prim("/World/ActiveParent/Child")?.is_active()?);
+    assert!(stage.prim("/World/ActiveParent/Child")?.is_loaded()?);
+
+    assert!(!stage.prim("/World/InactiveParent")?.is_active()?);
+    assert!(!stage.prim("/World/InactiveParent/Child")?.is_active()?);
+    assert!(!stage.prim("/World/InactiveParent/Child")?.is_loaded()?);
+
+    assert!(!stage.prim("/World/Missing")?.is_active()?);
+    Ok(())
+}
+
+/// Records every layer the wrapped resolver opens, to verify lazy loading: a
+/// reference/payload target is read from disk only when composition reaches its
+/// arc, never at stage-open time.
+struct RecordingResolver {
+    inner: ar::DefaultResolver,
+    opened: Rc<RefCell<Vec<String>>>,
+}
+
+impl RecordingResolver {
+    fn new(opened: Rc<RefCell<Vec<String>>>) -> Self {
+        Self {
+            inner: ar::DefaultResolver::new(),
+            opened,
+        }
+    }
+}
+
+impl ar::Resolver for RecordingResolver {
+    fn create_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        self.inner.create_identifier(asset_path, anchor)
+    }
+    fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
+        self.inner.resolve(asset_path)
+    }
+    fn resolve_for_new_asset(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
+        self.inner.resolve_for_new_asset(asset_path)
+    }
+    fn open_asset(&self, resolved_path: &ar::ResolvedPath) -> std::io::Result<Box<dyn ar::Asset>> {
+        self.opened.borrow_mut().push(resolved_path.to_string());
+        self.inner.open_asset(resolved_path)
+    }
+    fn identity(&self) -> String {
+        self.inner.identity()
+    }
+    fn is_context_dependent_path(&self, asset_path: &str) -> bool {
+        self.inner.is_context_dependent_path(asset_path)
+    }
+    fn in_memory_identifier<'a>(&self, asset_path: &'a str) -> Cow<'a, str> {
+        self.inner.in_memory_identifier(asset_path)
+    }
+}
+
+/// A reference target is opened only when composition reaches its arc, not at
+/// stage-open time, and then exactly once.
+#[test]
+fn lazy_reference_loads_on_demand() -> Result<()> {
+    let path = composition_path("references/reference_same_folder.usda");
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .open(&path)?;
+
+    let opened_has = |needle: &str| opened.borrow().iter().any(|p| p.contains(needle));
+
+    // Opening the stage reads only the root layer; the reference target stays
+    // closed until composition reaches the arc on `/World`.
+    assert!(opened_has("reference_same_folder"));
+    assert!(!opened_has("_stage.usda"), "reference target must not load at open");
+    assert_eq!(stage.layer_count(), 1);
+
+    // Composing `/World` follows its reference, opening the target exactly once.
+    let _ = child_names(&stage, "/World")?;
+    assert!(opened_has("_stage.usda"), "composing the prim must load its reference");
+    assert_eq!(stage.layer_count(), 2);
+    let target_opens = opened.borrow().iter().filter(|p| p.contains("_stage.usda")).count();
+    assert_eq!(target_opens, 1, "the reference target loads exactly once");
+    Ok(())
+}
+
+/// A prim below a reference whose target is not loaded yet is asked about
+/// first: composing its parent demands the target, so the answers found
+/// before the load lands are not kept, and the prim reads as it composes
+/// once the target is in.
+#[test]
+fn deep_query_before_reference_load() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"P\" (\n    references = @./t.usda@</T>\n)\n{\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("t.usda"),
+        "#usda 1.0\ndef \"T\" {\n    def \"Child\" {\n        def \"Leaf\" {}\n    }\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.layer_count(), 1, "the reference target loads on demand");
+
+    let leaf = stage.prim("/P/Child/Leaf")?;
+    assert!(leaf.is_valid()?, "the leaf composes from the loaded target");
+    assert!(leaf.is_defined()?);
+    assert!(leaf.is_active()?);
+    let mut visited = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |path| visited.push(path.clone()))?;
+    assert!(visited.contains(&sdf::path("/P/Child/Leaf")?));
+    Ok(())
+}
+
+/// Opening a stage reads its root and session layers once each: the read that
+/// composes their expression variables is the one their stacks are built from.
+#[test]
+fn root_layers_read_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let session = dir.path().join("session.usda");
+    fs::write(&root, "#usda 1.0\ndef \"World\" {}\n")?;
+    fs::write(&session, "#usda 1.0\n")?;
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .session_layer(session.to_str().unwrap())
+        .open(root.to_str().unwrap())?;
+
+    let opens = |name: &str| opened.borrow().iter().filter(|path| path.ends_with(name)).count();
+    assert_eq!(opens("root.usda"), 1);
+    assert_eq!(opens("session.usda"), 1);
+    Ok(())
+}
+
+/// A muted reference target contributes nothing and is never read from disk,
+/// even once composition reaches its arc, and surfaces a `MutedAssetPath`
+/// diagnostic.
+#[test]
+fn muted_reference_target_not_opened() -> Result<()> {
+    let path = composition_path("references/reference_same_folder.usda");
+    let target = composition_path("references/_stage.usda");
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    // Mute the reference target by its canonical identifier.
+    let muted_id = ar::DefaultResolver::new().create_identifier(&target, None);
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .mute([muted_id])
+        .open(&path)?;
+
+    // Composing `/World` reaches the muted reference; it is recognized as muted
+    // before the loader would open it.
+    let _ = child_names(&stage, "/World")?;
+    assert!(
+        !opened.borrow().iter().any(|p| p.contains("_stage.usda")),
+        "a muted reference target must never be opened"
+    );
+    let errors = stage.composition_errors();
+    let muted = errors
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                pcp::CompositionDiagnostic::MutedAssetPath { arc: pcp::ArcType::Reference, asset_path, .. }
+                    if asset_path.contains("_stage.usda")
+            )
+        })
+        .count();
+    assert_eq!(
+        muted, 1,
+        "a muted reference target must surface exactly one MutedAssetPath diagnostic, got {errors:?}"
+    );
+    Ok(())
+}
+
+/// Unmuting a reference target that was muted *before it ever loaded* recomposes
+/// the referrer: the arc was skipped at the demand point (the target never
+/// interned, so the layer-keyed mute fanout cannot find the referrer), and the
+/// unmute fans out by the target's canonical identifier instead — dropping the
+/// stale index so the load barrier finally opens the target on the next query.
+#[test]
+fn unmute_unloaded_reference_recomposes() -> Result<()> {
+    let path = composition_path("references/reference_same_folder.usda");
+    let target = composition_path("references/_stage.usda");
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let muted_id = ar::DefaultResolver::new().create_identifier(&target, None);
+    let stage = Stage::builder()
+        .resolver(RecordingResolver::new(opened.clone()))
+        .mute([muted_id.clone()])
+        .open(&path)?;
+
+    // While muted, the reference is skipped and its target is never opened, so
+    // `/World` composes with no referenced children.
+    assert_eq!(child_names(&stage, "/World")?, Vec::<String>::new());
+    assert!(
+        !opened.borrow().iter().any(|p| p.contains("_stage.usda")),
+        "a muted reference target must never be opened"
+    );
+
+    // Unmuting the never-loaded target must recompose `/World`: the load barrier
+    // opens the target on demand and the reference brings in its children.
+    stage.unmute_layer(&muted_id);
+    assert_eq!(
+        child_names(&stage, "/World")?,
+        vec!["Cube"],
+        "unmuting a never-loaded reference target recomposes the referrer"
+    );
+    assert!(
+        opened.borrow().iter().any(|p| p.contains("_stage.usda")),
+        "unmuting must let the load barrier open the now-unmuted target"
+    );
+    Ok(())
+}
+
+#[test]
+fn load_none() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+
+    let loaded = Stage::open(&path)?;
+    // Lazy loading: only the root layer is loaded until composition reaches the
+    // payload arc on `/World`.
+    assert_eq!(loaded.layer_count(), 1);
+    assert!(loaded.prim("/World")?.is_loaded()?);
+    assert_eq!(child_names(&loaded, "/World")?, vec!["Cube"]);
+    // Composing `/World` pulled its payload target in, so it is now loaded.
+    assert_eq!(loaded.layer_count(), 2);
+
+    let unloaded = Stage::builder().load(InitialLoadSet::LoadNone).open(&path)?;
+    assert_eq!(unloaded.initial_load_set(), InitialLoadSet::LoadNone);
+    assert_eq!(unloaded.layer_count(), 1);
+    assert!(!unloaded.prim("/World")?.is_loaded()?);
+    assert_eq!(child_names(&unloaded, "/World")?, Vec::<String>::new());
+
+    let mut prims = Vec::new();
+    unloaded.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.as_str().to_string()))?;
+    assert!(prims.is_empty());
+    Ok(())
+}
+
+/// Runtime `load`/`unload` mutate the effective load state incrementally,
+/// independent of the stage's open-time `InitialLoadSet`.
+#[test]
+fn runtime_load_unload() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::builder().load(InitialLoadSet::LoadNone).open(&path)?;
+    assert!(!stage.prim("/World")?.is_loaded()?);
+
+    stage.load("/World", LoadPolicy::WithDescendants).unwrap();
+    assert!(stage.prim("/World")?.is_loaded()?);
+    assert_eq!(child_names(&stage, "/World")?, vec!["Cube"]);
+
+    stage.unload("/World").unwrap();
+    assert!(!stage.prim("/World")?.is_loaded()?);
+    assert_eq!(child_names(&stage, "/World")?, Vec::<String>::new());
+    Ok(())
+}
+
+/// `set_load_rules` installs a caller-built table wholesale, and `load_rules`
+/// reads back exactly what was installed.
+#[test]
+fn set_load_rules_round_trips() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::open(&path)?;
+
+    let mut rules = pcp::LoadRules::all();
+    rules.unload(sdf::Path::new("/World")?);
+    stage.set_load_rules(rules.clone());
+
+    assert_eq!(stage.load_rules(), rules);
+    assert!(!stage.prim("/World")?.is_loaded()?);
+    Ok(())
+}
+
+/// A redundant `load`/`unload` call — one that resolves to the same load
+/// rules already in effect — fires no [`StageSink::load_rules_changed`]
+/// notification, since nothing was actually invalidated.
+#[test]
+fn load_noop_fires_no_notification() -> Result<()> {
+    let path = composition_path("payload/payload_same_folder.usda");
+    let stage = Stage::open(&path)?;
+    let calls = Rc::new(RefCell::new(0));
+    let _token = {
+        let calls = calls.clone();
+        stage.add_sink(RecordingSink {
+            load_rules: Some(Box::new(move |_stage, _resynced| {
+                *calls.borrow_mut() += 1;
+            })),
+            ..Default::default()
+        })?
+    };
+
+    // Already loaded with the default (empty) rules -- a true no-op.
+    stage.load("/World", LoadPolicy::WithDescendants).unwrap();
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "already-loaded path with default rules fires nothing"
+    );
+
+    stage.unload("/World").unwrap();
+    assert_eq!(*calls.borrow(), 1);
+
+    stage.unload("/World").unwrap();
+    assert_eq!(*calls.borrow(), 1, "repeated unload is a no-op");
+    Ok(())
+}
+
+/// Writes a three-layer payload chain (`root` -> `/World/A` payloads `a.usda`
+/// -> `/World/A/Deep` payloads `deep.usda`) into a fresh temp directory, for
+/// tests exercising nested load-rule interactions.
+fn write_nested_payload_scene(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let root = dir.join("root.usda");
+    let a = dir.join("a.usda");
+    let deep = dir.join("deep.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"A\" (\n        payload = @a.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &a,
+        "#usda 1.0\n(\n    defaultPrim = \"A\"\n)\ndef \"A\" {\n    def \"Deep\" (\n        payload = @deep.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &deep,
+        "#usda 1.0\n(\n    defaultPrim = \"Deep\"\n)\ndef \"Deep\" {\n    custom double x = 42\n}\n",
+    )?;
+    Ok(root)
+}
+
+/// `find_loadable` discovers every payload-carrying prim under `root`, even
+/// one nested behind another payload it must transiently load to see past,
+/// and restores the stage's original (unloaded) state afterward. `load_set`
+/// then reports only what the live rules actually include.
+#[test]
+fn nested_payload_find_loadable_and_load_set() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+
+    assert_eq!(
+        stage.find_loadable("/World")?,
+        vec![sdf::path("/World/A")?, sdf::path("/World/A/Deep")?]
+    );
+    assert!(stage.load_set()?.is_empty(), "load rules still say LoadNone");
+    // The transient discovery swap must not leave the rules changed.
+    assert!(!stage.prim("/World/A")?.is_loaded()?);
+
+    stage.load("/World/A", LoadPolicy::WithDescendants).unwrap();
+    assert_eq!(
+        stage.load_set()?,
+        vec![sdf::path("/World/A")?, sdf::path("/World/A/Deep")?]
+    );
+    Ok(())
+}
+
+/// `load_and_unload` applies every unload before any load, so a path in both
+/// sets ends up loaded.
+#[test]
+fn load_and_unload_same_path_prefers_load() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    stage
+        .load_and_unload(
+            [(sdf::path("/World/A")?, LoadPolicy::WithDescendants)],
+            [sdf::path("/World/A")?],
+        )
+        .unwrap();
+    assert!(stage.prim("/World/A")?.is_loaded()?);
+    Ok(())
+}
+
+/// Unloading an ancestor while loading one of its descendants in the same
+/// `load_and_unload` call still leaves the descendant reachable: the
+/// ancestor's own payload reopens just enough to expose it (`Rule::Only` via
+/// `LoadRules::effective_rule`'s lookahead).
+#[test]
+fn load_and_unload_nested_ancestor_descendant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+
+    stage
+        .load_and_unload(
+            [(sdf::path("/World/A/Deep")?, LoadPolicy::WithDescendants)],
+            [sdf::path("/World/A")?],
+        )
+        .unwrap();
+    assert!(stage.prim("/World/A")?.is_loaded()?);
+    assert!(stage.prim("/World/A/Deep")?.is_loaded()?);
+    assert_eq!(
+        stage
+            .attribute("/World/A/Deep.x")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(42.0))
+    );
+    Ok(())
+}
+
+/// `Prim::load` / `Prim::unload` act on the prim's own path, so a handle is
+/// enough to change the stage's load state (C++ `UsdPrim::Load` / `Unload`),
+/// and each `LoadPolicy` reaches a different depth.
+#[test]
+fn prim_load_unload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_payload_scene(dir.path())?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+    assert!(!stage.prim("/World/A")?.is_loaded()?);
+
+    // The prim's own payload comes in; the one nested under it stays out.
+    stage.prim("/World/A")?.load(LoadPolicy::WithoutDescendants);
+    assert!(stage.prim("/World/A")?.is_loaded()?);
+    assert!(!stage.prim("/World/A/Deep")?.is_loaded()?);
+    assert!(
+        stage
+            .load_rules()
+            .is_loaded_with_no_descendants(&sdf::path("/World/A")?)
+    );
+
+    stage.prim("/World/A")?.load(LoadPolicy::WithDescendants);
+    assert!(stage.prim("/World/A/Deep")?.is_loaded()?);
+    assert!(
+        stage
+            .load_rules()
+            .is_loaded_with_all_descendants(&sdf::path("/World/A")?)
+    );
+    assert_eq!(stage.attribute("/World/A/Deep.x")?.get::<f64>()?, Some(42.0));
+
+    stage.prim("/World/A")?.unload();
+    assert!(!stage.prim("/World/A")?.is_loaded()?);
+    assert_eq!(child_names(&stage, "/World/A")?, Vec::<String>::new());
+    Ok(())
+}
+
+/// A path in a prototype's `/__Prototype_N` namespace is dropped before it
+/// reaches the rule table, so `Prim::load` / `Prim::unload` on prim reached
+/// through `Prim::prototype` author nothing — the leniency `Stage::load`
+/// documents. The same call on the instance's own real-namespace path does
+/// author a rule, so the gate is selective rather than inert.
+#[test]
+fn prototype_load_ignored() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Child\" {}\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = stage.prim("/World/Inst")?.prototype()?.expect("Inst is an instance");
+    let before = stage.load_rules();
+
+    stage.prim(&prototype)?.unload();
+    assert_eq!(stage.load_rules(), before, "the prototype root authors no rule");
+
+    stage.prim(&sdf::path(format!("{prototype}/Child"))?)?.unload();
+    assert_eq!(stage.load_rules(), before, "nor does a prim inside the prototype");
+
+    stage.prim("/World/Inst/Child")?.unload();
+    assert_ne!(stage.load_rules(), before, "the real-namespace path does author one");
+    Ok(())
+}
+
+/// Two instances sharing identical arcs mint one prototype by default; giving
+/// one instance's descendant a different runtime load rule than the other's
+/// splits them into separate prototypes (`InstanceKey` folds in each
+/// instance's own load rules, re-rooted onto its path).
+#[test]
+fn instance_descendant_load_rule_splits_prototype() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    let heavy = dir.path().join("heavy.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"InstA\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n    def \"InstB\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Heavy\" (\n        payload = @heavy.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &heavy,
+        "#usda 1.0\n(\n    defaultPrim = \"Heavy\"\n)\ndef \"Heavy\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let proto_a = stage.prim("/World/InstA")?.prototype()?.expect("InstA is an instance");
+    let proto_b = stage.prim("/World/InstB")?.prototype()?.expect("InstB is an instance");
+    assert_eq!(
+        proto_a, proto_b,
+        "identical composition and load state share a prototype"
+    );
+
+    stage.unload("/World/InstA/Heavy").unwrap();
+
+    let proto_a = stage.prim("/World/InstA")?.prototype()?.expect("still an instance");
+    let proto_b = stage.prim("/World/InstB")?.prototype()?.expect("still an instance");
+    assert_ne!(
+        proto_a, proto_b,
+        "differing load rules on a descendant split the prototype"
+    );
+    Ok(())
+}
+
+/// A caller-supplied `set_load_rules` table naming a synthetic
+/// `/__Prototype_N` path directly is stripped before it is stored: load rules
+/// are only ever meaningful in real-instance-namespace terms (see
+/// `instance_descendant_load_rule_splits_prototype`), and unlike `load`/
+/// `unload`, a raw `set_load_rules` call has no other gate against it.
+#[test]
+fn set_load_rules_strips_prototype_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = stage.prim("/World/Inst")?.prototype()?.expect("Inst is an instance");
+
+    let mut rules = pcp::LoadRules::all();
+    rules.unload(prototype);
+    stage.set_load_rules(rules);
+
+    assert!(
+        stage.load_rules().is_empty(),
+        "the prototype-rooted rule must never be stored"
+    );
+    Ok(())
+}
+
+/// `Prim::is_loaded` gives the same answer whether reached through an
+/// instance's own path or through the shared prototype's synthetic path —
+/// both route through the prototype's stored relative load rules, not the
+/// global table (which never carries prototype-rooted entries).
+#[test]
+fn is_loaded_through_prototype_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let proto = dir.path().join("proto.usda");
+    let heavy = dir.path().join("heavy.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"World\" {\n    def \"Inst\" (\n        instanceable = true\n        references = @proto.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &proto,
+        "#usda 1.0\n(\n    defaultPrim = \"Proto\"\n)\ndef \"Proto\" {\n    def \"Heavy\" (\n        payload = @heavy.usda@\n    ) {}\n}\n",
+    )?;
+    fs::write(
+        &heavy,
+        "#usda 1.0\n(\n    defaultPrim = \"Heavy\"\n)\ndef \"Heavy\" {\n    custom double x = 1\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let prototype = stage.prim("/World/Inst")?.prototype()?.expect("Inst is an instance");
+    let proto_heavy = prototype.append_path("Heavy")?;
+
+    assert!(
+        stage.prim(&proto_heavy)?.is_loaded()?,
+        "loaded by default before any unload"
+    );
+
+    stage.unload("/World/Inst/Heavy").unwrap();
+
+    assert!(
+        !stage.prim("/World/Inst/Heavy")?.is_loaded()?,
+        "unloaded through the instance's own path"
+    );
+    assert!(
+        !stage.prim(&proto_heavy)?.is_loaded()?,
+        "the prototype's own path must report the same, not the previous unconditional loaded"
+    );
+    Ok(())
+}
+
+#[test]
+fn defined_abstract() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    assert_eq!(stage.prim("/World/OverOnly")?.specifier()?, Some(sdf::Specifier::Over));
+    assert!(stage.prim("/World/ActiveParent/Child")?.is_defined()?);
+    assert!(!stage.prim("/World/OverOnly")?.is_defined()?);
+    assert!(!stage.prim("/World/OverParent/Child")?.is_defined()?);
+
+    assert!(stage.prim("/World/ClassParent/Child")?.is_defined()?);
+    assert!(stage.prim("/World/ClassParent")?.is_abstract()?);
+    assert!(stage.prim("/World/ClassParent/Child")?.is_abstract()?);
+    assert!(!stage.prim("/World/ActiveParent/Child")?.is_abstract()?);
+    Ok(())
+}
+
+#[test]
+fn instance_flag() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    assert!(stage.prim("/World/Instance")?.has_composition_arc()?);
+    assert!(stage.prim("/World/Instance")?.is_instance()?);
+
+    assert!(!stage.prim("/World/InstanceableNoArc")?.has_composition_arc()?);
+    assert!(!stage.prim("/World/InstanceableNoArc")?.is_instance()?);
+    Ok(())
+}
+
+/// An instance prim's children come only from its composition arcs; a
+/// local-only child is discarded (spec 11.3.3).
+#[test]
+fn instance_children_from_arcs_only() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing.usda"))?;
+
+    let mut children = child_names(&stage, "/Instance")?;
+    children.sort();
+    assert_eq!(children, vec!["Child".to_string()]);
+
+    // A plain (non-instance) reference still merges local and referenced
+    // children.
+    let mut non_instance = child_names(&stage, "/NonInstance")?;
+    non_instance.sort();
+    assert_eq!(non_instance, vec!["Child".to_string(), "LocalOnly".to_string()]);
+    Ok(())
+}
+
+/// Instances sharing a prototype resolve descendant values identically and
+/// expose the prototype's children (spec 11.3.3).
+#[test]
+fn shared_instances_resolve_identically() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    assert_eq!(
+        stage
+            .attribute("/A/Child.size")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/B/Child.size")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/C/Child.size")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(9.0))
+    );
+
+    assert_eq!(child_names(&stage, "/A")?, vec!["Child".to_string()]);
+    assert_eq!(child_names(&stage, "/B")?, vec!["Child".to_string()]);
+    Ok(())
+}
+
+/// Class arcs that add no shared opinions do not split instances, as in C++
+/// `PcpInstanceKey`: `/Set`'s class implied down to `/Set/A` and `/Set/B` is
+/// ancestral, so even its opinion on `A/Geo` neither keys nor reaches the
+/// instance, and `/C` and `/D` inherit classes nothing defines. All four share
+/// one prototype and resolve `Geo.radius` to the referenced asset's value.
+#[test]
+fn class_arcs_share_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_class_arcs.usda"))?;
+
+    let prototype = first_prototype(&stage)?;
+    for instance in ["/Set/A", "/Set/B", "/C", "/D"] {
+        assert_eq!(
+            stage.prim(instance)?.prototype()?.as_ref(),
+            Some(&prototype),
+            "{instance}"
+        );
+        assert_eq!(
+            stage
+                .attribute(format!("{instance}/Geo.radius"))?
+                .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+            Some(vt::Value::Double(1.0)),
+            "{instance}"
+        );
+    }
+    assert_eq!(stage.prototypes()?, vec![prototype]);
+    Ok(())
+}
+
+/// Reads `Geo.radius` under `instance` at the default time.
+fn geo_radius(stage: &Stage, instance: &str) -> Result<Option<vt::Value>> {
+    stage
+        .attribute(format!("{instance}/Geo.radius"))?
+        .get_at::<vt::Value>(usd::TimeCode::new(0.0))
+}
+
+/// A class that gains its first spec joins the key of the instance inheriting
+/// it (C++ `Pcp_ChildNodeInstanceableChanged`): `/C` leaves the prototype it
+/// shared, and the opinion reaches `/C` alone, even though `/C` seeded that
+/// prototype. Removing the class again brings `/C` back.
+#[test]
+fn class_spec_rekeys_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_class_arcs.usda"))?;
+    // `/C` registers first, so the shared prototype is seeded from its index.
+    let shared = stage.prim("/C")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/D")?.prototype()?.as_ref(), Some(&shared));
+
+    stage
+        .override_prim("/__class__/C/Geo")?
+        .create_attribute("radius", "double")?
+        .set(vt::Value::Double(7.0))?;
+
+    let own = stage.prim("/C")?.prototype()?.expect("an instance");
+    assert_eq!(geo_radius(&stage, "/C")?, Some(vt::Value::Double(7.0)));
+    for instance in ["/D", "/Set/A", "/Set/B"] {
+        let prototype = stage.prim(instance)?.prototype()?.expect("an instance");
+        assert_ne!(prototype, own, "{instance}");
+        assert_eq!(
+            geo_radius(&stage, instance)?,
+            Some(vt::Value::Double(1.0)),
+            "{instance}"
+        );
+    }
+    assert_eq!(stage.prim(own.clone())?.instances()?, paths(&["/C"]));
+    assert_eq!(stage.prototypes()?.len(), 2);
+
+    assert!(stage.remove_prim("/__class__/C")?);
+    let prototype = stage.prim("/D")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/C")?.prototype()?.as_ref(), Some(&prototype));
+    assert_eq!(geo_radius(&stage, "/C")?, Some(vt::Value::Double(1.0)));
+    assert_eq!(stage.prototypes()?, vec![prototype]);
+    Ok(())
+}
+
+/// An `instanceable` prim whose only arc is its ancestor's is not an instance,
+/// as in C++ `Pcp_PrimIndexIsInstanceable`: the inherited class's opinions are
+/// the prim's own, so its children stay.
+#[test]
+fn ancestral_arc_not_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_ancestral_arc.usda"))?;
+
+    let prim = stage.prim("/Set/A")?;
+    assert!(!prim.is_instance()?);
+    assert_eq!(prim.prototype()?, None);
+    assert!(stage.prim("/Set/A/Geo")?.is_valid()?);
+    assert!(stage.prim("/Set/A/Local")?.is_valid()?);
+    assert_eq!(geo_radius(&stage, "/Set/A")?, Some(vt::Value::Double(5.0)));
+    assert!(stage.prototypes()?.is_empty());
+    Ok(())
+}
+
+/// Whether an `instanceable` prim is an instance follows the specs its arcs
+/// reach, answered again after each edit. A class with no spec gives the prim
+/// nothing to share. Defining the class makes the prim an instance, and
+/// removing it again ends that.
+#[test]
+fn instance_follows_class_spec() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\n\
+         def Scope \"Inst\" (instanceable = true\n inherits = </Class>) {}\n",
+    )?;
+    assert!(!stage.prim("/Inst")?.is_instance()?);
+
+    stage.override_prim("/Class")?;
+    assert!(stage.prim("/Inst")?.is_instance()?);
+
+    assert!(stage.remove_prim("/Class")?);
+    assert!(!stage.prim("/Inst")?.is_instance()?);
+    Ok(())
+}
+
+/// `get_prototype` / `get_instances` group instances by shared composition,
+/// and the prototype namespace is addressable (spec 11.3.3).
+#[test]
+fn prototype_queries() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    let proto = stage.prim("/A")?.prototype()?;
+    assert!(proto.is_some());
+    assert_eq!(stage.prim("/B")?.prototype()?, proto); // same composition → shared
+    assert_ne!(stage.prim("/C")?.prototype()?, proto); // different prototype
+    assert_eq!(stage.prim("/Proto")?.prototype()?, None); // not an instance
+
+    let proto = proto.unwrap();
+    // Returned sorted by path, so callers need not sort themselves.
+    let instances: Vec<String> = stage
+        .prim(proto.clone())?
+        .instances()?
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    assert_eq!(instances, vec!["/A".to_string(), "/B".to_string()]);
+
+    // The prototype namespace is addressable and resolves to the shared
+    // (arc-only) subtree.
+    assert!(stage.prim(proto.clone())?.is_prototype()?);
+    let child = sdf::path(format!("{proto}/Child"))?;
+    assert!(stage.prim(child.clone())?.is_in_prototype()?);
+    assert_eq!(
+        stage
+            .attribute(child.append_property("size")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+    Ok(())
+}
+
+/// Prototype queries respect the population mask: a masked-out instance is
+/// not instanced and never appears among a prototype's instances.
+#[test]
+fn prototype_queries_masked() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/A"])?)
+        .open(&fixture_path("instancing_shared.usda"))?;
+
+    // /A is in the mask; /B (which shares /A's prototype) is not.
+    assert!(stage.prim("/A")?.is_instance()?);
+    assert!(!stage.prim("/B")?.is_instance()?);
+
+    let proto = stage.prim("/A")?.prototype()?;
+    assert!(proto.is_some());
+    assert_eq!(stage.prim("/B")?.prototype()?, None);
+
+    // The masked-out /B is excluded from the prototype's instance list.
+    let proto = proto.unwrap();
+    assert_eq!(stage.prim(proto.clone())?.instances()?, vec![sdf::path("/A")?]);
+    assert_eq!(stage.prototypes()?, vec![proto]);
+    Ok(())
+}
+
+/// The instance-relative population mask is part of the instancing key (C++
+/// `Usd_InstanceKey`), so two otherwise-identical instances share a prototype
+/// only when the mask reaches them the same way — and the prototype exposes
+/// just the children that mask admits (spec 11.3.3).
+///
+/// Ported from OpenUSD `testUsdStagePopulationMasks.py::test_Bug152904`.
+#[test]
+fn mask_keys_prototype() -> Result<()> {
+    let fixture = fixture_path("instancing_mask_split.usda");
+
+    // Symmetric: both instances are reached through their `geom` child alone,
+    // so one prototype serves both and `shading` is not populated.
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Instance_1/geom", "/Instance_2/geom"])?)
+        .open(&fixture)?;
+    let one = stage.prim("/Instance_1")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/Instance_2")?.prototype()?, Some(one.clone()));
+    assert_eq!(child_names(&stage, one)?, vec!["geom".to_string()]);
+
+    // Asymmetric: `/Instance_2` is included whole, `/Instance_1` only through
+    // `geom`, so the two cannot share one composed subtree.
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Instance_1/geom", "/Instance_2"])?)
+        .open(&fixture)?;
+    let one = stage.prim("/Instance_1")?.prototype()?.expect("an instance");
+    let two = stage.prim("/Instance_2")?.prototype()?.expect("an instance");
+    assert_ne!(one, two, "instances the mask reaches differently split");
+    assert_eq!(child_names(&stage, one)?, vec!["geom".to_string()]);
+    assert_eq!(
+        child_names(&stage, two)?,
+        vec!["geom".to_string(), "shading".to_string()]
+    );
+    Ok(())
+}
+
+/// An instance the mask covers whole keys the same however it was reached, so
+/// two fully-included instances still share; one the mask excludes is not
+/// populated and registers nothing at all (spec 11.3.3).
+#[test]
+fn mask_relative_sharing() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Instance_1", "/Instance_2"])?)
+        .open(&fixture_path("instancing_mask_split.usda"))?;
+    let one = stage.prim("/Instance_1")?.prototype()?.expect("an instance");
+    assert_eq!(stage.prim("/Instance_2")?.prototype()?, Some(one.clone()));
+    assert_eq!(stage.prototypes()?, vec![one.clone()]);
+    assert_eq!(
+        stage.prim(one)?.instances()?,
+        paths(&["/Instance_1", "/Instance_2"]),
+        "both instances registered"
+    );
+
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Instance_1"])?)
+        .open(&fixture_path("instancing_mask_split.usda"))?;
+    let one = stage.prim("/Instance_1")?.prototype()?.expect("an instance");
+    assert!(!stage.prim("/Instance_2")?.is_instance()?, "excluded, so not populated");
+    assert_eq!(stage.prim("/Instance_2")?.prototype()?, None);
+    assert_eq!(stage.prim(one)?.instances()?, paths(&["/Instance_1"]));
+    Ok(())
+}
+
+/// The prototype namespace is addressable on a masked stage without first
+/// reaching it through an instance: the query completes stage population, and
+/// the prototype then resolves the content the mask admits (spec 11.3.3).
+#[test]
+fn masked_cold_prototype_query() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Instance_1/geom"])?)
+        .open(&fixture_path("instancing_mask_split.usda"))?;
+
+    // Nothing has touched an instance yet.
+    let proto = first_prototype(&stage)?;
+    assert_eq!(child_names(&stage, proto.clone())?, vec!["geom".to_string()]);
+    assert_eq!(
+        stage
+            .attribute(proto.append_path("geom")?.append_property("size")?)?
+            .get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(1.0)
+    );
+    assert_eq!(
+        stage
+            .attribute(proto.append_path("shading")?.append_property("size")?)?
+            .get_at::<f64>(usd::TimeCode::new(0.0))?,
+        None,
+        "the mask does not name shading, so the prototype does not compose it"
+    );
+    Ok(())
+}
+
+/// A nested prototype resolves cold under a mask naming only the outer
+/// instance: discovery walks each prototype namespace it registers, so the
+/// inner one is reachable without any proxy query (spec 11.3.3).
+#[test]
+fn nested_prototype_cold_query() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/A"])?)
+        .open(&fixture_path("instancing_nested_in_prototype.usda"))?;
+
+    let roots = stage.prototypes()?;
+    assert_eq!(roots.len(), 2, "an outer and a nested prototype: {roots:?}");
+    let outer = stage.prim("/A")?.prototype()?.expect("/A is an instance");
+    let nested = roots
+        .into_iter()
+        .find(|root| *root != outer)
+        .expect("a second prototype");
+    assert_eq!(
+        stage.prim(nested)?.instances()?,
+        vec![outer.append_path("Nested")?],
+        "the nested prototype's instance is the prim inside the enclosing one"
+    );
+    Ok(())
+}
+
+/// Population gates registration, not just the mask: an inactive instance — or
+/// one under an inactive ancestor — is no instance at all, so it mints no
+/// prototype, and reactivating restores both (C++ `_NameChildrenPred`).
+#[test]
+fn inactive_instance_not_populated() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    assert!(stage.prim("/A")?.is_instance()?);
+
+    stage.prim("/A")?.set_active(false)?;
+    assert!(!stage.prim("/A")?.is_instance()?, "an inactive prim is not populated");
+    assert_eq!(stage.prim("/A")?.prototype()?, None);
+    let a = sdf::path("/A")?;
+    for root in stage.prototypes()? {
+        assert!(
+            !stage.prim(root.clone())?.instances()?.contains(&a),
+            "{root} still lists the deactivated instance"
+        );
+    }
+
+    stage.prim("/A")?.set_active(true)?;
+    assert!(stage.prim("/A")?.is_instance()?, "reactivating restores the instance");
+    assert!(stage.prim("/A")?.prototype()?.is_some());
+    Ok(())
+}
+
+/// Deactivating the last instance of a prototype retires it: the `active` edit
+/// is significant, so the registry drops the root its instance chain named.
+#[test]
+fn deactivating_retires_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    let solo = stage.prim("/C")?.prototype()?.expect("/C is an instance");
+    assert!(stage.prototypes()?.contains(&solo));
+
+    stage.prim("/C")?.set_active(false)?;
+    assert!(
+        !stage.prototypes()?.contains(&solo),
+        "the prototype went with its only instance"
+    );
+    Ok(())
+}
+
+/// Discovery runs whenever the population epoch has moved, not only when the
+/// queried root is unknown: an edit that adds an instance to a prototype that
+/// already exists leaves the root looking registered while its instance list
+/// is short one entry.
+#[test]
+fn rediscovery_on_known_root() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Proto/Child")?;
+    let instance = |path: &str| -> Result<()> {
+        stage.define_prim(path)?.set_metadata(
+            sdf::FieldKey::References.as_str(),
+            vt::Value::ReferenceListOp(sdf::ReferenceListOp::prepended([sdf::Reference {
+                prim_path: sdf::path("/Proto")?,
+                ..Default::default()
+            }])),
+        )?;
+        stage
+            .prim(path)?
+            .set_metadata(sdf::FieldKey::Instanceable.as_str(), vt::Value::Bool(true))?;
+        Ok(())
+    };
+
+    instance("/A")?;
+    let proto = first_prototype(&stage)?;
+    assert_eq!(stage.prim(proto.clone())?.instances()?, paths(&["/A"]));
+
+    // A second instance of the same composition joins the prototype that
+    // already exists, so the root stays registered while its membership grows.
+    instance("/B")?;
+    assert_eq!(
+        stage.prim(proto)?.instances()?,
+        paths(&["/A", "/B"]),
+        "the new instance is found without touching it"
+    );
+    Ok(())
+}
+
+/// `is_in_prototype` is namespace membership *and* existence: the registered
+/// root answers `true` as C++ does, an existing descendant does too, a missing
+/// one does not, and an ordinary instance proxy — which lives in its
+/// instance's namespace — is outside it (spec 11.3.3).
+#[test]
+fn in_prototype_is_inclusive() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    let proto = stage.prim("/A")?.prototype()?.expect("/A is an instance");
+
+    assert!(stage.prim(proto.clone())?.is_in_prototype()?, "the root itself");
+    assert!(stage.prim(proto.append_path("Child")?)?.is_in_prototype()?);
+    assert!(
+        !stage.prim(proto.append_path("Missing")?)?.is_in_prototype()?,
+        "a path that composes to no prim"
+    );
+    assert!(!stage.prim("/A/Child")?.is_in_prototype()?, "an instance proxy");
+    Ok(())
+}
+
+/// A load target in the reserved prototype namespace is a silent no-op — the
+/// test is syntactic, so it holds before any prototype is registered there.
+#[test]
+fn synthetic_load_target_ignored() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    let before = stage.load_rules();
+
+    stage.unload("/__Prototype_99")?;
+    stage.load("/__Prototype_99/Child", usd::LoadPolicy::WithDescendants)?;
+    assert_eq!(stage.load_rules(), before, "no rule was recorded either way");
+    Ok(())
+}
+
+/// A prototype path resolves its schema type without a prior instance query,
+/// and the identity is remembered rather than re-derived: population completes
+/// before the query is answered, so nothing composes into that namespace
+/// afterwards.
+#[test]
+fn prototype_type_resolves_cold() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    let proto = first_prototype(&stage)?;
+
+    let child = stage.prim(proto.append_path("Child")?)?;
+    let scope = Some(tf::Token::from("Scope"));
+    assert_eq!(child.type_name()?, scope);
+    assert_eq!(child.type_name()?, scope, "the memoized identity agrees");
+    Ok(())
+}
+
+/// A repaired target can reveal an instance the failed one hid, so dropping
+/// the failed indices advances the population epoch: `Stage::prototypes` then
+/// rediscovers without the repaired prim being touched first.
+#[test]
+fn epoch_covers_failure_recovery() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let target = dir.path().join("target.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+def \"P\" (
+    references = @target.usda@
+) {}
+",
+    )?;
+    fs::write(
+        &target,
+        "#usda 1.0
+def Broken {{{ not valid
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.prototypes()?.is_empty(),
+        "the unreadable target hides the instance"
+    );
+
+    // The repaired target makes `/P` instanceable. A retry clears the recorded
+    // failure; nothing queries `/P`.
+    fs::write(
+        &target,
+        "#usda 1.0
+(
+    defaultPrim = \"P\"
+)
+def \"P\" (
+    instanceable = true
+)
+{
+    def \"Child\" {
+        custom double x = 7
+    }
+}
+",
+    )?;
+    stage.retry_loads()?;
+
+    let roots = stage.prototypes()?;
+    assert_eq!(roots.len(), 1, "the newly revealed prototype is found: {roots:?}");
+    assert_eq!(stage.prim(roots[0].clone())?.instances()?, paths(&["/P"]));
+    Ok(())
+}
+
+/// Discovery stops at an inactive prim rather than descending: its subtree is
+/// not populated, so nothing under it composes — and a payload down there is
+/// never demanded.
+#[test]
+fn discovery_skips_inactive_subtree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+def \"Live\" (
+    instanceable = true
+    references = </Proto>
+) {}
+def \"Proto\" {
+    def \"Child\" {}
+}
+def \"Off\" (
+    active = false
+)
+{
+    def \"Deep\" (
+        payload = @missing.usda@
+    ) {}
+}
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.prototypes()?.len(), 1, "only the live instance registers");
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the payload under an inactive prim was never demanded: {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+const INACTIVE_PARENT: &str = "#usda 1.0
+def Xform \"P\" (
+    active = false
+)
+{
+    custom double x = 1
+    def Sphere \"C\"
+    {
+        custom double y = 2
+        def Scope \"D\" {}
+    }
+}
+";
+
+/// An inactive prim stays on the stage and answers its own reads, while its
+/// descendants are off it: no child list or traversal names them and no handle
+/// to one is valid (C++ `UsdStage::_ComposeChildren`). Their prim indices
+/// still compose, the composition tier being outside the stage's population.
+#[test]
+fn inactive_prim_no_descendants() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, INACTIVE_PARENT)?;
+
+    let p = stage.prim("/P")?;
+    assert!(p.is_valid()?);
+    assert!(!p.is_active()?);
+    assert_eq!(stage.attribute("/P.x")?.get::<f64>()?, Some(1.0));
+    assert!(p.child_names()?.is_empty());
+    assert!(p.children()?.is_empty());
+
+    for below in ["/P/C", "/P/C/D"] {
+        let prim = stage.prim(below)?;
+        assert!(!prim.is_valid()?, "{below}");
+        assert!(prim.child_names()?.is_empty(), "{below}");
+        assert!(prim.prim_stack()?.is_empty(), "{below}");
+        assert_eq!(stage.prim_status(below)?, PrimStatus::empty(), "{below}");
+    }
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, None);
+
+    let mut visited = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |path| visited.push(path.clone()))?;
+    assert_eq!(visited, paths(&["/P"]));
+
+    let (children, _) = stage.prim_index("/P")?.child_names()?;
+    assert_eq!(children, vec![tf::Token::new("C")]);
+    assert_eq!(stage.prim_index("/P/C")?.prim_stack()?.len(), 1);
+    Ok(())
+}
+
+/// A direct read below an inactive prim composes nothing there and never
+/// demands the payload authored below it. The same payload under an active
+/// parent reports its missing target.
+#[test]
+fn inactive_subtree_never_loads() -> Result<()> {
+    let scene = |active: bool| {
+        format!(
+            "#usda 1.0
+def \"Parent\" (
+    active = {active}
+)
+{{
+    def \"Deep\" (
+        payload = @missing.usda@
+    ) {{
+        def \"Leaf\" {{}}
+    }}
+}}
+"
+        )
+    };
+
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, &scene(false))?;
+    assert!(!stage.prim("/Parent/Deep/Leaf")?.is_valid()?);
+    assert!(child_names(&stage, "/Parent/Deep")?.is_empty());
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the payload under an inactive prim was never demanded: {:?}",
+        stage.composition_errors()
+    );
+
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, &scene(true))?;
+    assert!(stage.prim("/Parent/Deep/Leaf")?.is_valid()?);
+    assert!(
+        !stage.composition_errors().is_empty(),
+        "the same payload under an active prim is demanded"
+    );
+    Ok(())
+}
+
+/// Forwarding keeps a target on a relationship below an inactive prim as it
+/// is authored, without composing the prim that owns it (C++
+/// `UsdRelationship::GetForwardedTargets`, which follows a relationship only
+/// through a valid prim).
+#[test]
+fn forwarding_stops_at_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+def \"A\" {
+    rel r = </Off/Deep.r>
+}
+def \"X\" {}
+def \"Off\" (
+    active = false
+)
+{
+    def \"Deep\" (
+        payload = @missing.usda@
+    ) {
+        rel r = </X>
+    }
+}
+",
+    )?;
+
+    assert_eq!(fwd_targets(&stage, &sdf::path("/A.r")?)?, paths(&["/Off/Deep.r"]));
+    assert!(rel_targets(&stage, &sdf::path("/Off/Deep.r")?)?.is_empty());
+    assert!(
+        stage.composition_errors().is_empty(),
+        "the payload under an inactive prim was never demanded: {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Deactivating a prim takes its descendants off the stage and reactivating
+/// it brings them back, with the answers cached in between retired.
+#[test]
+fn activation_toggles_descendants() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\ndef \"P\" {\n    def \"C\" {\n        def \"D\" {}\n    }\n}\n",
+    )?;
+
+    let on_stage = |stage: &Stage| -> Result<(Vec<String>, bool, bool)> {
+        Ok((
+            child_names(stage, "/P")?,
+            stage.prim("/P/C")?.is_valid()?,
+            stage.prim("/P/C/D")?.is_valid()?,
+        ))
+    };
+    assert_eq!(on_stage(&stage)?, (vec!["C".to_string()], true, true));
+
+    stage.prim("/P")?.set_active(false)?;
+    assert_eq!(on_stage(&stage)?, (Vec::new(), false, false));
+    assert!(stage.prim("/P")?.is_valid()?);
+
+    stage.prim("/P")?.set_active(true)?;
+    assert_eq!(on_stage(&stage)?, (vec!["C".to_string()], true, true));
+    Ok(())
+}
+
+/// Defining a prim below an inactive one authors its spec, but the stage does
+/// not hold the prim: the returned handle is invalid and takes no write until
+/// the parent is reactivated (C++ `UsdStage::DefinePrim`).
+#[test]
+fn define_below_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(&dir, INACTIVE_PARENT)?;
+
+    let new = stage.define_prim("/P/New")?;
+    assert!(!new.is_valid()?);
+    assert_eq!(
+        stage.prim_index("/P/New")?.prim_stack()?.len(),
+        1,
+        "the spec is authored"
+    );
+    assert!(matches!(
+        new.clone().set_kind("component"),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+
+    stage.prim("/P")?.set_active(true)?;
+    assert!(new.is_valid()?);
+    assert_eq!(child_names(&stage, "/P")?, ["C", "New"]);
+    new.set_kind("component")?;
+    Ok(())
+}
+
+/// Defining a prim defines the ancestors it is under (C++
+/// `UsdStage::DefinePrim`): a missing or `over` ancestor becomes a `def` with
+/// its type kept, and a `class` ancestor, defining already, stays one.
+#[test]
+fn define_defines_ancestors() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\n\
+         over Scope \"Over\" {}\n\
+         class \"Class\" {}\n",
+    )?;
+    stage.define_prim("/Over/New/Leaf")?;
+    stage.define_prim("/Class/Leaf")?;
+    for path in ["/Over", "/Over/New", "/Over/New/Leaf", "/Class/Leaf"] {
+        let prim = stage.prim(path)?;
+        assert_eq!(prim.specifier()?, Some(sdf::Specifier::Def), "{path}");
+        assert!(prim.is_defined()?, "{path}");
+    }
+    assert_eq!(stage.prim("/Over")?.type_name()?.expect("a type").as_str(), "Scope");
+    assert_eq!(stage.prim("/Class")?.specifier()?, Some(sdf::Specifier::Class));
+    Ok(())
+}
+
+/// A prim the stage holds as defined takes no spec from a define: one a
+/// weaker layer defines gets nothing on the edit target, and a `class` stays
+/// one, unless the define names another type (C++ `UsdStage::DefinePrim`).
+#[test]
+fn define_leaves_defined() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0\ndef Scope \"A\" {}\nclass \"Rig\" {}\n",
+    )?;
+    let stage = open_text(&dir, "#usda 1.0\n(\n    subLayers = [@./weak.usda@]\n)\n")?;
+
+    stage.define_prim("/A/B")?;
+    // The chain to `/A/B` holds `/A` as an `over`, as the layer tier creates
+    // it; the weaker layer's def is left to define it.
+    let specifier = stage.root_layer().prim("/A")?.expect("the chain to /A/B").specifier()?;
+    assert_ne!(specifier, Some(sdf::Specifier::Def));
+    assert!(stage.prim("/A/B")?.is_defined()?);
+
+    stage.define_prim("/Rig")?;
+    assert!(stage.root_layer().prim("/Rig")?.is_none(), "a class is defined");
+    assert_eq!(stage.prim("/Rig")?.specifier()?, Some(sdf::Specifier::Class));
+
+    stage.define_typed_prim("/Rig", "Xform")?;
+    assert_eq!(stage.prim("/Rig")?.specifier()?, Some(sdf::Specifier::Def));
+    assert_eq!(stage.prim("/Rig")?.type_name()?.expect("a type").as_str(), "Xform");
+    Ok(())
+}
+
+/// A property write needs a prim the stage holds: below an inactive prim every
+/// creation and every write to an existing property is refused and authors
+/// nothing (C++ authoring through an invalid `UsdPrim`). After reactivation
+/// the write stamps the declaration the weaker layer gives the property.
+#[test]
+fn property_write_below_inactive() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0
+def \"P\" {
+    def \"C\" {
+        double radius = 1
+        rel proxy
+    }
+}
+",
+    )?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+(
+    subLayers = [@weak.usda@]
+)
+over \"P\" (
+    active = false
+) {}
+",
+    )?;
+
+    let not_valid = |result: Result<(), StageAuthoringError>| {
+        assert!(
+            matches!(result, Err(StageAuthoringError::PrimNotValid { .. })),
+            "{result:?}"
+        );
+    };
+    not_valid(stage.create_attribute("/P/C.radius", "float").map(drop));
+    not_valid(stage.create_attribute("/P/C.fresh", "float").map(drop));
+    not_valid(stage.create_relationship("/P/C.radius").map(drop));
+    not_valid(stage.create_relationship("/P/C.proxy").map(drop));
+    not_valid(stage.attribute("/P/C.radius")?.set(2.0).map(drop));
+    not_valid(stage.attribute("/P/C.radius")?.clear().map(drop));
+    not_valid(stage.relationship("/P/C.proxy")?.set_targets(["/P"]).map(drop));
+    not_valid(stage.relationship("/P/C.proxy")?.clear_targets().map(drop));
+    assert!(
+        stage.root_layer().prim("/P/C")?.is_none(),
+        "a refused write authors nothing"
+    );
+
+    stage.prim("/P")?.set_active(true)?;
+    let radius = stage.create_attribute("/P/C.radius", "float")?.set(2.0)?;
+    assert_eq!(radius.get::<f64>()?, Some(2.0), "stamped as the weaker layer's double");
+    assert!(matches!(
+        stage.create_relationship("/P/C.radius"),
+        Err(StageAuthoringError::SpecKindMismatch { .. })
+    ));
+    stage.relationship("/P/C.proxy")?.set_targets(["/P"])?;
+    assert_eq!(rel_targets(&stage, &sdf::path("/P/C.proxy")?)?, paths(&["/P"]));
+    Ok(())
+}
+
+/// A property write is refused on a prim the population mask excludes, as it
+/// is below an inactive prim.
+#[test]
+fn property_write_masked_out() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"Vis\" {}\ndef \"Hidden\" {\n    double x = 1\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Vis"])?)
+        .open(root.to_str().unwrap())?;
+
+    assert!(matches!(
+        stage.create_attribute("/Hidden.x", "double"),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+    assert!(matches!(
+        stage.attribute("/Hidden.x")?.set(2.0),
+        Err(StageAuthoringError::PrimNotValid { .. })
+    ));
+    stage.create_attribute("/Vis.x", "double")?.set(2.0)?;
+    Ok(())
+}
+
+/// A prim that exists only inside a variant the stage has not selected takes
+/// property writes through an edit target on that variant, at any depth: the
+/// population does not exclude it though nothing composes there.
+#[test]
+fn property_write_unselected_variant() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/World")?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.set_edit_target(EditTarget::for_local_direct_variant(root, "/World{set=sel}")?)?;
+
+    let only = stage.define_prim("/World/Only")?;
+    assert!(!only.is_valid()?, "the variant is not selected");
+    stage.create_attribute("/World/Only.x", "double")?;
+    stage.create_relationship("/World/Only.r")?.set_targets(["/World"])?;
+
+    stage.define_prim("/World/Only/Child")?;
+    stage.create_attribute("/World/Only/Child.x", "double")?;
+    stage
+        .create_relationship("/World/Only/Child.r")?
+        .set_targets(["/World"])?;
+
+    let layer = stage.root_layer();
+    assert!(layer.attribute("/World{set=sel}Only.x")?.is_some());
+    assert!(layer.relationship("/World{set=sel}Only.r")?.is_some());
+    assert!(layer.attribute("/World{set=sel}Only/Child.x")?.is_some());
+    assert!(layer.relationship("/World{set=sel}Only/Child.r")?.is_some());
+    Ok(())
+}
+
+/// A prim write under a variant edit target authors inside the variant.
+#[test]
+fn edit_under_variant_target() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let mat = stage.define_prim("/Mat")?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.set_edit_target(EditTarget::for_local_direct_variant(root, "/Mat{v=a}")?)?;
+    mat.set_kind("component")?;
+
+    let layer = stage.root_layer();
+    let variant = layer.prim("/Mat{v=a}")?.expect("the variant spec");
+    assert_eq!(variant.kind()?.as_deref(), Some("component"));
+    assert_eq!(layer.prim("/Mat")?.expect("the prim spec").kind()?, None);
+    Ok(())
+}
+
+/// Over a weaker layer's selection, a cleared selection lets it compose and
+/// a blocked one hides it.
+#[test]
+fn variant_selection_states() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0\ndef \"Mat\" (\n    variants = {\n        string v = \"a\"\n    }\n    prepend variantSets = \"v\"\n) {\n    \
+         variantSet \"v\" = {\n        \"a\" {}\n        \"b\" {}\n    }\n}\n",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@./weak.usda@]\n)\n")?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let selection = || -> Result<Vec<(String, String)>> { stage.prim("/Mat")?.variant_sets().selections() };
+    let author = |f: fn(&mut sdf::PrimSpecMut<'_>) -> Result<(), sdf::AuthoringError>| -> Result<()> {
+        stage.root_layer().edit(|e| {
+            f(&mut sdf::PrimSpec::over(e.data_mut(), "/Mat")?)?;
+            Ok(())
+        })?;
+        Ok(())
+    };
+
+    author(|spec| spec.set_variant_selection("v", "b"))?;
+    assert_eq!(selection()?, [("v".to_string(), "b".to_string())]);
+    author(|spec| spec.clear_variant_selection("v"))?;
+    assert_eq!(selection()?, [("v".to_string(), "a".to_string())]);
+    author(|spec| spec.block_variant_selection("v"))?;
+    assert!(selection()?.is_empty());
+    Ok(())
+}
+
+/// A stage over `fixture` with an empty session layer, whose identifier it
+/// answers too.
+fn with_session(fixture: &str) -> Result<(tempfile::TempDir, Stage, String)> {
+    let dir = tempfile::tempdir()?;
+    let session = dir.path().join("session.usda");
+    fs::write(&session, "#usda 1.0\n")?;
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(fixture)?;
+    let session = stage.session_layer().expect("a session layer").identifier().to_string();
+    Ok((dir, stage, session))
+}
+
+/// C++ `testUsdVariants.py`'s `test_VariantSetAPI`.
+#[test]
+fn variant_set_api() -> Result<()> {
+    let (_dir, stage, session) = with_session("fixtures/variants_milk_carton.usda")?;
+    let prim = stage.prim("/MilkCartonA")?;
+    let sets = prim.variant_sets();
+    assert!(sets.contains("modelingVariant")?);
+    let modeling = prim.variant_set("modelingVariant");
+    assert_eq!(modeling.name(), "modelingVariant");
+    assert_eq!(modeling.selection()?.as_deref(), Some("Carton_Opened"));
+    assert_eq!(modeling.names()?, ["ALL_VARIANTS", "Carton_Opened", "Carton_Sealed"]);
+    assert!(sets.contains("shadingComplexity")?);
+    assert!(!sets.contains("localDanglingVariant")?);
+    assert!(!sets.contains("referencedDanglingVariant")?);
+
+    stage.set_edit_target(EditTarget::for_layer(session))?;
+    modeling.set_selection("Carton_Sealed")?;
+    assert_eq!(modeling.selection()?.as_deref(), Some("Carton_Sealed"));
+    modeling.clear_selection()?;
+    assert_eq!(modeling.selection()?.as_deref(), Some("Carton_Opened"));
+    modeling.block_selection()?;
+    assert_eq!(modeling.selection()?, None);
+    Ok(())
+}
+
+/// The variants of a set are gathered from every node of the prim's index,
+/// a referenced site and one under a variant selection included.
+#[test]
+fn variant_names_composed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "Lib" {
+    def "Mat" (
+        prepend variantSets = "materialVariant"
+    ) {
+        variantSet "materialVariant" = {
+            "b" {}
+            "c" {}
+        }
+    }
+}
+def "Mat" (
+    prepend references = </Lib/Mat>
+    prepend variantSets = "materialVariant"
+) {
+    variantSet "materialVariant" = {
+        "a" {}
+        "b" {}
+    }
+}
+def "Shapes" (
+    variants = {
+        string shape = "round"
+    }
+    prepend variantSets = "shape"
+) {
+    variantSet "shape" = {
+        "round" {
+            def "Mat" (
+                prepend variantSets = "materialVariant"
+            ) {
+                variantSet "materialVariant" = {
+                    "d" {}
+                }
+            }
+        }
+    }
+}
+def "Round" (
+    prepend references = </Shapes/Mat>
+) {}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let names = |path: &str| stage.prim(path)?.variant_set("materialVariant").names();
+    assert_eq!(names("/Mat")?, ["a", "b", "c"]);
+    assert_eq!(names("/Round")?, ["d"]);
+    assert_eq!(stage.prim("/Mat")?.variant_sets().names()?, ["materialVariant"]);
+    Ok(())
+}
+
+/// A prim authored through a variant's edit target composes at its scene
+/// path, and the variant-selection path names no prim (C++
+/// `testUsdVariants.py`'s `test_VariantSelectionPathAbstraction`).
+#[test]
+fn variant_selection_paths() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let foo = stage.override_prim("/Foo")?;
+    let sets = foo.variant_sets();
+    assert!(sets.names()?.is_empty());
+    let lod = sets.add("LOD", usd::ListPosition::BackOfPrepend)?;
+    assert_eq!(sets.names()?, ["LOD"]);
+    lod.add_variant("High", usd::ListPosition::BackOfPrepend)?;
+    lod.set_selection("High")?;
+    {
+        let _context = stage.edit_context(lod.edit_target(None)?)?;
+        stage.define_prim("/Foo/Foobar")?.set_type_name("Scope")?;
+    }
+    assert!(stage.prim("/Foo/Foobar")?.is_valid()?);
+    assert!(!stage.prim("/Foo{LOD=High}Foobar")?.is_valid()?);
+    Ok(())
+}
+
+/// Variant sets nest inside a variant's edit context (C++
+/// `testUsdVariants.py`'s `test_NestedVariantSets`).
+#[test]
+fn nested_variant_sets() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let foo = stage.define_prim("/Foo")?.set_type_name("Scope")?;
+    let sets = foo.variant_sets();
+    let lod = sets.add("LOD", usd::ListPosition::BackOfPrepend)?;
+    lod.add_variant("High", usd::ListPosition::BackOfPrepend)?;
+    lod.set_selection("High")?;
+    {
+        let _lod = stage.edit_context(lod.edit_target(None)?)?;
+        let costume = sets.add("Costume", usd::ListPosition::BackOfPrepend)?;
+        costume.add_variant("Spooky", usd::ListPosition::BackOfPrepend)?;
+        costume.set_selection("Spooky")?;
+        {
+            let _costume = stage.edit_context(costume.edit_target(None)?)?;
+            stage.define_prim("/Foo/SpookyHat")?.set_type_name("Cone")?;
+        }
+        let stuff = stage.define_prim("/Foo/DetailedStuff")?.set_type_name("Scope")?;
+        let variant = stuff
+            .variant_sets()
+            .add("StuffVariant", usd::ListPosition::BackOfPrepend)?;
+        variant.add_variant("A", usd::ListPosition::BackOfPrepend)?;
+        variant.set_selection("A")?;
+        let _stuff = stage.edit_context(variant.edit_target(None)?)?;
+        stage
+            .define_prim("/Foo/DetailedStuff/StuffA")?
+            .set_type_name("Sphere")?;
+    }
+    assert_eq!(sets.names()?, ["LOD", "Costume"]);
+    assert!(stage.prim("/Foo/SpookyHat")?.is_valid()?);
+    assert!(stage.prim("/Foo/DetailedStuff/StuffA")?.is_valid()?);
+    assert!(
+        stage
+            .root_layer()
+            .prim("/Foo{LOD=High}{Costume=Spooky}SpookyHat")?
+            .is_some()
+    );
+    Ok(())
+}
+
+/// The edit target maps the prim through the current edit target, and uses
+/// the composed selection, a stronger layer's over the target layer's.
+#[test]
+fn variant_edit_target() -> Result<()> {
+    let (_dir, stage, session) = with_session("fixtures/variants_milk_carton.usda")?;
+    let root = stage.root_layer().identifier().to_string();
+    let modeling = stage.prim("/MilkCartonA")?.variant_set("modelingVariant");
+    stage.set_edit_target(EditTarget::for_layer(session))?;
+    modeling.set_selection("Carton_Sealed")?;
+
+    let target = modeling.edit_target(Some(&root))?;
+    assert_eq!(target.layer_identifier(), root);
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/MilkCartonA/Child")?),
+        Some(sdf::path("/MilkCartonA{modelingVariant=Carton_Sealed}Child")?)
+    );
+
+    // Under a variant target the prim maps into that variant first.
+    stage.set_edit_target(EditTarget::for_local_direct_variant(root.clone(), "/MilkCartonA{v=x}")?)?;
+    let target = modeling.edit_target(None)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/MilkCartonA")?),
+        Some(sdf::path("/MilkCartonA{v=x}{modelingVariant=Carton_Sealed}")?)
+    );
+    Ok(())
+}
+
+/// A set a stronger layer deletes from `variantSetNames` is neither named nor
+/// evaluated, its spec and selection notwithstanding.
+#[test]
+fn variant_set_deleted() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        "#usda 1.0\ndef \"Mat\" (\n    variants = {\n        string v = \"a\"\n    }\n    prepend variantSets = \"v\"\n) {\n    \
+         variantSet \"v\" = {\n        \"a\" {\n            def \"FromA\" {}\n        }\n    }\n}\n",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@./weak.usda@]\n)\nover \"Mat\" (\n    delete variantSets = \"v\"\n) {}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let mat = stage.prim("/Mat")?;
+    assert!(!mat.variant_sets().contains("v")?);
+    assert_eq!(mat.variant_set("v").selection()?, None);
+    assert!(!stage.prim("/Mat/FromA")?.is_valid()?);
+    Ok(())
+}
+
+/// A set selecting no variant has no edit target, and neither has a layer
+/// that is not local.
+#[test]
+fn edit_target_no_selection() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let foo = stage.define_prim("/Foo")?;
+    assert!(matches!(
+        foo.variant_set("none").edit_target(None),
+        Err(StageAuthoringError::NoVariantSelection { .. })
+    ));
+    let lod = foo.variant_sets().add("LOD", usd::ListPosition::BackOfPrepend)?;
+    lod.add_variant("High", usd::ListPosition::BackOfPrepend)?;
+    lod.set_selection("High")?;
+    assert!(matches!(
+        lod.edit_target(Some("missing.usda")),
+        Err(StageAuthoringError::LayerNotFound { .. })
+    ));
+    Ok(())
+}
+
+/// A move onto a path below an inactive prim sees the stage, where nothing
+/// occupies the destination, though a reference composes a prim there. The
+/// move is authored, and reactivating the parent composes the moved spec over
+/// the referenced prim.
+#[test]
+fn move_below_inactive_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\ndef \"M\" {\n    def \"C\" {\n        double fromRef = 1\n    }\n}\n",
+    )?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0
+def \"A\" {
+    double local = 2
+}
+def \"P\" (
+    active = false
+    references = @ref.usda@</M>
+) {}
+",
+    )?;
+    assert_eq!(
+        stage.prim_index("/P/C")?.prim_stack()?.len(),
+        1,
+        "the reference composes /P/C"
+    );
+
+    let mut editor = usd::NamespaceEditor::new(&stage);
+    editor.move_prim("/A", "/P/C").unwrap();
+    editor.apply()?;
+    assert!(!stage.prim("/A")?.is_valid()?);
+    assert!(!stage.prim("/P/C")?.is_valid()?, "/P is still inactive");
+
+    stage.prim("/P")?.set_active(true)?;
+    assert_eq!(stage.attribute("/P/C.local")?.get::<f64>()?, Some(2.0));
+    assert_eq!(stage.attribute("/P/C.fromRef")?.get::<f64>()?, Some(1.0));
+    Ok(())
+}
+
+/// An ancestor whose `active` is not a bool cannot say whether its descendants
+/// are on the stage, so reads below it fail. Repairing the field restores
+/// them, with no failure left cached.
+#[test]
+fn malformed_active_fails_reads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        "#usda 1.0\ndef \"P\" {\n    def \"C\" {\n        double y = 2\n    }\n}\n",
+    )?;
+    let set_active = |value: vt::Value| -> Result<()> {
+        stage.root_layer().edit(|e| {
+            e.data_mut()
+                .set_field(&sdf::path("/P")?, sdf::FieldKey::Active.as_str(), value);
+            Ok(())
+        })?;
+        Ok(())
+    };
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, Some(2.0));
+
+    set_active(vt::Value::Int(5))?;
+    assert!(stage.prim("/P/C")?.is_valid().is_err());
+    assert!(stage.attribute("/P/C.y")?.get::<f64>().is_err());
+    assert!(stage.prim("/P")?.child_names().is_err());
+
+    set_active(vt::Value::Bool(true))?;
+    assert!(stage.prim("/P/C")?.is_valid()?);
+    assert_eq!(stage.attribute("/P/C.y")?.get::<f64>()?, Some(2.0));
+    assert_eq!(child_names(&stage, "/P")?, ["C"]);
+    Ok(())
+}
+
+/// Discovery spans branches that pull in different layers, each settling its
+/// own loading, and must still stamp one coherent population: `/A`'s prototype
+/// survives `/B` demanding a target of its own, whose `${VAR}` sublayer
+/// resolves later still.
+#[test]
+fn discovery_spans_branches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+(
+    expressionVariables = {
+        string WHICH = \"pick\"
+    }
+)
+def \"A\" (
+    instanceable = true
+    references = @early.usda@
+) {}
+def \"B\" (
+    references = @holder.usda@
+) {}
+",
+    )?;
+    fs::write(
+        dir.path().join("early.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Early\"
+)
+def \"Early\" {
+    def \"Child\" {}
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("holder.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Holder\"
+    subLayers = [@`\"${WHICH}.usda\"`@]
+)
+def \"Holder\" {}
+",
+    )?;
+    fs::write(
+        dir.path().join("pick.usda"),
+        "#usda 1.0
+
+over \"Holder\" {}
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let roots = stage.prototypes()?;
+    assert_eq!(roots.len(), 1, "the earlier branch's prototype survives: {roots:?}");
+    assert_eq!(stage.prim(roots[0].clone())?.instances()?, paths(&["/A"]));
+    assert_eq!(child_names(&stage, roots[0].clone())?, vec!["Child".to_string()]);
+    Ok(())
+}
+
+/// A mask naming a path *inside* an instance populates the prototype through
+/// it, and does so across nesting and deferred payload loading: the mask reads
+/// the same before and after `load`, because it is anchored on the instance
+/// namespace its author wrote rather than the synthetic prototype path.
+///
+/// Ported from OpenUSD `testUsdBugs.py::test_USD_5709`.
+#[test]
+fn masked_instance_payload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+def \"Outer\" (
+    instanceable = true
+    references = @model.usda@
+) {}
+",
+    )?;
+    fs::write(
+        dir.path().join("model.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Model\"
+)
+def \"Model\" {
+    def \"geom\" {
+        custom double size = 1
+    }
+    def \"shading\" {}
+    def \"Inner\" (
+        instanceable = true
+        payload = @inner.usda@
+    ) {}
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("inner.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Inner\"
+)
+def \"Inner\" {
+    def \"Leaf\" {
+        custom double size = 2
+    }
+}
+",
+    )?;
+
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/Outer/geom", "/Outer/Inner"])?)
+        .load(usd::InitialLoadSet::LoadNone)
+        .open(root.to_str().unwrap())?;
+
+    // Cold, with the payload unloaded: the outer prototype exposes the masked
+    // children and nothing else.
+    let outer = first_prototype(&stage)?;
+    assert_eq!(
+        child_names(&stage, outer.clone())?,
+        vec!["geom".to_string(), "Inner".to_string()],
+        "shading is outside the mask"
+    );
+    assert_eq!(
+        stage
+            .attribute(outer.append_path("geom")?.append_property("size")?)?
+            .get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(1.0)
+    );
+
+    // Loading the payload exposes the nested instance's own prototype, still
+    // resolved against the same mask. The load state is part of the instancing
+    // key, so `/Outer` re-keys onto a fresh prototype rather than mutating the
+    // one composed without the payload.
+    stage.load("/Outer/Inner", usd::LoadPolicy::WithDescendants)?;
+    let outer = stage.prim("/Outer")?.prototype()?.expect("/Outer is still an instance");
+    let nested = stage
+        .prim(outer.append_path("Inner")?)?
+        .prototype()?
+        .expect("the nested prim is an instance");
+    assert_eq!(
+        stage
+            .attribute(nested.append_path("Leaf")?.append_property("size")?)?
+            .get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(2.0),
+        "the nested prototype composes the loaded payload"
+    );
+    assert!(
+        stage.prototypes()?.contains(&nested),
+        "the nested prototype joins the stage's set"
+    );
+    Ok(())
+}
+
+/// A prim whose index was cached while it had no spec must recompose when one
+/// is first authored beneath it on a layer its graph never touched — the
+/// self-registration that keeps an empty index findable.
+#[test]
+fn empty_index_sees_child() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let extra = dir.path().join("extra.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+(
+    subLayers = [@extra.usda@]
+)
+def \"A\" {}
+",
+    )?;
+    fs::write(
+        &extra,
+        "#usda 1.0
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(child_names(&stage, "/A")?.is_empty(), "nothing below /A yet");
+
+    let extra_id = identifier_by_leaf(&stage, "extra.usda");
+    stage.layer(&extra_id)?.expect("the sublayer is live").edit(|e| {
+        sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Over, "")?;
+        sdf::PrimSpec::new(e.data_mut(), "/A/B", sdf::Specifier::Def, "")?;
+        Ok(())
+    })?;
+
+    assert_eq!(
+        child_names(&stage, "/A")?,
+        vec!["B".to_string()],
+        "the first spec authored below /A reaches its cached index"
+    );
+    Ok(())
+}
+
+/// A demanded layer that introduces relocates invalidates the stacks that read
+/// it, so a branch discovery visited *earlier* is dropped mid-walk. The pass
+/// restarts until the population epoch holds still, and the stamped result is
+/// one coherent population rather than a mixture of two.
+#[test]
+fn discovery_restarts_on_late_load() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    // `/A` is walked first and registers its prototype; `/B` is walked after and
+    // only then demands `late.usda`, whose relocates restale the graph.
+    fs::write(
+        &root,
+        "#usda 1.0
+def \"A\" (
+    instanceable = true
+    references = @early.usda@
+) {}
+def \"B\" (
+    references = @late.usda@
+) {}
+",
+    )?;
+    fs::write(
+        dir.path().join("early.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Early\"
+)
+def \"Early\" {
+    def \"Child\" {}
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0
+(
+    defaultPrim = \"Late\"
+    relocates = {
+        </Late/Old>: </Late/New>
+    }
+)
+def \"Late\" {
+    def \"Old\" {}
+}
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let roots = stage.prototypes()?;
+    assert_eq!(roots.len(), 1, "the earlier branch's prototype survives: {roots:?}");
+    assert_eq!(stage.prim(roots[0].clone())?.instances()?, paths(&["/A"]));
+    assert_eq!(child_names(&stage, roots[0].clone())?, vec!["Child".to_string()]);
+    // The late layer really did compose, relocates and all.
+    assert!(stage.prim("/B")?.is_valid()?, "the late branch composed");
+    Ok(())
+}
+
+/// A prototype root is not an instance, whatever its composed `instanceable`
+/// opinion says (spec 11.3.3): the opinion describes the prims that share the
+/// prototype, not the prototype itself.
+#[test]
+fn prototype_root_not_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_prototype_root_instanceable.usda"))?;
+    let proto = stage
+        .prim("/World/Place")?
+        .prototype()?
+        .expect("/World/Place is an instance");
+
+    assert!(stage.prim(proto.clone())?.is_prototype()?);
+    assert!(!stage.prim(proto.clone())?.is_instance()?);
+    assert_eq!(stage.prim(proto)?.prototype()?, None);
+    Ok(())
+}
+
+/// A nested prototype survives a mask naming only the outer instance: it is
+/// reported among the stage's prototypes, its instance is the prim in the
+/// enclosing prototype, and its content stays readable (spec 11.3.3).
+#[test]
+fn nested_prototype_masked() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/A"])?)
+        .open(&fixture_path("instancing_nested_in_prototype.usda"))?;
+
+    let outer = stage.prim("/A")?.prototype()?.expect("/A is an instance");
+    let nested_instance = outer.append_path("Nested")?;
+    let nested = stage
+        .prim(nested_instance.clone())?
+        .prototype()?
+        .expect("the nested prim is an instance");
+
+    assert!(
+        stage.prototypes()?.contains(&nested),
+        "the nested prototype is populated"
+    );
+    assert_eq!(stage.prim(nested.clone())?.instances()?, vec![nested_instance]);
+    assert_eq!(
+        stage
+            .attribute(nested.append_path("Leaf")?.append_property("v")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(3.0))
+    );
+    Ok(())
+}
+
+/// A nested instance (an instance inside a prototype's subtree) is
+/// recognized, resolves values within the queried instance, and shares its
+/// own prototype across the outer instances (spec 11.3.3).
+#[test]
+fn nested_instances() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_nested.usda"))?;
+
+    assert_eq!(
+        stage
+            .attribute("/A/Sub/L.v")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/B/Sub/L.v")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0))
+    );
+
+    // The nested prims are instances and share one prototype.
+    assert!(stage.prim("/A/Sub")?.is_instance()?);
+    assert!(stage.prim("/B/Sub")?.is_instance()?);
+    let nested = stage.prim("/A/Sub")?.prototype()?;
+    assert!(nested.is_some());
+    assert_eq!(stage.prim("/B/Sub")?.prototype()?, nested);
+
+    // The outer instances share a distinct prototype.
+    let outer = stage.prim("/A")?.prototype()?;
+    assert_eq!(stage.prim("/B")?.prototype()?, outer);
+    assert_ne!(outer, nested);
+
+    // The nested subtree is also reachable through the outer prototype.
+    let outer = outer.unwrap();
+    assert_eq!(
+        stage
+            .attribute(sdf::path(format!("{outer}/Sub/L.v"))?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0))
+    );
+    Ok(())
+}
+
+/// A connection inside an instance subtree resolves within the queried
+/// instance, not the shared canonical instance (spec 11.3.3 + 11.3.4).
+#[test]
+fn instance_connection_remaps_to_instance() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_connections.usda"))?;
+
+    // Query /I1 first so it becomes canonical.
+    assert_eq!(
+        connections(&stage, &sdf::path("/I1/Dst.inputs:in")?)?,
+        vec![sdf::path("/I1/Src.outputs:out")?]
+    );
+    // /I2 shares the prototype; its connection must point into /I2.
+    assert_eq!(
+        connections(&stage, &sdf::path("/I2/Dst.inputs:in")?)?,
+        vec![sdf::path("/I2/Src.outputs:out")?]
+    );
+    Ok(())
+}
+
+/// A connection on a prototype *descendant* resolves in the prototype
+/// namespace when queried directly on the prototype, and remaps to the
+/// queried instance when reached through a proxy (spec 11.3.3 + 12.4).
+#[test]
+fn prototype_descendant_target_remap() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_connections.usda"))?;
+
+    // Query an instance proxy first to register the prototype; the target
+    // remaps into that instance's namespace.
+    assert_eq!(
+        connections(&stage, &sdf::path("/I1/Dst.inputs:in")?)?,
+        vec![sdf::path("/I1/Src.outputs:out")?]
+    );
+
+    // The same connection queried directly on the prototype descendant stays
+    // in the prototype namespace (no instance to remap to).
+    let proto = stage.prim("/I1")?.prototype()?.expect("I1 is an instance");
+    let dst_in = proto.append_path("Dst")?.append_property("inputs:in")?;
+    assert_eq!(
+        connections(&stage, &dst_in)?,
+        vec![proto.append_path("Src")?.append_property("outputs:out")?]
+    );
+    Ok(())
+}
+
+/// Forwarding through a relationship that lives inside an instance
+/// prototype resolves within the queried instance: the prototype rel is
+/// classified correctly (not mistaken for a terminal) and its targets
+/// remap into the instance namespace (spec 11.3.3 + 12.4).
+#[test]
+fn forwarded_targets_through_instance() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("asset.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Proto"
+)
+
+def "Proto"
+{
+    def "Target" {}
+    rel direct = [</Proto/Target>]
+    rel chain = [</Proto.direct>]
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+
+def "I1" (
+    instanceable = true
+    references = @asset.usda@
+)
+{
+}
+
+def "I2" (
+    instanceable = true
+    references = @asset.usda@
+)
+{
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    // chain -> direct (a prototype relationship) -> Target. Each hop stays
+    // in the queried instance's namespace.
+    assert_eq!(
+        fwd_targets(&stage, &sdf::path("/I1.chain")?)?,
+        vec![sdf::path("/I1/Target")?]
+    );
+    assert_eq!(
+        fwd_targets(&stage, &sdf::path("/I2.chain")?)?,
+        vec![sdf::path("/I2/Target")?]
+    );
+    Ok(())
+}
+
+/// Connection and schema readers descend into instance subtrees, so
+/// content inside an instance is not silently skipped. Public traversal
+/// stops at instances, but these readers need the full composed namespace.
+#[test]
+fn readers_index_instanced_content() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_connections.usda"))?;
+
+    let graph = usd::ConnectionGraph::from_stage(&stage)?;
+    // The connection lives inside the instance /I1; the reader must descend
+    // into the instance proxy to index it.
+    assert_eq!(
+        graph.sources(&sdf::path("/I1/Dst.inputs:in")?),
+        &[sdf::path("/I1/Src.outputs:out")?]
+    );
+    Ok(())
+}
+
+/// Default traversal stops at instance prims; `with_instance_proxies`
+/// descends into their subtrees (spec 11.3.3).
+#[test]
+fn traversal_instance_proxies() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    let mut default = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |p| default.push(p.to_string()))?;
+    assert!(default.contains(&"/A".to_string()));
+    assert!(!default.contains(&"/A/Child".to_string()));
+
+    let mut proxies = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT.with_instance_proxies(true), |p| {
+        proxies.push(p.to_string());
+    })?;
+    assert!(proxies.contains(&"/A/Child".to_string()));
+    Ok(())
+}
+
+/// A property authored at an instance root is local to the instance (spec
+/// 11.3.3). The instance keeps it, and the prototype root reads no opinions
+/// at all, since C++ reads a prototype root through an empty prim index. That
+/// the shared index drops the override is checked at the cache
+/// (`root_inerts_instance_overrides`).
+#[test]
+fn prototype_root_drops_instance_overrides() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_root_override.usda"))?;
+
+    // The instance root keeps its local overrides.
+    assert_eq!(
+        stage
+            .attribute("/A.shared")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(7.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/A.rootOnly")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(42.0))
+    );
+
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    for name in ["shared", "rootOnly"] {
+        assert_eq!(
+            stage
+                .attribute(proto.append_property(name)?)?
+                .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+            None,
+            "{name}"
+        );
+    }
+    Ok(())
+}
+
+/// The prototype namespace is addressable without ever touching an instance:
+/// stage population registers every prototype the first time a
+/// `/__Prototype_N` path is queried (spec 11.3.3).
+#[test]
+fn prototype_survives_early_query() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_root_override.usda"))?;
+
+    // Discovery, not an instance query, is what makes this resolve — the
+    // prototype path comes from the stage, since its number depends on nothing
+    // a caller can predict.
+    let proto = first_prototype(&stage)?;
+    let root = stage.prim(proto.clone())?;
+    assert!(root.is_valid()?);
+    assert!(root.is_prototype()?);
+
+    // Reaching the same prototype through its instance agrees.
+    assert_eq!(stage.prim("/A")?.prototype()?, Some(proto));
+    Ok(())
+}
+
+/// A prototype *descendant* resolves on the same terms as its root: the shared
+/// content, not the empty composition the synthetic path would have in its own
+/// right (spec 11.3.3).
+#[test]
+fn descendant_survives_early_query() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    let proto = first_prototype(&stage)?;
+    let child = proto.append_path("Child")?;
+    assert_eq!(
+        stage
+            .attribute(child.append_property("size")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+    assert!(stage.prim(child)?.is_in_prototype()?);
+    Ok(())
+}
+
+/// A path in the reserved prototype namespace that names no registered
+/// prototype composes to nothing, as C++ hands back an invalid prim — and
+/// says so without claiming to be prototype content.
+#[test]
+fn unknown_prototype_is_empty() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+    let unknown = sdf::path("/__Prototype_99")?;
+
+    assert!(!stage.prim(unknown.clone())?.is_valid()?);
+    assert!(!stage.prim(unknown.clone())?.is_prototype()?);
+    assert!(!stage.prim(unknown.clone())?.is_in_prototype()?);
+    assert_eq!(
+        stage
+            .attribute(unknown.append_path("Child")?.append_property("size")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None
+    );
+    Ok(())
+}
+
+/// An `AttributeQuery` built on a prototype descendant resolves on its first
+/// read and stays resolved: the prototype is registered before the query is
+/// answered, so there is no empty source to heal from (spec 11.3.3).
+#[test]
+fn query_heals_materialization() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    let proto = first_prototype(&stage)?;
+    let q = stage.attribute_query(proto.append_path("Child")?.append_property("size")?)?;
+    assert_eq!(q.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(5.0));
+
+    // Composing the instance changes nothing: it resolves to the prototype the
+    // query already read.
+    assert_eq!(stage.prim("/A")?.prototype()?, Some(proto));
+    assert_eq!(q.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(5.0));
+    Ok(())
+}
+
+/// A property authored inside a variant selected on an instance is shared
+/// content (the selection defines the prototype), so the instance resolves
+/// it (spec 11.3.3). The prototype root reads no opinions; that the shared
+/// index keeps the variant opinion is checked at the cache
+/// (`root_keeps_variant_opinions`).
+#[test]
+fn prototype_root_keeps_variant_opinions() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_variant_root.usda"))?;
+
+    assert_eq!(
+        stage
+            .attribute("/A.picked")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    assert_eq!(
+        stage
+            .attribute(proto.append_property("picked")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None
+    );
+    Ok(())
+}
+
+/// A relationship/connection target authored at a prototype's root resolves
+/// into each instance's namespace on the instances (spec 11.3.3 + 12.4). The
+/// prototype root reads no opinions, so it has no targets; the root rebase
+/// (`rebase_root`) that translates them into the prototype namespace is
+/// checked at the cache (`root_target_remap`).
+#[test]
+fn prototype_root_target_remap() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_root_target.usda"))?;
+
+    // On the instances the targets stay in each instance's own namespace.
+    assert_eq!(
+        rel_targets(&stage, &sdf::path("/A.myrel")?)?,
+        vec![sdf::path("/A/Target")?]
+    );
+    assert_eq!(
+        connections(&stage, &sdf::path("/A.inputs:in")?)?,
+        vec![sdf::path("/A.outputs:out")?]
+    );
+    assert_eq!(
+        rel_targets(&stage, &sdf::path("/B.myrel")?)?,
+        vec![sdf::path("/B/Target")?]
+    );
+
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    assert!(rel_targets(&stage, &proto.append_property("myrel")?)?.is_empty());
+    assert!(connections(&stage, &proto.append_property("inputs:in")?)?.is_empty());
+    Ok(())
+}
+
+/// A prototype root is valid and keeps its children, but reads no opinions
+/// (spec 11.3.3): C++ gives it the empty prim type info and reads it through
+/// an empty prim index, and hard-codes it as a defined model group. Every
+/// opinion in the fixture is authored on the referenced source, so each one
+/// is shared content the source index composes and the root still drops.
+#[test]
+fn prototype_root_empty() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_root_empty.usda"))?;
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    let root = stage.prim(proto.clone())?;
+
+    assert!(root.is_valid()?);
+    assert_eq!(root.type_name()?, None);
+    assert!(root.api_schemas()?.is_empty());
+    assert!(root.property_names()?.is_empty());
+    assert_eq!(root.specifier()?, Some(sdf::Specifier::Def));
+    assert!(root.is_defined()?);
+    assert!(root.is_model()?);
+    assert!(root.is_group()?);
+    assert!(!root.is_component()?);
+
+    // Its properties: no declaration, value, samples, spec or target.
+    let animated = root.attribute("animated");
+    assert_eq!(animated.type_name()?, None);
+    assert!(!animated.has_authored_value()?);
+    assert!(!animated.resolve_info()?.has_authored_value());
+    assert_eq!(animated.get::<vt::Value>()?, None);
+    assert_eq!(animated.time_samples()?, None);
+    assert!(!animated.might_be_time_varying()?);
+    assert!(animated.property_stack()?.is_empty());
+    let myrel = root.relationship("myrel");
+    assert!(!myrel.has_authored_targets()?);
+    assert!(myrel.targets()?.is_empty());
+    assert!(myrel.property_stack()?.is_empty());
+    let input = root.attribute("inputs:in");
+    assert!(!input.has_authored_connections()?);
+    assert!(input.connections()?.is_empty());
+
+    // The prim itself: no stack, selection, arc or index.
+    assert!(root.prim_stack()?.is_empty());
+    assert!(root.variant_sets().selections()?.is_empty());
+    assert!(!root.has_composition_arc()?);
+    assert!(root.prim_index().graph()?.is_empty());
+    assert_eq!(root.prim_index().child_names()?, (Vec::new(), Vec::new()));
+
+    // The children still come from the source index, and compose normally.
+    assert_eq!(child_names(&stage, proto.clone())?, vec!["Child".to_string()]);
+    let child_path = proto.append_path("Child")?;
+    let child = stage.prim(child_path.clone())?;
+    assert_eq!(child.type_name()?.as_deref(), Some("Scope"));
+    assert_eq!(child.attribute("size").get::<f64>()?, Some(3.0));
+    assert!(child.is_defined()?);
+
+    // Forwarding does not follow the root's hidden relationship: C++ finds no
+    // relationship there, so the target stays as the path it names. Through
+    // the instance, the same chain forwards to the root's target.
+    let to_root = child_path.append_property("toRoot")?;
+    assert_eq!(fwd_targets(&stage, &to_root)?, vec![proto.append_property("myrel")?]);
+    assert_eq!(
+        fwd_targets(&stage, &sdf::path("/A/Child.toRoot")?)?,
+        vec![sdf::path("/A/Child")?]
+    );
+    Ok(())
+}
+
+/// A prototype root is active and loaded whatever its source index says, as
+/// C++ `Usd_PrimData` sets it (spec 11.3.3). The instance overrides a
+/// referenced `active = false`, and that override is instance-local, so the
+/// source index reads `false`; the prototype and its child are still there.
+#[test]
+fn prototype_root_active() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_inactive_source.usda"))?;
+    assert!(stage.prim("/A")?.is_active()?);
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    let root = stage.prim(proto.clone())?;
+
+    assert!(root.is_active()?);
+    assert!(root.is_loaded()?);
+    assert_eq!(child_names(&stage, proto.clone())?, vec!["Child".to_string()]);
+    let child = stage.prim(proto.append_path("Child")?)?;
+    assert!(child.is_active()?);
+    assert_eq!(child.attribute("size").get::<f64>()?, Some(3.0));
+    Ok(())
+}
+
+/// Traversal reads a prim's inherited status from its parent's, and visits
+/// exactly the prims whose own full status matches, in the same order: over
+/// inactive, `over` and `class` branches, an instance, deep nesting, and
+/// payloads with and without load rules, under the default predicates and
+/// ones consulting a single inherited bit.
+#[test]
+fn traversal_matches_prim_status() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("payload.usda"),
+        "#usda 1.0\ndef \"P\"\n{\n    def \"Inside\"\n    {\n        def \"More\"\n        {\n        }\n    }\n}\n",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "World"
+{
+    def "Active"
+    {
+        def "Leaf"
+        {
+        }
+    }
+    def "Off" (
+        active = false
+    )
+    {
+        def "Leaf"
+        {
+        }
+    }
+    over "Over"
+    {
+        def "Leaf"
+        {
+        }
+    }
+    class "Class"
+    {
+        def "Leaf"
+        {
+        }
+    }
+    def "Loaded" (
+        payload = @./payload.usda@</P>
+    )
+    {
+    }
+    def "Unloaded" (
+        payload = @./payload.usda@</P>
+    )
+    {
+    }
+    def "Inst" (
+        instanceable = true
+        references = </World/Active>
+    )
+    {
+    }
+    def "Deep"
+    {
+        over "A"
+        {
+            def "B"
+            {
+            }
+        }
+        def "C"
+        {
+            class "D"
+            {
+                def "E"
+                {
+                }
+            }
+        }
+    }
+}
+"#,
+    )?;
+    let root = root.to_str().expect("utf-8 temp path");
+    for load in [InitialLoadSet::LoadAll, InitialLoadSet::LoadNone] {
+        let stage = Stage::builder().load(load).open(root)?;
+        stage.prim("/World/Loaded")?.load(LoadPolicy::WithDescendants);
+        let mut all = Vec::new();
+        stage.traverse(PrimPredicate::ALL, |path| all.push(path.clone()))?;
+        let predicates = [
+            PrimPredicate::DEFAULT,
+            PrimPredicate::DEFAULT_PROXIES,
+            PrimPredicate::new(PrimStatus::ACTIVE, PrimStatus::empty()),
+            PrimPredicate::new(PrimStatus::LOADED, PrimStatus::empty()),
+            PrimPredicate::new(PrimStatus::DEFINED, PrimStatus::empty()),
+            PrimPredicate::new(PrimStatus::empty(), PrimStatus::ABSTRACT),
+        ];
+        for predicate in predicates {
+            let mut expected = Vec::new();
+            let mut instances: Vec<sdf::Path> = Vec::new();
+            for path in &all {
+                let below_instance = instances
+                    .iter()
+                    .any(|instance| path.has_prefix(instance) && path != instance);
+                let status = stage.prim_status(path.clone())?;
+                if status.contains(PrimStatus::INSTANCE) {
+                    instances.push(path.clone());
+                }
+                if predicate.matches(status) && (predicate == PrimPredicate::DEFAULT_PROXIES || !below_instance) {
+                    expected.push(path.clone());
+                }
+            }
+            let mut visited = Vec::new();
+            stage.traverse(predicate, |path| visited.push(path.clone()))?;
+            assert_eq!(visited, expected, "{load:?} {predicate:?}");
+            assert!(visited.len() > 5);
+        }
+    }
+    Ok(())
+}
+
+/// A prim sorts its properties into attributes and relationships by their
+/// composed spec, and a prototype root, which reads no opinions, has neither.
+#[test]
+fn properties_by_spec_type() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "Source"
+{
+    double size = 1
+    rel target = </Source>
+}
+
+def "A" (
+    instanceable = true
+    references = </Source>
+)
+{
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let source = stage.prim("/Source")?;
+    let attributes: Vec<String> = source
+        .attributes()?
+        .iter()
+        .map(|attribute| attribute.name().to_owned())
+        .collect();
+    assert_eq!(attributes, ["size"]);
+    let relationships: Vec<String> = source
+        .relationships()?
+        .iter()
+        .map(|rel| rel.name().to_owned())
+        .collect();
+    assert_eq!(relationships, ["target"]);
+
+    let prototype = stage.prim(stage.prim("/A")?.prototype()?.expect("A is an instance"))?;
+    assert!(prototype.attributes()?.is_empty());
+    assert!(prototype.relationships()?.is_empty());
+    Ok(())
+}
+
+/// The defined and abstract bits a prim status reads from one ancestor walk
+/// agree with `is_defined` and `is_abstract` asked one at a time, across
+/// `def`, `over` and `class` chains and an instance's prototype.
+#[test]
+fn status_bits_match_queries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+class "Class"
+{
+    def "Child"
+    {
+        over "Over"
+        {
+        }
+    }
+}
+
+over "Over"
+{
+    def "Child"
+    {
+    }
+}
+
+def "World"
+{
+    class "Nested"
+    {
+        def "Leaf"
+        {
+        }
+    }
+}
+
+def "A" (
+    instanceable = true
+    references = </Class>
+)
+{
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let mut paths = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |path| paths.push(path.clone()))?;
+    for prototype in stage.prototypes()? {
+        paths.push(prototype.append_path("Child")?);
+        paths.push(prototype);
+    }
+    assert!(paths.len() > 10);
+    for path in paths {
+        let prim = stage.prim(path.clone())?;
+        let status = stage.prim_status(path.clone())?;
+        assert_eq!(status.contains(PrimStatus::DEFINED), prim.is_defined()?, "{path}");
+        assert_eq!(status.contains(PrimStatus::ABSTRACT), prim.is_abstract()?, "{path}");
+    }
+    Ok(())
+}
+
+/// A prototype root is defined and not abstract whatever its source authors,
+/// as C++ `Usd_PrimData` sets it, and its children inherit that (spec
+/// 11.3.3).
+#[test]
+fn prototype_root_defined() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for specifier in ["over", "class"] {
+        let root = dir.path().join(format!("{specifier}.usda"));
+        fs::write(
+            &root,
+            format!(
+                r#"#usda 1.0
+{specifier} "Source"
+{{
+    def Scope "Child"
+    {{
+    }}
+}}
+
+def "A" (
+    instanceable = true
+    references = </Source>
+)
+{{
+}}
+"#
+            ),
+        )?;
+        let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+        let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+        let root = stage.prim(proto.clone())?;
+
+        assert_eq!(root.specifier()?, Some(sdf::Specifier::Def), "{specifier}");
+        assert!(root.is_defined()?, "{specifier}");
+        assert!(!root.is_abstract()?, "{specifier}");
+        let child = stage.prim(proto.append_path("Child")?)?;
+        assert!(child.is_defined()?, "{specifier}");
+        assert!(!child.is_abstract()?, "{specifier}");
+    }
+    Ok(())
+}
+
+/// A prototype root is a model group, so a `component` under it is a model
+/// whatever the root's source authors (C++ `Usd_PrimData` consults a prim's
+/// kind only under a group parent).
+#[test]
+fn prototype_child_model() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "Source"
+{
+    def Scope "Child" (
+        kind = "component"
+    )
+    {
+    }
+}
+
+def Scope "A" (
+    instanceable = true
+    references = </Source>
+)
+{
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+
+    let child = stage.prim(proto.append_path("Child")?)?;
+    assert!(child.is_model()?);
+    assert!(child.is_component()?);
+    // The proxy answers as that prim does, though the instance above it
+    // authors no kind and is no model itself.
+    let proxy = stage.prim("/A/Child")?;
+    assert!(proxy.is_instance_proxy()?);
+    assert!(proxy.is_model()? && proxy.is_component()?);
+    assert_eq!(model_flags(&stage, "/A")?, NOT_MODEL);
+    Ok(())
+}
+
+/// A proxy under a nested instance answers as the prim in the nested
+/// prototype, whose root is a group, whatever the instances above it author.
+/// `ModelAPI::is_kind` and the `model` status bit follow.
+#[test]
+fn proxy_model_from_prototype() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "Inner"
+{
+    def Scope "Leaf" (
+        kind = "prop"
+    )
+    {
+        def Scope "Part" (
+            kind = "prop"
+        )
+        {
+        }
+    }
+}
+
+def Scope "Source"
+{
+    def Scope "Squad" (
+        kind = "chargroup"
+    )
+    {
+    }
+
+    def Scope "Nest" (
+        instanceable = true
+        references = </Inner>
+    )
+    {
+    }
+}
+
+def Scope "A" (
+    instanceable = true
+    kind = "site_root"
+    references = </Source>
+)
+{
+}
+"#,
+    )?;
+    let stage = Stage::builder()
+        .schema_registry(custom_kinds_registry()?)
+        .open(root.to_str().expect("utf-8 temp path"))?;
+
+    // The instance is classified as any prim is: by its own kind and place.
+    assert_eq!(model_flags(&stage, "/A")?, NOT_MODEL);
+    // Its proxies are classified in the prototype, under a root that is a
+    // group.
+    assert_eq!(model_flags(&stage, "/A/Squad")?, GROUP);
+    // The nested instance authors no kind, so it is no model, and its own
+    // proxies answer from the nested prototype.
+    assert!(stage.prim("/A/Nest")?.is_instance_proxy()?);
+    assert_eq!(model_flags(&stage, "/A/Nest")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/A/Nest/Leaf")?, COMPONENT);
+    // A component holds no model, in a prototype as anywhere.
+    assert_eq!(model_flags(&stage, "/A/Nest/Leaf/Part")?, NOT_MODEL);
+    // The source the instances reference is ordinary namespace.
+    assert_eq!(model_flags(&stage, "/Inner/Leaf")?, NOT_MODEL);
+
+    let leaf = usd::ModelAPI::from_prim_unchecked(stage.prim("/A/Nest/Leaf")?);
+    assert!(leaf.is_kind("component", usd::KindValidation::ModelHierarchy)?);
+    assert!(leaf.is_kind("prop", usd::KindValidation::ModelHierarchy)?);
+    let part = usd::ModelAPI::from_prim_unchecked(stage.prim("/A/Nest/Leaf/Part")?);
+    assert!(!part.is_kind("prop", usd::KindValidation::ModelHierarchy)?);
+    assert!(part.is_kind("prop", usd::KindValidation::None)?);
+
+    assert!(stage.prim_status("/A/Nest/Leaf")?.contains(PrimStatus::MODEL));
+    assert!(!stage.prim_status("/A/Nest")?.contains(PrimStatus::MODEL));
+    Ok(())
+}
+
+/// A prim the population mask excludes answers no composition arcs, without
+/// composing it or loading the layer it references.
+#[test]
+fn masked_arc_unloaded() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let referenced = dir.path().join("ref.usda");
+    fs::write(&referenced, "#usda 1.0\ndef Scope \"Ref\"\n{\n}\n")?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "Masked" (
+    references = @./ref.usda@</Ref>
+)
+{
+}
+
+def Scope "Kept"
+{
+}
+"#,
+    )?;
+    let root = root.to_str().expect("utf-8 temp path");
+    let loads_ref = |stage: &Stage| {
+        stage
+            .layer_identifiers()
+            .iter()
+            .any(|id| FsPath::new(id).ends_with("ref.usda"))
+    };
+
+    let stage = Stage::builder().mask(StagePopulationMask::new(["/Kept"])?).open(root)?;
+    assert!(!stage.prim("/Masked")?.has_composition_arc()?);
+    assert!(!loads_ref(&stage), "ref.usda is not loaded");
+
+    // Unmasked, the same prim reports its reference.
+    let stage = Stage::open(root)?;
+    assert!(stage.prim("/Masked")?.has_composition_arc()?);
+    assert!(loads_ref(&stage), "ref.usda is loaded");
+    Ok(())
+}
+
+/// The resolved variant selection is part of the instancing key: instances
+/// of one reference share a prototype iff their selections match (spec
+/// 11.3.3). /A and /C select `x` and share; /B selects `y` and is distinct.
+#[test]
+fn variant_selection_keys_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_variant_distinct.usda"))?;
+
+    let proto = |p: &str| -> Result<sdf::Path> {
+        Ok(stage
+            .prim(p)?
+            .prototype()?
+            .unwrap_or_else(|| panic!("{p} is not an instance")))
+    };
+
+    // Same selection (`x`) shares one prototype; the other selection (`y`)
+    // gets a distinct one.
+    assert_eq!(proto("/A")?, proto("/C")?);
+    assert_ne!(proto("/A")?, proto("/B")?);
+
+    // Each prototype resolves its own variant content.
+    assert_eq!(
+        stage
+            .attribute("/A.picked")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/B.picked")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(2.0))
+    );
+    assert_eq!(
+        stage
+            .attribute("/C.picked")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0))
+    );
+    Ok(())
+}
+
+/// A relationship authored inside an instance's variant translates into the
+/// shared prototype namespace (spec 11.3.3): the relative target anchors at
+/// the variant-qualified site (`/A{v=x}Geom`), and translation strips the
+/// selection and re-anchors onto `/__Prototype_N`.
+#[test]
+fn variant_rel_in_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_variant_rel.usda"))?;
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+
+    let rig = proto.append_path("Rig")?;
+    assert_eq!(
+        stage.relationship(rig.append_property("wires")?)?.targets()?,
+        vec![proto.append_path("Geom")?],
+        "the variant-authored target lands in the prototype namespace"
+    );
+    assert!(
+        stage.composition_errors().is_empty(),
+        "no target drops: {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// The #129 matrix: a `prototypes` relationship inside content reached
+/// through a payload keeps its target when a variant selection wraps that
+/// payload — with and without instancing.
+#[test]
+fn rel_through_variant_payload() -> Result<()> {
+    for variant in [false, true] {
+        for instanceable in [false, true] {
+            let dir = tempfile::tempdir()?;
+            fs::write(
+                dir.path().join("bundle.usda"),
+                r#"#usda 1.0
+( defaultPrim = "bundle" )
+def Xform "bundle"
+{
+    def PointInstancer "instancer"
+    {
+        rel prototypes = [ </bundle/instancer/Proto1> ]
+
+        def Xform "Proto1"
+        {
+        }
+    }
+}
+"#,
+            )?;
+            let geometry = r#"def Xform "geometry" (
+                prepend payload = @./bundle.usda@</bundle>
+            )
+            {
+            }"#;
+            let content = if variant {
+                format!(
+                    r#"#usda 1.0
+( defaultPrim = "C" )
+def Xform "C" (
+    variants = {{
+        string element = "v1"
+    }}
+    prepend variantSets = "element"
+)
+{{
+    variantSet "element" = {{
+        "v1" {{
+            {geometry}
+        }}
+    }}
+}}
+"#
+                )
+            } else {
+                format!(
+                    r#"#usda 1.0
+( defaultPrim = "C" )
+def Xform "C"
+{{
+    {geometry}
+}}
+"#
+                )
+            };
+            fs::write(dir.path().join("content.usda"), content)?;
+            let inst = if instanceable {
+                "instanceable = true\n        "
+            } else {
+                ""
+            };
+            fs::write(
+                dir.path().join("outer.usda"),
+                format!(
+                    r#"#usda 1.0
+( defaultPrim = "Root" )
+def Xform "Root"
+{{
+    def Xform "Inst" (
+        {inst}payload = @./content.usda@</C>
+    )
+    {{
+    }}
+}}
+"#
+                ),
+            )?;
+
+            let stage = Stage::builder()
+                .load(InitialLoadSet::LoadAll)
+                .open(dir.path().join("outer.usda").to_str().unwrap())?;
+            let base = if instanceable {
+                stage
+                    .prim("/Root/Inst")?
+                    .prototype()?
+                    .expect("instance resolves a prototype")
+            } else {
+                sdf::path("/Root/Inst")?
+            };
+            let instancer = base.append_path("geometry")?.append_path("instancer")?;
+            assert_eq!(
+                stage
+                    .relationship(instancer.append_property("prototypes")?)?
+                    .targets()?,
+                vec![instancer.append_path("Proto1")?],
+                "variant={variant} instanceable={instanceable}"
+            );
+            assert!(
+                stage.composition_errors().is_empty(),
+                "variant={variant} instanceable={instanceable}: {:?}",
+                stage.composition_errors()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A prototype is populated when at least one of its instances is in the
+/// population mask (spec 11.3.3): the synthetic `/__Prototype_N` namespace is
+/// never named in a user mask, yet its shared content stays readable through
+/// the masked instance.
+#[test]
+fn prototype_visible_under_mask() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/A"])?)
+        .open(&fixture_path("instancing_shared.usda"))?;
+
+    // /A is in the mask and is an instance; its prototype is reachable.
+    assert!(stage.prim("/A")?.is_instance()?);
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+
+    // The prototype's shared content is readable even though /__Prototype_N
+    // is never named in the mask, because instance /A is.
+    let child = proto.append_path("Child")?;
+    assert!(stage.prim(child.clone())?.is_valid()?);
+    assert_eq!(
+        stage
+            .attribute(child.append_property("size")?)?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+
+    // A prototype with no masked instance stays hidden: /B (and so the
+    // prototype it would otherwise expose) is outside the mask.
+    assert!(!stage.mask().includes(&sdf::path("/B")?));
+    Ok(())
+}
+
+/// A prototype's namespace can contain a nested instance: that nested prim
+/// is itself an instance and mints its own prototype, and a prim beneath it
+/// is an instance proxy of the nested prototype rather than plain prototype
+/// content (spec 11.3.3).
+#[test]
+fn nested_instance_in_prototype() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_nested_in_prototype.usda"))?;
+
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+
+    // The proxy chain through the instance namespace resolves the nested
+    // value (/A/Nested is itself an instance).
+    assert!(stage.prim("/A/Nested")?.is_instance()?);
+    assert_eq!(
+        stage
+            .attribute("/A/Nested/Leaf.v")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(3.0))
+    );
+
+    // Inside the prototype namespace, the nested prim is an instance and
+    // mints its own, distinct prototype.
+    let nested = stage.prim(proto.append_path("Nested")?)?;
+    assert!(nested.is_instance()?);
+    let nested_proto = nested.prototype()?.expect("nested prim is an instance");
+    assert_ne!(nested_proto, proto);
+
+    // A prim beneath the nested instance (inside the prototype namespace) is
+    // an instance proxy of the nested prototype — previously this was
+    // reported as plain prototype content.
+    let leaf = stage.prim(proto.append_path("Nested")?.append_path("Leaf")?)?;
+    assert!(leaf.is_instance_proxy()?);
+    let in_proto = leaf.prim_in_prototype()?.expect("Leaf is an instance proxy");
+    assert_eq!(in_proto.path(), &nested_proto.append_path("Leaf")?);
+    Ok(())
+}
+
+/// An instance's descendant is an instance proxy that maps to a prim in the
+/// shared prototype; the instance root and non-instanced prims are not
+/// proxies (spec 11.3.3).
+#[test]
+fn instance_proxy_api() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_shared.usda"))?;
+
+    assert!(!stage.prim("/A")?.is_instance_proxy()?);
+    assert!(stage.prim("/A/Child")?.is_instance_proxy()?);
+
+    let proto = stage.prim("/A")?.prototype()?.expect("A is an instance");
+    let in_proto = stage
+        .prim("/A/Child")?
+        .prim_in_prototype()?
+        .expect("Child is an instance proxy");
+    assert_eq!(in_proto.path(), &proto.append_path("Child")?);
+    assert!(in_proto.is_in_prototype()?);
+
+    // A prim in the prototype namespace is in a prototype, not a proxy.
+    assert!(!in_proto.is_instance_proxy()?);
+
+    // A nonexistent path under an instance is not a proxy, and has no prim in
+    // the prototype.
+    assert!(!stage.prim("/A/Missing")?.is_instance_proxy()?);
+    assert!(stage.prim("/A/Missing")?.prim_in_prototype()?.is_none());
+    Ok(())
+}
+
+/// Local opinions on an instance's descendants are discarded; values come
+/// from the arc (spec 11.3.3).
+#[test]
+fn instance_descendant_ignores_local_override() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing.usda"))?;
+
+    // Instance: the local `over Child { size = 999 }` is ignored.
+    assert_eq!(
+        stage
+            .attribute("/Instance/Child.size")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0))
+    );
+
+    // Non-instance: the local override wins as usual.
+    assert_eq!(
+        stage
+            .attribute("/NonInstance/Child.size")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(999.0))
+    );
+    Ok(())
+}
+
+#[test]
+fn instance_descendant_ignores_local_arc() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_local_arc.usda"))?;
+
+    // The local `over Child (references = </Other/Child>)` carries its own
+    // arc; both the local opinion and the node that arc spawns are
+    // discarded, so the value comes from the prototype, not /Other/Child.
+    assert_eq!(
+        stage
+            .attribute("/A/Child.v")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(1.0))
+    );
+    Ok(())
+}
+
+#[test]
+fn model_hierarchy() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    assert_eq!(stage.prim("/World")?.kind()?.as_deref(), Some("assembly"));
+    assert!(stage.prim("/World")?.is_model()?);
+    assert!(stage.prim("/World")?.is_group()?);
+
+    assert!(stage.prim("/World/Group")?.is_model()?);
+    assert!(stage.prim("/World/Group")?.is_group()?);
+    assert!(stage.prim("/World/Group/Component")?.is_model()?);
+    assert!(stage.prim("/World/Group/Component")?.is_component()?);
+
+    assert!(!stage.prim("/World/Group/Subcomponent")?.is_model()?);
+    assert!(stage.prim("/World/Group/Subcomponent")?.is_subcomponent()?);
+
+    assert_eq!(
+        stage
+            .prim("/World/InvalidComponentParent/Component")?
+            .kind()?
+            .as_deref(),
+        Some("component")
+    );
+    assert!(!stage.prim("/World/InvalidComponentParent/Component")?.is_model()?);
+    assert!(!stage.prim("/World/InvalidComponentParent/Component")?.is_component()?);
+    Ok(())
+}
+
+/// The three model-hierarchy answers for the prim at `path`.
+fn model_flags(stage: &Stage, path: &str) -> Result<(bool, bool, bool)> {
+    let prim = stage.prim(path)?;
+    Ok((prim.is_model()?, prim.is_group()?, prim.is_component()?))
+}
+
+/// A registry declaring the kinds `fixtures/custom_kinds.usda` authors.
+fn custom_kinds_registry() -> Result<Arc<usd::SchemaRegistry>> {
+    static SITE: &usd::SchemaFamily<'_> = &usd::SchemaFamily::new("site", &[]).kinds(&[
+        kind::Decl::new("chargroup").base("assembly"),
+        kind::Decl::new("prop").base("component"),
+        kind::Decl::new("rig").base("model"),
+        kind::Decl::new("rivet").base("subcomponent"),
+        kind::Decl::new("site_root"),
+    ]);
+    Ok(usd::SchemaRegistry::builder().register(SITE).build()?)
+}
+
+fn open_custom_kinds() -> Result<Stage> {
+    Stage::builder()
+        .schema_registry(custom_kinds_registry()?)
+        .open("fixtures/custom_kinds.usda")
+}
+
+const MODEL: (bool, bool, bool) = (true, false, false);
+const GROUP: (bool, bool, bool) = (true, true, false);
+const COMPONENT: (bool, bool, bool) = (true, false, true);
+const NOT_MODEL: (bool, bool, bool) = (false, false, false);
+
+/// The pseudo-root is a model group, and `kind = "model"` under a group is a
+/// model that is neither a group nor a component (C++
+/// `Usd_PrimData::_ComposeAndCacheFlags`).
+#[test]
+fn model_root_and_base() -> Result<()> {
+    let stage = Stage::open("fixtures/custom_kinds.usda")?;
+    assert_eq!(model_flags(&stage, "/")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Leaf")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Abstract")?, MODEL);
+    Ok(())
+}
+
+#[test]
+fn model_custom_kinds() -> Result<()> {
+    let stage = open_custom_kinds()?;
+
+    // A kind derived from `assembly` is a group, so its children are models.
+    assert_eq!(model_flags(&stage, "/Show")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, COMPONENT);
+    // One derived from `model` itself is a model and nothing more.
+    assert_eq!(model_flags(&stage, "/Show/Rig")?, MODEL);
+
+    // A root kind is no model, and nothing under it is one.
+    assert_eq!(model_flags(&stage, "/Show/Marker")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Marker/Prop")?, NOT_MODEL);
+
+    // A kind derived from `subcomponent` is one wherever it sits.
+    let rivet = stage.prim("/Show/Hero/Rivet")?;
+    assert!(rivet.is_subcomponent()? && !rivet.is_model()?);
+    assert!(!stage.prim("/Show/Hero")?.is_subcomponent()?);
+    Ok(())
+}
+
+#[test]
+fn model_custom_kind_instance() -> Result<()> {
+    let stage = open_custom_kinds()?;
+    let proto = stage.prim("/Show/Crowd")?.prototype()?.expect("Crowd is an instance");
+    assert_eq!(model_flags(&stage, proto.as_str())?, GROUP);
+
+    let member = proto.append_path("Member")?;
+    assert_eq!(model_flags(&stage, member.as_str())?, COMPONENT);
+    // The instance is a group by its own kind, the referenced `chargroup`,
+    // and the proxy answers as the prototype's prim.
+    assert_eq!(model_flags(&stage, "/Show/Crowd")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Crowd/Member")?, COMPONENT);
+    Ok(())
+}
+
+/// Without the declarations, every answer that rests on one is `false`. What
+/// rests on none keeps its answer: the pseudo-root, a prototype root, and the
+/// built-in kinds under a built-in group.
+#[test]
+fn model_kinds_undeclared() -> Result<()> {
+    let stage = Stage::open("fixtures/custom_kinds.usda")?;
+    for path in [
+        "/Show",
+        "/Show/Hero",
+        "/Show/Rig",
+        "/Show/Marker",
+        "/Show/Marker/Prop",
+        "/Show/Squad",
+        "/Show/Squad/Unit",
+        "/Show/Crowd",
+        "/Show/Crowd/Member",
+    ] {
+        assert_eq!(model_flags(&stage, path)?, NOT_MODEL, "{path}");
+    }
+    assert!(!stage.prim("/Show/Hero/Rivet")?.is_subcomponent()?);
+
+    assert_eq!(model_flags(&stage, "/")?, GROUP);
+    assert_eq!(model_flags(&stage, "/BuiltIn/Leaf")?, COMPONENT);
+    let proto = stage.prim("/Show/Crowd")?.prototype()?.expect("Crowd is an instance");
+    assert_eq!(model_flags(&stage, proto.as_str())?, GROUP);
+    let member = proto.append_path("Member")?;
+    assert_eq!(model_flags(&stage, member.as_str())?, NOT_MODEL);
+    Ok(())
+}
+
+/// An ancestor's `kind` is read live: a descendant leaves the model hierarchy
+/// when the ancestor stops being a group and rejoins it when it is one again.
+#[test]
+fn model_follows_kind_edit() -> Result<()> {
+    let stage = open_custom_kinds()?;
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+
+    stage.prim("/Show")?.set_kind("site_root")?;
+    assert_eq!(model_flags(&stage, "/Show")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, NOT_MODEL);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, NOT_MODEL);
+
+    stage.prim("/Show")?.set_kind("chargroup")?;
+    assert_eq!(model_flags(&stage, "/Show")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Hero")?, COMPONENT);
+    assert_eq!(model_flags(&stage, "/Show/Squad")?, GROUP);
+    assert_eq!(model_flags(&stage, "/Show/Squad/Unit")?, COMPONENT);
+    Ok(())
+}
+
+/// Two stages over one file, open together, each answer by their own
+/// registry.
+#[test]
+fn model_kinds_per_stage() -> Result<()> {
+    let declared = open_custom_kinds()?;
+    let plain = Stage::open("fixtures/custom_kinds.usda")?;
+    for _ in 0..2 {
+        assert_eq!(model_flags(&declared, "/Show/Hero")?, COMPONENT);
+        assert_eq!(model_flags(&plain, "/Show/Hero")?, NOT_MODEL);
+        assert_eq!(model_flags(&declared, "/Show")?, GROUP);
+        assert_eq!(model_flags(&plain, "/Show")?, NOT_MODEL);
+    }
+    Ok(())
+}
+
+#[test]
+fn prim_status_bits() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    assert_eq!(
+        stage.prim_status("/World/ClassParent/Child")?,
+        PrimStatus::ACTIVE | PrimStatus::LOADED | PrimStatus::DEFINED | PrimStatus::ABSTRACT
+    );
+
+    assert_eq!(
+        stage.prim_status("/World/Instance")?,
+        PrimStatus::ACTIVE | PrimStatus::LOADED | PrimStatus::DEFINED | PrimStatus::INSTANCE
+    );
+    Ok(())
+}
+
+#[test]
+fn traverse_default() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::DEFAULT, |p| prims.push(p.as_str().to_string()))?;
+
+    assert!(prims.contains(&"/World".to_string()));
+    assert!(prims.contains(&"/World/ActiveParent".to_string()));
+    assert!(prims.contains(&"/World/ActiveParent/Child".to_string()));
+    assert!(prims.contains(&"/World/Instance".to_string()));
+
+    assert!(!prims.contains(&"/World/InactiveParent".to_string()));
+    assert!(!prims.contains(&"/World/InactiveParent/Child".to_string()));
+    assert!(!prims.contains(&"/World/OverOnly".to_string()));
+    assert!(!prims.contains(&"/World/OverParent".to_string()));
+    assert!(!prims.contains(&"/World/OverParent/Child".to_string()));
+    assert!(!prims.contains(&"/World/ClassParent".to_string()));
+    assert!(!prims.contains(&"/World/ClassParent/Child".to_string()));
+    Ok(())
+}
+
+#[test]
+fn traverse_all_predicate() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |p| prims.push(p.as_str().to_string()))?;
+
+    assert!(prims.contains(&"/World/InactiveParent".to_string()));
+    assert!(!prims.contains(&"/World/InactiveParent/Child".to_string()));
+    assert!(prims.contains(&"/World/OverOnly".to_string()));
+    assert!(prims.contains(&"/World/OverParent/Child".to_string()));
+    assert!(prims.contains(&"/World/ClassParent".to_string()));
+    assert!(prims.contains(&"/World/ClassParent/Child".to_string()));
+    Ok(())
+}
+
+#[test]
+fn custom_predicate() -> Result<()> {
+    let stage = open_stage_queries_fixture()?;
+    let predicate = PrimPredicate::new(PrimStatus::ACTIVE | PrimStatus::DEFINED, PrimStatus::empty());
+
+    let mut prims = Vec::new();
+    stage.traverse(predicate, |p| prims.push(p.as_str().to_string()))?;
+
+    assert!(prims.contains(&"/World/ClassParent".to_string()));
+    assert!(prims.contains(&"/World/ClassParent/Child".to_string()));
+    assert!(!prims.contains(&"/World/InactiveParent".to_string()));
+    assert!(!prims.contains(&"/World/OverOnly".to_string()));
+    Ok(())
+}
+
+// --- Stage-tier authoring ---
+
+/// Author `value` as the raw `field` of `attr`'s spec on the root layer, the
+/// edit target of every stage here. The attribute setters refuse the value
+/// fields, so a whole-field `timeSamples` block, an empty sample map, or a
+/// malformed field is authored the way a text layer would carry it.
+fn author_raw_field(attr: &usd::Attribute, field: &str, value: vt::Value) -> Result<()> {
+    let stage = attr.stage();
+    stage.root_layer().edit(|e| {
+        e.attribute_mut(attr.path())?
+            .expect("the attribute spec is on the root layer")
+            .set(field, value);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn in_memory_stage() -> Result<Stage> {
+    Stage::builder().in_memory("anon.usda")
+}
+
+#[test]
+fn author_default_prim() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.set_default_prim("World")?;
+    stage.define_prim("/World")?.set_type_name("Xform")?;
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+    Ok(())
+}
+
+#[test]
+fn default_prim_rejects_non_prim() -> Result<()> {
+    let stage = in_memory_stage()?;
+    for name in ["World.attr", "/", ""] {
+        let err = stage.set_default_prim(name).unwrap_err();
+        assert!(
+            matches!(err, StageAuthoringError::Layer(sdf::AuthoringError::InvalidPath { .. })),
+            "{name} names no prim"
+        );
+    }
+    // An absolute spelling is accepted: it is how C++ writes a nested default
+    // prim, so rejecting it would make a C++-authored value unwritable here.
+    stage.set_default_prim("/World/Char")?;
+    assert_eq!(stage.default_prim().as_deref(), Some("/World/Char"));
+    Ok(())
+}
+
+/// Modern OpenUSD allows nested `defaultPrim` values like `"World/Char"`.
+/// The write contract must match what the read path will accept.
+#[test]
+fn default_prim_accepts_nested() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.set_default_prim("World/Mesh")?;
+    assert_eq!(stage.default_prim().as_deref(), Some("World/Mesh"));
+    Ok(())
+}
+
+/// A stage opened from a file is editable — every backend implements the
+/// field-level write API — so authoring into its root layer succeeds.
+#[test]
+fn file_loaded_stage_is_editable() -> Result<()> {
+    let stage = Stage::open(&composition_path("subLayer/sublayer_same_folder.usda"))?;
+    stage.define_prim("/X")?;
+    stage.set_default_prim("World")?;
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+    Ok(())
+}
+
+#[test]
+fn edit_target_out_of_range() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let err = stage
+        .set_edit_target(EditTarget::for_layer("missing-layer"))
+        .unwrap_err();
+    assert!(matches!(err, StageAuthoringError::LayerNotFound { .. }));
+    Ok(())
+}
+
+/// A local edit target maps scene paths to themselves, so authoring is
+/// unchanged from the bare-`layer_index` behavior.
+#[test]
+fn edit_target_local_is_identity() -> Result<()> {
+    let target = EditTarget::for_layer("test");
+    let path = sdf::path("/A/B")?;
+    assert_eq!(target.map_to_spec_path(&path), Some(path));
+    Ok(())
+}
+
+/// A variant edit target rewrites scene paths into the `{set=sel}`
+/// namespace; paths outside the variant prim map to themselves.
+#[test]
+fn variant_target_maps_selection() -> Result<()> {
+    let target = EditTarget::for_local_direct_variant("test", sdf::path("/Prim{set=sel}")?)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Prim/child")?),
+        Some(sdf::path("/Prim{set=sel}child")?)
+    );
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Prim.attr")?),
+        Some(sdf::path("/Prim{set=sel}.attr")?)
+    );
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Other")?),
+        Some(sdf::path("/Other")?)
+    );
+    Ok(())
+}
+
+/// A bad target is rejected at `edit_context`, leaving the current target
+/// unchanged.
+#[test]
+fn edit_context_rejects_bad_target() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let before = stage.edit_target().layer_identifier().to_string();
+    let result = stage.edit_context(EditTarget::for_layer("missing-layer"));
+    assert!(matches!(result, Err(StageAuthoringError::LayerNotFound { .. })));
+    assert_eq!(stage.edit_target().layer_identifier(), before);
+    Ok(())
+}
+
+/// Defining the variant-owning prim itself through a variant target writes
+/// the variant spec `/Prim{set=sel}` its path maps to, as C++ `DefinePrim`
+/// does through `SdfCreatePrimInLayer`.
+#[test]
+fn define_prim_at_variant_leaf() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.define_prim("/Prim")?;
+    stage.set_edit_target(EditTarget::for_local_direct_variant(
+        root,
+        sdf::path("/Prim{set=sel}")?,
+    )?)?;
+    // `/Prim` is defined already; a new type makes the define write.
+    stage.define_typed_prim("/Prim", "Scope")?;
+    let layer = stage.root_layer();
+    let variant = layer.prim("/Prim{set=sel}")?.expect("the variant spec");
+    assert_eq!(variant.type_name()?.as_deref(), Some("Scope"));
+    assert_eq!(variant.specifier()?, Some(sdf::Specifier::Def));
+    Ok(())
+}
+
+/// In-memory stage with `/Prim` inheriting a local class `/_Class`, so the
+/// inherit arc's source layer is the writable root.
+fn inherit_stage() -> Result<Stage> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/_Class")?;
+    stage.define_prim("/Prim")?.set_metadata(
+        sdf::FieldKey::InheritPaths.as_str(),
+        vt::Value::PathListOp(sdf::PathListOp::prepended([sdf::path("/_Class")?])),
+    )?;
+    Ok(stage)
+}
+
+/// An arc target on a reference captures the referenced layer and maps composed
+/// paths down into its namespace.
+#[test]
+fn edit_target_for_reference_node() -> Result<()> {
+    let stage = Stage::open(&fixture_path("ref_external.usda"))?;
+    let target = stage.edit_target_for_node(&sdf::path("/World/MyPrim")?, EditTargetArc::Reference)?;
+    assert!(target.layer_identifier().ends_with("ref_target.usda"));
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/World/MyPrim/Child")?),
+        Some(sdf::path("/Source/Child")?)
+    );
+    Ok(())
+}
+
+/// An inherit arc target captures the class-owning layer and maps the composed
+/// path to the class path.
+#[test]
+fn edit_target_for_inherit_node() -> Result<()> {
+    let stage = inherit_stage()?;
+    let target = stage.edit_target_for_node(&sdf::path("/Prim")?, EditTargetArc::Inherit)?;
+    assert_eq!(target.layer_identifier(), stage.root_layer().identifier());
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Prim/Child")?),
+        Some(sdf::path("/_Class/Child")?)
+    );
+    Ok(())
+}
+
+/// A prim with no arc of the requested kind has no arc target.
+#[test]
+fn edit_target_no_matching_arc() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Prim")?;
+    assert!(matches!(
+        stage.edit_target_for_node(&sdf::path("/Prim")?, EditTargetArc::Reference),
+        Err(StageAuthoringError::NoArcNode { .. })
+    ));
+    Ok(())
+}
+
+/// An arc target for a node whose site sits inside a variant maps composed
+/// paths to the variant-qualified spec path (C++ `_ComposeMappingForNode`
+/// composes the node-path qualifier onto the arc mapping), so authoring lands
+/// where it composes.
+#[test]
+fn arc_target_in_variant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "P" (
+    variants = {
+        string v = "x"
+    }
+    prepend variantSets = "v"
+)
+{
+    variantSet "v" = {
+        "x" {
+            def Scope "_C"
+            {
+                double val = 1
+            }
+            def Scope "Child" (
+                inherits = </P/_C>
+            )
+            {
+            }
+        }
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P/Child.val")?.get::<f64>()?,
+        Some(1.0),
+        "the in-variant class composes onto the inheritor"
+    );
+
+    let target = stage.edit_target_for_node(&sdf::path("/P/Child")?, EditTargetArc::Inherit)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/P/Child")?),
+        Some(sdf::path("/P{v=x}_C")?),
+        "the class spec lives inside the variant, so the target maps there"
+    );
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Unrelated")?),
+        Some(sdf::path("/Unrelated")?),
+        "the class map's root identity survives the qualifier composition"
+    );
+    {
+        let _ctx = stage.edit_context(target)?;
+        stage
+            .create_attribute("/P/Child.extra", "double")?
+            .set(vt::Value::Double(4.0))?;
+    }
+    assert_eq!(
+        stage.attribute("/P/Child.extra")?.get::<f64>()?,
+        Some(4.0),
+        "the opinion authored at the variant-qualified class path composes back"
+    );
+    Ok(())
+}
+
+/// A class defined inside a variant and inherited through a RELATIVE path
+/// behaves exactly like the absolute form: the class-arc map is selection-free
+/// (both endpoints stripped), so a within-class relationship target translates
+/// to the inheritor's image and the arc edit target maps to the qualified
+/// class spec.
+#[test]
+fn variant_class_rel() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def Scope "P" (
+    variants = {
+        string v = "x"
+    }
+    prepend variantSets = "v"
+)
+{
+    variantSet "v" = {
+        "x" {
+            def Scope "_C"
+            {
+                double val = 1
+                rel self_rel = </P/_C>
+            }
+            def Scope "Child" (
+                inherits = <../_C>
+            )
+            {
+            }
+        }
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/P/Child.val")?.get::<f64>()?,
+        Some(1.0),
+        "the relatively-inherited in-variant class composes"
+    );
+    assert_eq!(
+        stage.relationship("/P/Child.self_rel")?.targets()?,
+        vec![sdf::path("/P/Child")?],
+        "the within-class target translates to the inheritor's image"
+    );
+    assert!(
+        stage.composition_errors().is_empty(),
+        "no spurious target diagnostics: {:?}",
+        stage.composition_errors()
+    );
+
+    let target = stage.edit_target_for_node(&sdf::path("/P/Child")?, EditTargetArc::Inherit)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/P/Child")?),
+        Some(sdf::path("/P{v=x}_C")?),
+        "the relative form maps like the absolute one"
+    );
+    Ok(())
+}
+
+/// A reference prim path carrying a variant selection is invalid (C++
+/// `PcpErrorInvalidPrimPath`): the text parser rejects it at read time, but
+/// binary input reaches composition unchecked, so composition drops the arc
+/// and reports it.
+#[test]
+fn variant_ref_path_error() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Target")?;
+    stage.define_prim("/P")?.set_metadata(
+        sdf::FieldKey::References.as_str(),
+        vt::Value::ReferenceListOp(sdf::ReferenceListOp::prepended([sdf::Reference {
+            asset_path: String::new(),
+            prim_path: sdf::path("/Target{v=a}")?,
+            ..Default::default()
+        }])),
+    )?;
+    assert!(stage.prim("/P")?.is_valid()?);
+    assert!(
+        stage
+            .composition_errors()
+            .iter()
+            .any(|e| matches!(e, pcp::CompositionDiagnostic::InvalidPrimPath { .. })),
+        "the selection-bearing prim path is rejected, got {:?}",
+        stage.composition_errors()
+    );
+    Ok(())
+}
+
+/// Authoring through an inherit arc target lands the opinion at the class path
+/// in the source layer, not at the composed path, and it composes back.
+#[test]
+fn edit_target_authors_into_class() -> Result<()> {
+    let stage = inherit_stage()?;
+    let target = stage.edit_target_for_node(&sdf::path("/Prim")?, EditTargetArc::Inherit)?;
+    {
+        let _ctx = stage.edit_context(target)?;
+        stage.define_prim("/Prim/Child")?;
+    }
+    assert!(stage.prim("/Prim/Child")?.is_valid()?);
+    let root = stage.root_layer();
+    assert!(root.prim("/_Class/Child")?.is_some());
+    assert!(root.prim("/Prim/Child")?.is_none());
+    Ok(())
+}
+
+/// `map_to_spec_path` re-maps an embedded relationship target through the same
+/// arc mapping (C++ `MapToSpecPath` step 2).
+#[test]
+fn map_spec_path_remaps_embedded_target() -> Result<()> {
+    let stage = Stage::open(&fixture_path("ref_external.usda"))?;
+    let target = stage.edit_target_for_node(&sdf::path("/World/MyPrim")?, EditTargetArc::Reference)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/World/MyPrim.rel[/World/MyPrim/Child]")?),
+        Some(sdf::path("/Source.rel[/Source/Child]")?)
+    );
+    Ok(())
+}
+
+/// An embedded target outside the arc's co-domain rejects the whole path.
+#[test]
+fn map_spec_path_rejects_outside_target() -> Result<()> {
+    let stage = Stage::open(&fixture_path("ref_external.usda"))?;
+    let target = stage.edit_target_for_node(&sdf::path("/World/MyPrim")?, EditTargetArc::Reference)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/World/MyPrim.rel[/Elsewhere]")?),
+        None
+    );
+    Ok(())
+}
+
+/// A local target's identity mapping leaves an embedded target untouched.
+#[test]
+fn map_spec_path_local_keeps_target() -> Result<()> {
+    let target = EditTarget::for_layer("test");
+    let path = sdf::path("/A.rel[/B].attr")?;
+    assert_eq!(target.map_to_spec_path(&path), Some(path));
+    Ok(())
+}
+
+/// A variant target maps an embedded target without leaving a variant
+/// selection on the target path (target paths never carry selections).
+#[test]
+fn map_spec_path_variant_strips_target() -> Result<()> {
+    let target = EditTarget::for_local_direct_variant("test", sdf::path("/Prim{set=sel}")?)?;
+    assert_eq!(
+        target.map_to_spec_path(&sdf::path("/Prim.rel[/Prim/T]")?),
+        Some(sdf::path("/Prim{set=sel}.rel[/Prim/T]")?)
+    );
+    Ok(())
+}
+
+/// `edit_target_root` names the root layer with an identity mapping and equals
+/// the default target installed at open.
+#[test]
+fn edit_target_root_matches_default() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let target = stage.edit_target_root();
+    assert_eq!(target.layer_identifier(), stage.root_layer().identifier());
+    assert_eq!(target.map_to_spec_path(&sdf::path("/A/B")?), Some(sdf::path("/A/B")?));
+    assert_eq!(stage.edit_target(), target);
+    Ok(())
+}
+
+/// `edit_target_session` names the strongest session layer, or is `None` when
+/// the stage has no session layer.
+#[test]
+fn edit_target_session() -> Result<()> {
+    let stage = open_with_session()?;
+    let target = stage.edit_target_session().expect("session layer");
+    assert_eq!(
+        target.layer_identifier(),
+        stage.session_layer().expect("session layer").identifier()
+    );
+
+    assert!(in_memory_stage()?.edit_target_session().is_none());
+    Ok(())
+}
+
+/// A stage-bound target is rejected by a stage with a different root layer
+/// stack identity; a stage-agnostic `for_layer` target is still accepted, and a
+/// cloned handle to the same stage accepts its sibling's bound target.
+#[test]
+fn layer_stack_id_distinguishes_stages() -> Result<()> {
+    let stage_a = Stage::builder().in_memory("anon_a.usda")?;
+    let stage_b = Stage::builder().in_memory("anon_b.usda")?;
+    let bound = stage_a.edit_target_root();
+    assert!(matches!(
+        stage_b.set_edit_target(bound.clone()),
+        Err(StageAuthoringError::EditTargetWrongStage)
+    ));
+    let root_b = stage_b.root_layer().identifier().to_string();
+    assert!(stage_b.set_edit_target(EditTarget::for_layer(root_b)).is_ok());
+
+    // A cloned handle shares the same `StageInner`, so it has the same root
+    // layer stack identity and accepts the target built against its sibling.
+    let stage_a_clone = stage_a.clone();
+    assert!(stage_a_clone.set_edit_target(bound).is_ok());
+    Ok(())
+}
+
+/// Anonymous root layers are unique per stage even when opened with the same
+/// tag, so two such stages have distinct layer stack identities and reject each
+/// other's edit targets.
+#[test]
+fn anonymous_stages_are_distinct() -> Result<()> {
+    let stage_a = Stage::builder().in_memory("same.usda")?;
+    let stage_b = Stage::builder().in_memory("same.usda")?;
+    assert_ne!(stage_a.root_layer().identifier(), stage_b.root_layer().identifier());
+    assert!(matches!(
+        stage_b.set_edit_target(stage_a.edit_target_root()),
+        Err(StageAuthoringError::EditTargetWrongStage)
+    ));
+    Ok(())
+}
+
+/// A target naming a layer is valid; one naming no layer is null and invalid.
+#[test]
+fn edit_target_null_and_valid() -> Result<()> {
+    let valid = EditTarget::for_layer("layer");
+    assert!(!valid.is_null());
+    assert!(valid.is_valid());
+
+    let null = EditTarget::for_layer("");
+    assert!(null.is_null());
+    assert!(!null.is_valid());
+    Ok(())
+}
+
+/// `compose_over` layers a variant refinement onto a reference target, so a
+/// stage write resolves through both into the nested spec path; a null target
+/// composes to the other.
+#[test]
+fn edit_target_compose_over() -> Result<()> {
+    let stage = Stage::open(&fixture_path("ref_external.usda"))?;
+    let weaker = stage.edit_target_for_node(&sdf::path("/World/MyPrim")?, EditTargetArc::Reference)?;
+    let stronger = EditTarget::for_local_direct_variant(weaker.layer_identifier(), sdf::path("/Source{set=sel}")?)?;
+
+    let composed = stronger.compose_over(&weaker);
+    assert_eq!(composed.layer_identifier(), weaker.layer_identifier());
+    assert_eq!(
+        composed.map_to_spec_path(&sdf::path("/World/MyPrim/Child")?),
+        Some(sdf::path("/Source{set=sel}Child")?)
+    );
+
+    assert_eq!(EditTarget::for_layer("").compose_over(&weaker), weaker);
+    Ok(())
+}
+
+/// Composing targets bound to stages with different layer stack identities
+/// yields a null target, keeping the cross-stage guard intact.
+#[test]
+fn compose_over_cross_stack_null() -> Result<()> {
+    let stage_a = Stage::builder().in_memory("anon_a.usda")?;
+    let stage_b = Stage::builder().in_memory("anon_b.usda")?;
+    let composed = stage_a.edit_target_root().compose_over(&stage_b.edit_target_root());
+    assert!(composed.is_null());
+    Ok(())
+}
+
+/// A stage-bound target is accepted by a freshly opened stage with the same
+/// root layer, session, and resolver context: layer-stack identity is by
+/// composition input, not by stage instance.
+#[test]
+fn layer_stack_id_same_inputs() -> Result<()> {
+    let path = fixture_path("ref_external.usda");
+    let stage_a = Stage::open(&path)?;
+    let stage_b = Stage::open(&path)?;
+    assert!(stage_b.set_edit_target(stage_a.edit_target_root()).is_ok());
+    Ok(())
+}
+
+/// Adds `/Prim`, referencing `/Source` through `offset`.
+fn reference_with_offset(stage: &Stage, offset: sdf::LayerOffset) -> Result<()> {
+    stage.define_prim("/Prim")?.set_metadata(
+        sdf::FieldKey::References.as_str(),
+        vt::Value::ReferenceListOp(sdf::ReferenceListOp::prepended([sdf::Reference {
+            prim_path: sdf::path("/Source")?,
+            layer_offset: offset,
+            ..Default::default()
+        }])),
+    )?;
+    Ok(())
+}
+
+/// Authoring a time sample through an arc target with a non-identity layer
+/// offset keys the sample at the inverse-mapped source time, so it reads back
+/// at the original stage time once composition re-applies the offset.
+#[test]
+fn arc_target_retimes_time_sample() -> Result<()> {
+    let stage = in_memory_stage()?;
+    // `/Prim` references `/Source` with a (offset = 10) layer offset, so a
+    // source-layer time `t` composes to stage time `t + 10`.
+    stage.define_prim("/Source")?.create_attribute("x", "double")?;
+    reference_with_offset(&stage, sdf::LayerOffset::new(10.0, 1.0))?;
+
+    let target = stage.edit_target_for_node(&sdf::path("/Prim")?, EditTargetArc::Reference)?;
+    // Stage time 15 inverse-maps to source time 5.
+    assert_eq!(target.map_to_spec_time(15.0), 5.0);
+    {
+        let _ctx = stage.edit_context(target)?;
+        stage
+            .attribute("/Prim.x")?
+            .set_at(vt::Value::Double(42.0), usd::TimeCode::new(15.0))?;
+    }
+
+    // The sample landed at source time 5 in the root layer...
+    let samples = stage.attribute("/Source.x")?.time_samples()?.expect("samples");
+    assert_eq!(samples, vec![(5.0, vt::Value::Double(42.0))]);
+    // ...and reads back at stage time 15 through the offset reference.
+    assert_eq!(
+        stage.attribute("/Prim.x")?.get_at::<f64>(usd::TimeCode::new(15.0))?,
+        Some(42.0)
+    );
+    Ok(())
+}
+
+/// `time_sample_times` retimes samples brought in through a non-identity arc
+/// offset identically to the full `time_samples()` map and to `value_at`.
+#[test]
+fn time_sample_times_retimed() -> Result<()> {
+    let stage = in_memory_stage()?;
+    // `/Prim` references `/Source` with offset 10, scale 1: a source time `t`
+    // composes to stage time `t + 10`.
+    stage
+        .define_prim("/Source")?
+        .create_attribute("x", "double")?
+        .set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+        .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?;
+    reference_with_offset(&stage, sdf::LayerOffset::new(10.0, 1.0))?;
+
+    let attr = stage.attribute("/Prim.x")?;
+    let map = attr.time_samples()?.expect("samples");
+    let retimed_keys: Vec<f64> = map.iter().map(|(t, _)| *t).collect();
+    assert_eq!(retimed_keys, vec![10.0, 20.0]);
+    assert_eq!(attr.time_sample_times()?, retimed_keys);
+    assert_eq!(attr.num_time_samples()?, 2);
+    // The retimed times read back as live samples through the offset arc.
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(10.0))?, Some(1.0));
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(20.0))?, Some(3.0));
+    Ok(())
+}
+
+/// A `timecode` value is a time coordinate, so an arc's layer offset retimes
+/// the value itself — not only the times a sample map is keyed by (C++
+/// `Usd_ApplyLayerOffsetToValue`).
+#[test]
+fn timecode_values_retimed() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let source = stage.define_prim("/Source")?;
+    source
+        .create_attribute("t", "timecode")?
+        .set(vt::Value::TimeCode(sdf::TimeCode(5.0)))?;
+    source
+        .create_attribute("many", "timecode[]")?
+        .set(vt::Value::TimeCodeVec(vec![sdf::TimeCode(5.0), sdf::TimeCode(10.0)]))?;
+    // A sampled timecode is retimed twice over: the sample's key moves, and so
+    // does the time the sample holds.
+    source
+        .create_attribute("animated", "timecode")?
+        .set_at(vt::Value::TimeCode(sdf::TimeCode(5.0)), usd::TimeCode::new(0.0))?;
+    // Source time `t` composes to stage time `10 + 2t`.
+    reference_with_offset(&stage, sdf::LayerOffset::new(10.0, 2.0))?;
+
+    let scalar = Some(vt::Value::TimeCode(sdf::TimeCode(20.0)));
+    let array = Some(vt::Value::TimeCodeVec(vec![sdf::TimeCode(20.0), sdf::TimeCode(30.0)]));
+    assert_eq!(stage.attribute("/Prim.t")?.get::<vt::Value>()?, scalar);
+    assert_eq!(stage.attribute("/Prim.many")?.get::<vt::Value>()?, array);
+    // A default resolves the same whether or not the read names a time: the
+    // timed read takes the local-default shortcut, the untimed one full
+    // composition, and the two must not disagree about the time frame.
+    let at = usd::TimeCode::new(0.0);
+    assert_eq!(stage.attribute("/Prim.t")?.get_at::<vt::Value>(at)?, scalar);
+    assert_eq!(stage.attribute("/Prim.many")?.get_at::<vt::Value>(at)?, array);
+    assert_eq!(stage.attribute_query("/Prim.t")?.get_at::<vt::Value>(at)?, scalar);
+
+    let animated = stage.attribute("/Prim.animated")?;
+    let sampled = Some(vt::Value::TimeCode(sdf::TimeCode(20.0)));
+    assert_eq!(animated.time_sample_times()?, vec![10.0]);
+    assert_eq!(animated.get_at::<vt::Value>(usd::TimeCode::new(10.0))?, sampled);
+    // The whole-map read and the cached query replay agree with the direct one.
+    assert_eq!(
+        animated.time_samples()?,
+        Some(vec![(10.0, vt::Value::TimeCode(sdf::TimeCode(20.0)))])
+    );
+    assert_eq!(
+        stage
+            .attribute_query("/Prim.animated")?
+            .get_at::<vt::Value>(usd::TimeCode::new(10.0))?,
+        sampled
+    );
+    Ok(())
+}
+
+/// Authoring a `timecode` through an arc target with a layer offset writes the
+/// inverse-mapped value, so it reads back as authored (C++
+/// `_StageValueToFieldXf`).
+#[test]
+fn timecode_authoring_retimed() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Source")?.create_attribute("t", "timecode")?;
+    reference_with_offset(&stage, sdf::LayerOffset::new(10.0, 2.0))?;
+
+    let target = stage.edit_target_for_node(&sdf::path("/Prim")?, EditTargetArc::Reference)?;
+    {
+        let _ctx = stage.edit_context(target)?;
+        stage
+            .attribute("/Prim.t")?
+            .set(vt::Value::TimeCode(sdf::TimeCode(20.0)))?;
+    }
+
+    // Stage time 20 inverse-maps to source time 5...
+    assert_eq!(
+        stage.attribute("/Source.t")?.get::<vt::Value>()?,
+        Some(vt::Value::TimeCode(sdf::TimeCode(5.0)))
+    );
+    // ...and composition maps it back through the arc.
+    assert_eq!(
+        stage.attribute("/Prim.t")?.get::<vt::Value>()?,
+        Some(vt::Value::TimeCode(sdf::TimeCode(20.0)))
+    );
+    Ok(())
+}
+
+// Value resolution walks sites strongest-first and probes `timeSamples` then
+// `default` at each site (C++ `Usd_Resolver`), so a stronger layer's `default`
+// hides a weaker layer's `timeSamples`.
+
+/// One time sample of a type that composes over weaker values might vary with
+/// what it composes over, as C++ `UsdAttribute::ValueMightBeTimeVarying`
+/// answers; one sample of any other type is constant.
+#[test]
+fn single_sample_composing_varies() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"A\"\n{\n    pathExpression p.timeSamples = { 0: \"/A\" }\n    double x.timeSamples = { 0: 2.0 }\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(stage.attribute("/A.p")?.might_be_time_varying()?);
+    assert!(!stage.attribute("/A.x")?.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A stronger layer's `default` hides a weaker sublayer's `timeSamples`.
+#[test]
+fn default_hides_weaker_samples() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        dir.path().join("sub.usda"),
+        "#usda 1.0\ndef \"A\"\n{\n    double x.timeSamples = { 0: 2.0 }\n}\n",
+    )?;
+    fs::write(
+        &root,
+        "#usda 1.0\n(\n    subLayers = [@./sub.usda@]\n)\ndef \"A\"\n{\n    double x = 1.0\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let attr = stage.attribute("/A.x")?;
+    // The default answers at every time, so the attribute is not time-varying
+    // and reports no samples — every query must agree, the composed map with
+    // them.
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(1.0));
+    assert_eq!(attr.get::<f64>()?, Some(1.0));
+    assert!(!attr.might_be_time_varying()?);
+    assert_eq!(attr.num_time_samples()?, 0);
+    assert_eq!(attr.time_samples()?, None, "the hidden samples are not the source");
+    Ok(())
+}
+
+/// The same ordering one arc down: a referenced stack's root layer authors the
+/// `default`, its own sublayer the `timeSamples`.
+#[test]
+fn default_hides_across_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        dir.path().join("refsub.usda"),
+        "#usda 1.0\ndef \"S\"\n{\n    double x.timeSamples = { 0: 2.0 }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\n(\n    subLayers = [@./refsub.usda@]\n)\ndef \"S\"\n{\n    double x = 1.0\n}\n",
+    )?;
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"A\" (\n    references = @./ref.usda@</S>\n)\n{\n}\n",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(1.0)
+    );
+    Ok(())
+}
+
+/// A `Root` node's `default` outranks a weaker `Inherit` node's `timeSamples`,
+/// even though both sit in the stage's local layers.
+#[test]
+fn default_hides_inherited_samples() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .override_prim("/C")?
+        .create_attribute("x", "double")?
+        .set_at(vt::Value::Double(2.0), usd::TimeCode::new(0.0))?;
+    stage
+        .define_prim("/A")?
+        .set_metadata(
+            sdf::FieldKey::InheritPaths.as_str(),
+            vt::Value::PathListOp(sdf::PathListOp::prepended([sdf::path("/C")?])),
+        )?
+        .create_attribute("x", "double")?
+        .set(vt::Value::Double(1.0))?;
+
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(1.0)
+    );
+    Ok(())
+}
+
+/// `resolve_info` reports the proximal source, `resolve_info_at(None)` the one
+/// that answers at the default time. They differ on an attribute holding both.
+#[test]
+fn proximal_differs_from_default() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/A")?
+        .create_attribute("x", "double")?
+        .set(vt::Value::Double(1.0))?
+        .set_at(vt::Value::Double(2.0), usd::TimeCode::new(0.0))?;
+
+    let attr = stage.attribute("/A.x")?;
+    // Without a time, the time-varying source is the proximal one; asking about
+    // the default time skips it and names the `default`.
+    assert_eq!(attr.resolve_info()?.source(), usd::ResolveInfoSource::TimeSamples);
+    assert_eq!(attr.resolve_info_at(None)?.source(), usd::ResolveInfoSource::Default);
+    assert!(attr.resolve_info()?.value_source_might_be_time_varying());
+    assert!(!attr.resolve_info_at(None)?.value_source_might_be_time_varying());
+    Ok(())
+}
+
+/// A block is an authored opinion that withholds a value: the attribute still
+/// reads back its schema fallback (spec 12.3.6), and only
+/// `has_authored_value_opinion` counts the block.
+#[test]
+fn resolve_info_reports_block() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage.define_prim("/A")?.create_attribute("x", "double")?;
+    attr.clone().set(vt::Value::Double(1.0))?;
+    assert!(stage.attribute("/A.x")?.resolve_info()?.has_authored_value());
+
+    attr.block()?;
+    let info = stage.attribute("/A.x")?.resolve_info()?;
+    assert!(info.value_is_blocked());
+    assert!(!info.has_authored_value());
+    assert!(info.has_authored_value_opinion());
+    // No schema declares the attribute here, so nothing answers below the block.
+    assert_eq!(info.source(), usd::ResolveInfoSource::None);
+    assert_eq!(stage.attribute("/A.x")?.get::<f64>()?, None);
+    Ok(())
+}
+
+/// A spec site carries the cumulative offset that reaches its layer, composing
+/// the arc's offset with the layer's own sublayer offset.
+#[test]
+fn spec_site_carries_offset() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/Source")?
+        .create_attribute("x", "double")?
+        .set(vt::Value::Double(1.0))?;
+    reference_with_offset(&stage, sdf::LayerOffset::new(10.0, 2.0))?;
+
+    let attr = stage.attribute("/Prim.x")?;
+    let stack = attr.property_stack()?;
+    let site = stack.first().expect("one contributing spec");
+    assert_eq!(site.path, sdf::path("/Source.x")?);
+    assert_eq!(site.offset, sdf::LayerOffset::new(10.0, 2.0));
+    // The resolve info answers with that same site, so the two queries cannot
+    // disagree about where an opinion lives.
+    assert_eq!(attr.resolve_info()?.spec_site(), Some(site));
+    Ok(())
+}
+
+/// The node a resolve info names is the site that answered, described by value
+/// so it outlives the composition index it came from.
+#[test]
+fn resolve_info_names_node() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/Source")?
+        .create_attribute("x", "double")?
+        .set(vt::Value::Double(1.0))?;
+    reference_with_offset(&stage, sdf::LayerOffset::IDENTITY)?;
+
+    let info = stage.attribute("/Prim.x")?.resolve_info()?;
+    let node = info.node().expect("an authored opinion names its node");
+    assert_eq!(node.arc(), pcp::ArcType::Reference);
+    assert_eq!(node.path(), &sdf::path("/Source")?);
+    Ok(())
+}
+
+/// Two sublayers of one layer stack share a composition node, so the node
+/// alone cannot say which of them answered; the spec can.
+#[test]
+fn sublayer_contributors_differ() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (name, value) in [("strong.usda", 1.0), ("weak.usda", 2.0)] {
+        fs::write(
+            dir.path().join(name),
+            format!("#usda 1.0\ndef \"A\"\n{{\n    double x = {value}\n}}\n"),
+        )?;
+    }
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [\n        @./strong.usda@,\n        @./weak.usda@\n    ]\n)\n",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+
+    let attr = stage.attribute("/A.x")?;
+    let info = attr.resolve_info()?;
+    let site = info.spec_site().expect("an authored opinion names its spec");
+    assert!(
+        site.layer.identifier().ends_with("strong.usda"),
+        "the stronger sublayer answered: {site:?}"
+    );
+    // Both sublayers contribute under one node, which is why the spec is what
+    // tells them apart.
+    let stack = attr.property_stack()?;
+    assert_eq!(stack.len(), 2);
+    assert_eq!(site, &stack[0]);
+    assert_eq!(attr.get::<f64>()?, Some(1.0));
+    Ok(())
+}
+
+/// A value clip names the layer a property stack lists for it, which for an
+/// active clip holding the samples is the clip itself.
+#[test]
+fn clip_names_its_layer() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_basic"))?;
+    let attr = stage.attribute("/Model.size")?;
+    let at = usd::TimeCode::new(10.0);
+
+    let info = attr.resolve_info_at(at)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::ValueClips);
+    let site = info.spec_site().expect("a clip names the layer it was read from");
+    assert!(
+        site.layer.identifier().ends_with("clip.usd"),
+        "the clip layer answered: {site:?}"
+    );
+    assert_eq!(site, attr.property_stack_at(at)?.first().expect("a clip site"));
+
+    // Without a time no clip is selected, so there is no layer to name.
+    assert!(attr.resolve_info()?.spec_site().is_none());
+    // A clip value is read whole rather than composed, so it answers alone.
+    assert!(info.weaker_sources().is_empty());
+    Ok(())
+}
+
+/// A gap `interpolateMissingClipValues` fills is the case where the spec a
+/// resolve info names is *not* where the value came from: the stack lists the
+/// manifest, while the samples were interpolated across the clips surrounding
+/// the gap. The accessor promises the stack's site, and this pins that.
+#[test]
+fn clip_interpolated_gap_site() -> Result<()> {
+    let stage = Stage::open(&fixture_path("clip_missing_interp/root.usda"))?;
+    let attr = stage.attribute("/Model.size")?;
+    let at = usd::TimeCode::new(15.0);
+
+    // The value is interpolated between clipA's 0 and clipC's 100, so it came
+    // from neither the empty middle clip nor the manifest.
+    assert_eq!(value_f64(&stage, "/Model.size", 15.0), Some(75.0));
+    let info = attr.resolve_info_at(at)?;
+    let site = info.spec_site().expect("the stack's site");
+    assert!(
+        site.layer.identifier().ends_with("manifest.usda"),
+        "the stack names the manifest, not the clips the samples came from: {site:?}"
+    );
+    assert!(attr.property_stack_at(at)?.contains(site), "the stack lists it too");
+    Ok(())
+}
+
+/// At a gap in a clip set that authors no manifest, the value interpolates
+/// from the surrounding clips and the stack would name the manifest, which
+/// the stage synthesized and no registry holds: neither the resolve info nor
+/// the stack names a site for it.
+#[test]
+fn synthesized_manifest_gap() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = FsPath::new(&fixture_path("clip_missing_interp/root.usda"))
+        .parent()
+        .expect("a fixture directory")
+        .to_path_buf();
+    for clip in ["clipA.usda", "clipB.usda", "clipC.usda"] {
+        fs::copy(fixture.join(clip), dir.path().join(clip))?;
+    }
+    let root_path = dir.path().join("root.usda");
+    fs::write(
+        &root_path,
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clipA.usda@, @./clipB.usda@, @./clipC.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 0), (10, 1), (20, 2)]
+            bool interpolateMissingClipValues = true
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    let stage = Stage::open(root_path.to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.size")?;
+    let at = usd::TimeCode::new(15.0);
+
+    assert_eq!(value_f64(&stage, "/Model.size", 15.0), Some(75.0));
+    let info = attr.resolve_info_at(at)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::ValueClips);
+    assert!(info.spec_site().is_none(), "{:?}", info.spec_site());
+    let stack = attr.property_stack_at(at)?;
+    assert_eq!(stack.len(), 1, "{stack:?}");
+    assert!(stack[0].layer.identifier().ends_with("root.usda"), "{stack:?}");
+
+    // Where the active clip authors samples, it is the site.
+    let clip = attr.resolve_info_at(usd::TimeCode::new(5.0))?;
+    let site = clip.spec_site().expect("the clip names its layer");
+    assert!(site.layer.identifier().ends_with("clipA.usda"), "{site:?}");
+    Ok(())
+}
+
+/// Authors `opinions[i]` as `/A.expr` on sublayer `i` of a fresh stage,
+/// strongest first, and opens it. Each opinion is its declared type and its
+/// literal, so a text-valued opinion and a block author through it too.
+fn expression_stack(dir: &FsPath, opinions: &[(&str, &str)]) -> Result<Stage> {
+    let bodies: Vec<_> = opinions
+        .iter()
+        .map(|(kind, literal)| format!("    uniform {kind} expr = {literal}\n"))
+        .collect();
+    sublayer_stack(dir, &bodies)
+}
+
+/// Authors `bodies[i]` as the body of `/A` on sublayer `i` of a fresh stage,
+/// strongest first, and opens it.
+fn sublayer_stack(dir: &FsPath, bodies: &[impl AsRef<str>]) -> Result<Stage> {
+    for (i, body) in bodies.iter().enumerate() {
+        let prim = format!("def \"A\"\n{{\n{}}}\n", body.as_ref());
+        let text = match i + 1 < bodies.len() {
+            true => format!("#usda 1.0\n(\n    subLayers = [@./layer{}.usda@]\n)\n{prim}", i + 1),
+            false => format!("#usda 1.0\n{prim}"),
+        };
+        fs::write(dir.join(format!("layer{i}.usda")), text)?;
+    }
+    Stage::open(dir.join("layer0.usda").to_str().expect("utf-8 path"))
+}
+
+/// A relative expression a `string` spells in a variant anchors at the prim
+/// that holds the variant set, as one authored on the prim itself does.
+#[test]
+fn variant_expression_anchored() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let layer = dir.path().join("layer.usda");
+    fs::write(
+        &layer,
+        r#"#usda 1.0
+def "P" (
+    variants = {
+        string v = "a"
+    }
+    prepend variantSets = "v"
+)
+{
+    uniform pathExpression m = "/x// %_"
+    variantSet "v" = {
+        "a" {
+            uniform string m = ".//"
+        }
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(layer.to_str().expect("utf-8 path"))?;
+
+    assert_eq!(
+        stage
+            .attribute("/P.m")?
+            .get::<sdf::PathExpression>()?
+            .map(|expr| expr.to_string()),
+        Some("/x// /P//".to_string())
+    );
+    Ok(())
+}
+
+/// A path expression composed from weaker opinions names every one it drew
+/// on, strongest first, each with the node and spec it came from.
+#[test]
+fn chain_names_contributors() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[("pathExpression", "\"/a// %_\""), ("pathExpression", "\"/b//\"")],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/a// /b//"))
+    );
+    let info = attr.resolve_info_at(None)?;
+    let links = info.weaker_sources();
+    assert_eq!(links.len(), 1);
+    let site = links[0].spec_site().expect("a link names its spec");
+    assert!(site.layer.identifier().ends_with("layer1.usda"), "{site:?}");
+    // A link names its node as the head does, and here both are the root.
+    assert_eq!(
+        links[0].node().expect("a link names its node").arc(),
+        pcp::ArcType::Root
+    );
+    Ok(())
+}
+
+/// The chain stops where composition does: the opinion after the one that
+/// consumed the last `%_` never contributed and is not named.
+#[test]
+fn chain_stops_unreferenced() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[
+            ("pathExpression", "\"/a// %_\""),
+            ("pathExpression", "\"/b// %_\""),
+            ("pathExpression", "\"/c//\""),
+            ("pathExpression", "\"/d//\""),
+        ],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+
+    // Compared as text: composing left-to-right nests the tree differently
+    // from parsing the same expression in one go.
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?.map(|expr| expr.to_string()),
+        Some("/a// (/b// /c//)".to_string())
+    );
+    let info = attr.resolve_info_at(None)?;
+    let layers = stack_layers(
+        info.weaker_sources()
+            .iter()
+            .map(|link| link.spec_site().expect("a link names its spec").clone())
+            .collect(),
+    );
+    assert_eq!(layers.len(), 2, "the opinion after the last `%_` is not a contributor");
+    assert!(layers[0].ends_with("layer1.usda"), "{layers:?}");
+    assert!(layers[1].ends_with("layer2.usda"), "{layers:?}");
+    Ok(())
+}
+
+/// A composed value changes wherever any source it draws on does, so the
+/// sample times it reports are every contributing source's.
+#[test]
+fn chain_unions_sample_times() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e.timeSamples = {
+        0: \"/s// %_\",
+    }
+",
+            "    pathExpression e.timeSamples = {
+        1: \"/w//\",
+        2: \"/x//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    assert!(attr.might_be_time_varying()?);
+    // The composed samples are held by no one authored map, so there is none
+    // to report — and no `%_` reaches a reader through one.
+    assert_eq!(attr.time_samples()?, None);
+    // What the times promise: the value really does change at each of them.
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/s// /x//"))
+    );
+    Ok(())
+}
+
+/// A clip supplies a value like any other source: an expression that fills a
+/// stronger `%_` closes the composition, so the sources under it are masked
+/// and name no times — the same answer the read gives.
+#[test]
+fn closed_clip_expression_masks_weaker() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        0: "/clip//",
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        1: "/y//",
+        2: "/z//",
+    }
+}
+"#,
+    )?;
+    let strong = dir.path().join("strong.usda");
+    fs::write(
+        &strong,
+        r#"#usda 1.0
+(
+    subLayers = [@./root.usda@]
+)
+
+over "Model"
+{
+    pathExpression e = "/s// %_"
+}
+"#,
+    )?;
+    let stage = Stage::open(strong.to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/s// /clip//"))
+    );
+    assert_eq!(attr.time_sample_times()?, vec![0.0]);
+    Ok(())
+}
+
+/// A sample time is reported as authored, whatever its value: an infinite key
+/// is a sample like any other, and the count and the times agree about it.
+#[test]
+fn non_finite_sample_time_survives() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage.define_prim("/A")?.create_attribute("x", "double")?;
+    attr.set_at(1.0_f64, usd::TimeCode::new(f64::INFINITY))?;
+
+    let attr = stage.attribute("/A.x")?;
+    assert_eq!(attr.time_sample_times()?, vec![f64::INFINITY]);
+    assert_eq!(attr.num_time_samples()?, 1);
+    Ok(())
+}
+
+/// An ordinary text-valued clip answers on its own: a stronger composition
+/// could have read what it holds, but nothing here draws on anything weaker,
+/// so the sources under it are masked and name no times.
+#[test]
+fn text_clip_masks_weaker_times() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    string s
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    string s
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    string s.timeSamples = {
+        0: "fixed",
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    string s.timeSamples = {
+        1: "one",
+        2: "two",
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.s")?;
+
+    for time in [0.0, 1.0, 2.0] {
+        assert_eq!(
+            attr.get_at::<String>(usd::TimeCode::new(time))?,
+            Some("fixed".into()),
+            "at {time}"
+        );
+    }
+    assert_eq!(attr.time_sample_times()?, vec![0.0]);
+    Ok(())
+}
+
+/// A `string` or `token` attribute is an ordinary sampled attribute: a
+/// composition could read one, but that is a question about a *stronger*
+/// value, and it does not stop this map from being the answer.
+#[test]
+fn text_samples_keep_their_map() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage.define_prim("/A")?.create_attribute("s", "string")?;
+    attr.clone().set_at("first", usd::TimeCode::new(0.0))?;
+    attr.set_at("second", usd::TimeCode::new(1.0))?;
+
+    let samples = stage.attribute("/A.s")?.time_samples()?.expect("an authored map");
+    assert_eq!(samples.len(), 2);
+    assert_eq!(
+        stage.attribute("/A.s")?.get_at::<String>(usd::TimeCode::new(1.0))?,
+        Some("second".into())
+    );
+    Ok(())
+}
+
+/// A source that withholds the value ends the composition that reaches it,
+/// where one it merely passes over does not: the times a still-weaker source
+/// names are behind the block, and the count and the read agree on that.
+#[test]
+fn blocked_sample_closes_chain() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    pathExpression e.timeSamples = {
+        0: None,
+        1: \"/w//\",
+    }
+",
+            "    pathExpression e.timeSamples = {
+        5: \"/never//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    // The block leaves nothing to draw on, so the weakest map never answers.
+    let read = attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(5.0))?;
+    assert_eq!(read, Some(sdf::PathExpression::parse("/s// /w//")));
+    let times = attr.time_sample_times()?;
+    assert!(!times.contains(&5.0), "the block ended the composition: {times:?}");
+    assert_eq!(attr.num_time_samples()?, times.len());
+    Ok(())
+}
+
+/// A source is not one thing over all time: a map can withhold a value at one
+/// time and be passed over at another, and neither ends what the sources under
+/// it contribute.
+#[test]
+fn blocked_sample_keeps_chain_open() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    int e.timeSamples = {
+        0: None,
+        1: 7,
+    }
+",
+            "    pathExpression e.timeSamples = {
+        2: \"/y//\",
+        3: \"/z//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(3.0))?,
+        Some(sdf::PathExpression::parse("/s// /z//"))
+    );
+    let times = attr.time_sample_times()?;
+    assert!(times.contains(&2.0) && times.contains(&3.0), "{times:?}");
+    assert_eq!(attr.num_time_samples()?, times.len());
+    Ok(())
+}
+
+/// A clip holding nothing a composition reads is passed over the same way, so
+/// the sources under it still reach the times.
+#[test]
+fn ignored_clip_keeps_chain_open() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    int e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    int e.timeSamples = {
+        0: 7,
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        1: "/y//",
+        2: "/z//",
+    }
+}
+"#,
+    )?;
+    let strong = dir.path().join("strong.usda");
+    fs::write(
+        &strong,
+        r#"#usda 1.0
+(
+    subLayers = [@./root.usda@]
+)
+
+over "Model"
+{
+    pathExpression e = "/s// %_"
+}
+"#,
+    )?;
+    let stage = Stage::open(strong.to_str().expect("utf-8 path"))?;
+    let times = stage.attribute("/Model.e")?.time_sample_times()?;
+    assert!(times.contains(&1.0) && times.contains(&2.0), "{times:?}");
+    Ok(())
+}
+
+/// Counting samples follows the composition as the times do: a map the
+/// composition passes over ends nothing, so what it draws on afterwards is
+/// still counted.
+#[test]
+fn sample_count_reads_past_ignored() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    int e.timeSamples = {
+        0: 3,
+    }
+",
+            "    pathExpression e.timeSamples = {
+        1: \"/y//\",
+        2: \"/z//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/s// /z//"))
+    );
+    let times = attr.time_sample_times()?;
+    assert_eq!(attr.num_time_samples()?, times.len(), "{times:?}");
+    assert!(attr.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A clip sample authored as text is an expression where it composes into one,
+/// so what it spells decides how far clip discovery reads — the same question
+/// the ordinary sample path asks, asked of the same composition.
+#[test]
+fn text_clip_samples_keep_chain_open() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    token e.timeSamples = {
+        0: "/clip// %_",
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        1: "/y//",
+        2: "/z//",
+    }
+}
+"#,
+    )?;
+    let strong = dir.path().join("strong.usda");
+    fs::write(
+        &strong,
+        r#"#usda 1.0
+(
+    subLayers = [@./root.usda@]
+)
+
+over "Model"
+{
+    pathExpression e = "/s// %_"
+}
+"#,
+    )?;
+    let stage = Stage::open(strong.to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.e")?;
+
+    // The set stays active from 0, so the clip's own `%_` draws on the weaker
+    // sample and the stronger expression draws on both.
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/s// (/clip// /z//)"))
+    );
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    Ok(())
+}
+
+/// A clip that authors no samples for the attribute is filled from the
+/// manifest's default, so a composition that default leaves open draws on the
+/// sources weaker than the set, and reports their times.
+#[test]
+fn manifest_default_chains_sample_times() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e = "/manifest// %_"
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        1: "/y//",
+        2: "/z//",
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/manifest// /z//"))
+    );
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    Ok(())
+}
+
+/// A sample authored as text is an expression where it composes into one, so
+/// what it spells decides how far discovery reads — including a `%_` of its
+/// own, and one a closed sample before it does not speak for.
+#[test]
+fn text_samples_keep_chain_open() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    token e.timeSamples = {
+        0: \"/t// %_\",
+    }
+",
+            "    pathExpression e.timeSamples = {
+        1: \"/y//\",
+        2: \"/z//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    assert_eq!(attr.num_time_samples()?, 3);
+
+    // A closed sample does not speak for the map: a later one still composing
+    // keeps the sources under it in reach.
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    token e.timeSamples = {
+        0: \"/a//\",
+        5: \"/b// %_\",
+    }
+",
+            "    pathExpression e.timeSamples = {
+        7: \"/y//\",
+    }
+",
+        ],
+    )?;
+    assert_eq!(stage.attribute("/A.e")?.time_sample_times()?, vec![0.0, 5.0, 7.0]);
+    Ok(())
+}
+
+/// A clip whose samples compose draws on the sources weaker than it, so the
+/// times it reports are theirs too.
+#[test]
+fn clip_chain_unions_sample_times() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@]
+)
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        0: "/clip// %_",
+    }
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        1: "/y//",
+        2: "/z//",
+    }
+}
+"#,
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/clip// /z//"))
+    );
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    Ok(())
+}
+
+/// Sample times follow the composition past an opinion it ignores, whichever
+/// tier the composing value came from.
+#[test]
+fn sampled_chain_reads_past_ignored() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e.timeSamples = {
+        0: \"/s// %_\",
+    }
+",
+            "    int e = 3
+",
+            "    pathExpression e.timeSamples = {
+        1: \"/y//\",
+        2: \"/z//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(2.0))?,
+        Some(sdf::PathExpression::parse("/s// /z//"))
+    );
+    assert_eq!(attr.time_sample_times()?, vec![0.0, 1.0, 2.0]);
+    Ok(())
+}
+
+/// A cached query reports an expression in the stage's namespace, as a direct
+/// read does: a sample authored across a reference names paths in the
+/// referenced prim's namespace, not the stage's.
+#[test]
+fn query_maps_sampled_expression() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0
+def \"Original\"
+{
+    pathExpression e.timeSamples = {
+        0: \"/Original/child//\",
+    }
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0
+def \"A\" (
+    references = @./ref.usda@</Original>
+)
+{
+}
+",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(0.0);
+
+    assert_eq!(
+        usd::AttributeQuery::new(&attr).get_at::<sdf::PathExpression>(at)?,
+        attr.get_at::<sdf::PathExpression>(at)?
+    );
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/A/child//"))
+    );
+    Ok(())
+}
+
+/// An opinion the composition ignores does not end it: the sources it goes on
+/// to draw on still reach the cached query and the sample times.
+#[test]
+fn chain_reads_past_ignored_opinion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/s// %_\"
+",
+            "    int e = 3
+",
+            "    pathExpression e.timeSamples = {
+        1: \"/y//\",
+        2: \"/z//\",
+    }
+",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(2.0);
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/s// /z//"))
+    );
+    assert_eq!(
+        usd::AttributeQuery::new(&attr).get_at::<sdf::PathExpression>(at)?,
+        attr.get_at::<sdf::PathExpression>(at)?
+    );
+    assert_eq!(attr.time_sample_times()?, vec![1.0, 2.0]);
+    Ok(())
+}
+
+/// A weaker opinion authored as text is an expression like any other, so it
+/// reaches the value in the root namespace: its patterns are anchored at the
+/// prim that authored it and mapped across the arc that brought it in.
+#[test]
+fn text_opinion_maps_across_arc() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0
+def \"Original\"
+{
+    token e = \"child//\"
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0
+def \"A\" (
+    references = @./ref.usda@</Original>
+)
+{
+    pathExpression e = \"/A/strong// %_\"
+}
+",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().expect("utf-8 path"))?;
+
+    assert_eq!(
+        stage.attribute("/A.e")?.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/A/strong// /A/child//"))
+    );
+    Ok(())
+}
+
+/// A weaker opinion authored as text composes as an expression, so it is a
+/// contributor; one of a kind that composes nothing is skipped without ending
+/// the chain.
+#[test]
+fn chain_parses_text() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[
+            ("pathExpression", "\"/a// %_\""),
+            ("token", "\"/b//\""),
+            ("pathExpression", "\"/c//\""),
+        ],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+
+    // The token parses into the `%_`, so it is what the value composed over.
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/a// /b//"))
+    );
+    let info = attr.resolve_info_at(None)?;
+    assert_eq!(info.weaker_sources().len(), 1);
+    assert!(
+        info.weaker_sources()[0]
+            .spec_site()
+            .expect("a link names its spec")
+            .layer
+            .identifier()
+            .ends_with("layer1.usda"),
+        "the text opinion is the contributor"
+    );
+    Ok(())
+}
+
+/// A block ends the chain: it composes nothing itself, and nothing weaker is
+/// reached.
+#[test]
+fn chain_ends_at_block() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[
+            ("pathExpression", "\"/a// %_\""),
+            ("pathExpression", "None"),
+            ("pathExpression", "\"/c//\""),
+        ],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/a//")),
+        "the surviving `%_` resolves to nothing"
+    );
+    assert!(attr.resolve_info_at(None)?.weaker_sources().is_empty());
+    Ok(())
+}
+
+/// The chain follows the tier that answered rather than the time asked for: a
+/// numeric-time query over a composing `default` chains, while a proximal one
+/// — which answers which source would answer, not what went into a value —
+/// reports none.
+#[test]
+fn chain_follows_tier() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[("pathExpression", "\"/a// %_\""), ("pathExpression", "\"/b//\"")],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+
+    let info = attr.resolve_info_at(usd::TimeCode::new(5.0))?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    assert_eq!(info.weaker_sources().len(), 1);
+    assert!(attr.resolve_info()?.weaker_sources().is_empty());
+    Ok(())
+}
+
+/// The head and its links are specs the property stack lists, in the same
+/// relative order. The stack lists more — sites with no `default`, and the
+/// opinions composition skipped — so this is containment, not equality.
+#[test]
+fn chain_matches_property_stack() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = expression_stack(
+        dir.path(),
+        &[
+            ("pathExpression", "\"/a// %_\""),
+            ("pathExpression", "\"/b// %_\""),
+            ("pathExpression", "\"/c//\""),
+        ],
+    )?;
+    let attr = stage.attribute("/A.expr")?;
+    let info = attr.resolve_info_at(None)?;
+
+    let stack = attr.property_stack()?;
+    let mut composed = vec![info.spec_site().expect("the head names its spec").clone()];
+    composed.extend(
+        info.weaker_sources()
+            .iter()
+            .map(|link| link.spec_site().expect("a link names its spec").clone()),
+    );
+
+    let positions: Vec<usize> = composed
+        .iter()
+        .map(|site| {
+            stack
+                .iter()
+                .position(|listed| listed == site)
+                .expect("listed in the stack")
+        })
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{positions:?}");
+    Ok(())
+}
+
+/// Samples are read whole rather than composed, so that tier answers alone.
+#[test]
+fn samples_have_no_chain() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let samples = stage.define_prim("/S")?.create_attribute("x", "double")?;
+    samples.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?;
+
+    let info = stage.attribute("/S.x")?.resolve_info_at(usd::TimeCode::new(0.0))?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::TimeSamples);
+    assert!(info.weaker_sources().is_empty());
+    Ok(())
+}
+
+/// A sample that composes nothing still closes: a weaker reference is a
+/// composition token, and a read never hands one back.
+#[test]
+fn sampled_expression_closes() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let expr = stage.define_prim("/S")?.create_attribute("e", "pathExpression")?;
+    expr.set_at(sdf::PathExpression::parse("/s// %_"), usd::TimeCode::new(0.0))?;
+
+    assert_eq!(
+        stage
+            .attribute("/S.e")?
+            .get_at::<sdf::PathExpression>(usd::TimeCode::new(0.0))?,
+        Some(sdf::PathExpression::parse("/s//"))
+    );
+    Ok(())
+}
+
+/// Composition crosses the tiers: a `default` whose `%_` outlives the layers
+/// that hold `default`s draws on a weaker layer's time samples, and names that
+/// tier as the link.
+#[test]
+fn chain_reaches_samples() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    pathExpression e.timeSamples = {\n        0: \"/sampled//\",\n    }\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(0.0);
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/strong// /sampled//"))
+    );
+    let info = attr.resolve_info_at(at)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    let links = info.weaker_sources();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].source(), usd::ResolveInfoSource::TimeSamples);
+    assert!(
+        links[0]
+            .spec_site()
+            .is_some_and(|site| site.layer.identifier().ends_with("layer1.usda")),
+        "{links:?}"
+    );
+    Ok(())
+}
+
+/// A value clip is a source like any other, so a composing `default` stronger
+/// than the set draws on what the clip holds and names the clip as its link.
+#[test]
+fn chain_reaches_clip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // The clips are authored a layer below the composing opinion: a set is
+    // consulted only at the layer that declared it, and a site that answers
+    // never consults its own.
+    write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            asset manifestAssetPath = @./manifest.usda@
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e
+}
+"#,
+        r#"#usda 1.0
+
+def "Model"
+{
+    pathExpression e.timeSamples = {
+        0: "/clipped//",
+    }
+}
+"#,
+    )?;
+    let strong = dir.path().join("strong.usda");
+    fs::write(
+        &strong,
+        r#"#usda 1.0
+(
+    subLayers = [@./root.usda@]
+)
+
+over "Model"
+{
+    pathExpression e = "/strong// %_"
+}
+"#,
+    )?;
+    let stage = Stage::open(strong.to_str().expect("utf-8 path"))?;
+    let attr = stage.attribute("/Model.e")?;
+    let at = usd::TimeCode::new(0.0);
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/strong// /clipped//"))
+    );
+    let info = attr.resolve_info_at(at)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    let links = info.weaker_sources();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].source(), usd::ResolveInfoSource::ValueClips);
+    assert!(
+        links[0]
+            .spec_site()
+            .is_some_and(|site| site.layer.identifier().ends_with("clip.usda")),
+        "the link names the clip the value came from: {links:?}"
+    );
+    Ok(())
+}
+
+/// A site supplies one source: samples that answer there hide that site's own
+/// `default`, so a composing sample draws on the next site rather than on the
+/// opinion beside it (C++ moves to the next layer once a tier has answered).
+#[test]
+fn chain_skips_answered_site() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/beside//\"\n    pathExpression e.timeSamples = {\n        0: \"/sampled// %_\",\n    }\n",
+            "    pathExpression e = \"/weak//\"\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(0.0);
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/sampled// /weak//"))
+    );
+    let links = attr.resolve_info_at(at)?.weaker_sources().to_vec();
+    assert_eq!(links.len(), 1);
+    assert!(
+        links[0]
+            .spec_site()
+            .is_some_and(|site| site.layer.identifier().ends_with("layer1.usda")),
+        "the `default` beside the samples is not a source: {links:?}"
+    );
+    Ok(())
+}
+
+/// A cached query answers a composing value exactly as a direct read does: its
+/// source is not one snapshot, because what the value draws on changes with
+/// time.
+#[test]
+fn query_matches_composed_read() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    pathExpression e.timeSamples = {\n        0: \"/sampled//\",\n    }\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(0.0);
+    let query = usd::AttributeQuery::new(&attr);
+
+    assert_eq!(
+        query.get_at::<sdf::PathExpression>(at)?,
+        attr.get_at::<sdf::PathExpression>(at)?
+    );
+    assert_eq!(
+        query.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/strong// /sampled//"))
+    );
+    Ok(())
+}
+
+/// The same for a composing value a clip answers: the set is reached only
+/// because the stronger value composes, and it still rules out a snapshot.
+#[test]
+fn sampled_expression_query_varies() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e.timeSamples = {\n        0: \"/a// %_\",\n        10: \"/b// %_\",\n    }\n",
+            "    pathExpression e = \"/weak//\"\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let query = usd::AttributeQuery::new(&attr);
+
+    for time in [0.0, 10.0] {
+        let at = usd::TimeCode::new(time);
+        assert_eq!(
+            query.get_at::<sdf::PathExpression>(at)?,
+            attr.get_at::<sdf::PathExpression>(at)?,
+            "at {time}"
+        );
+    }
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(usd::TimeCode::new(10.0))?,
+        Some(sdf::PathExpression::parse("/b// /weak//"))
+    );
+    Ok(())
+}
+
+/// A value that composes over time samples is not constant, and a query that
+/// names no time says so too — it reads past the composing source to find out,
+/// without reporting the chain a timed query would.
+#[test]
+fn proximal_reports_varying() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    pathExpression e.timeSamples = {\n        0: \"/sampled//\",\n    }\n",
+        ],
+    )?;
+    let info = stage.attribute("/A.e")?.resolve_info()?;
+
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    assert!(info.value_source_might_be_time_varying());
+    assert!(info.weaker_sources().is_empty(), "a proximal query builds no chain");
+    Ok(())
+}
+
+/// A source that answers under a composing value but composes nothing into it
+/// is no link: the chain names what the value is made of.
+#[test]
+fn chain_omits_foreign_kind() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    int e = 3\n",
+            "    pathExpression e = \"/weak//\"\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/strong// /weak//"))
+    );
+    let links = attr.resolve_info_at(None)?.weaker_sources().to_vec();
+    assert_eq!(links.len(), 1, "the int composed nothing: {links:?}");
+    assert!(
+        links[0]
+            .spec_site()
+            .is_some_and(|site| site.layer.identifier().ends_with("layer2.usda")),
+        "{links:?}"
+    );
+    Ok(())
+}
+
+/// A weaker source that supplies no value blocks nothing it never answered
+/// for: the composing value that reached it is still the answer.
+#[test]
+fn chain_keeps_value_past_block() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        dir.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    pathExpression e = None\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let info = attr.resolve_info_at(None)?;
+
+    assert_eq!(
+        attr.get::<sdf::PathExpression>()?,
+        Some(sdf::PathExpression::parse("/strong//"))
+    );
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    assert!(!info.value_is_blocked(), "the block answered nothing");
+
+    let sampled = tempfile::tempdir()?;
+    let stage = sublayer_stack(
+        sampled.path(),
+        &[
+            "    pathExpression e = \"/strong// %_\"\n",
+            "    pathExpression e.timeSamples = {\n        0: None,\n    }\n",
+        ],
+    )?;
+    let attr = stage.attribute("/A.e")?;
+    let at = usd::TimeCode::new(0.0);
+    let info = attr.resolve_info_at(at)?;
+
+    assert_eq!(
+        attr.get_at::<sdf::PathExpression>(at)?,
+        Some(sdf::PathExpression::parse("/strong//"))
+    );
+    assert_eq!(info.source(), usd::ResolveInfoSource::Default);
+    assert!(!info.value_is_blocked(), "the blocked samples answered nothing");
+    Ok(())
+}
+
+/// Sites are visited in strength order, not partitioned by which layer stack
+/// holds them: a weaker `specializes` authored in the root layer must not
+/// outrank a stronger reference just because its layer is the root's.
+#[test]
+fn resolve_info_strength_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0
+def \"S\"
+{
+    double x = 111.0
+}
+",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        concat!(
+            "#usda 1.0
+",
+            "class \"C\"
+{
+    double x = 999.0
+}
+",
+            "def \"A\" (
+    references = @./ref.usda@</S>
+    specializes = </C>
+)
+{
+}
+",
+        ),
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let attr = stage.attribute("/A.x")?;
+    // The reference supplies the value, so it must also be the site reported.
+    assert_eq!(attr.get::<f64>()?, Some(111.0));
+    assert_eq!(
+        attr.resolve_info()?.node().map(pcp::ResolveNode::arc),
+        Some(pcp::ArcType::Reference)
+    );
+    let stack: Vec<_> = attr.property_stack()?.into_iter().map(|site| site.path).collect();
+    assert_eq!(stack, vec![sdf::path("/S.x")?, sdf::path("/C.x")?]);
+    Ok(())
+}
+
+/// A blocked `timeSamples` field is an authored opinion even though it is not
+/// a `default` block, which is the only kind `value_is_blocked` reports.
+#[test]
+fn blocked_field_is_authored() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage.define_prim("/A")?.create_attribute("x", "double")?;
+    author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock)?;
+
+    let info = stage.attribute("/A.x")?.resolve_info()?;
+    assert!(info.has_authored_value_opinion());
+    assert!(!info.has_authored_value());
+    assert!(!info.value_is_blocked());
+    Ok(())
+}
+
+/// A blocked `timeSamples` field withholds samples, not the value: resolution
+/// carries on to the `default` at the same site, as C++ does for a layer with
+/// no samples.
+#[test]
+fn blocked_samples_fall_through() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage
+        .define_prim("/A")?
+        .create_attribute("x", "double")?
+        .set(vt::Value::Double(5.0))?;
+    author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock)?;
+
+    let attr = stage.attribute("/A.x")?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(5.0));
+    assert_eq!(attr.get::<f64>()?, Some(5.0));
+    Ok(())
+}
+
+/// A clip set the walk never reaches is never composed, so a malformed
+/// expression inside it raises no diagnostic on a locally-sourced read.
+#[test]
+fn shadowed_clip_stays_uncomposed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        concat!(
+            "#usda 1.0
+",
+            "def \"Model\" (
+",
+            "    clips = {
+",
+            "        dictionary default = {
+",
+            "            asset[] assetPaths = [@`bad(`@]
+",
+            "            string primPath = \"/Model\"
+",
+            "            double2[] active = [(0, 0)]
+",
+            "        }
+",
+            "    }
+",
+            ")
+{
+    double size = 42.0
+}
+",
+        ),
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    // The local `default` answers, so the clip set below it never composes.
+    assert_eq!(
+        stage.attribute("/Model.size")?.get_at::<f64>(usd::TimeCode::new(0.0))?,
+        Some(42.0)
+    );
+    assert!(stage.composition_errors().is_empty());
+    Ok(())
+}
+
+/// A default-time query resolves from `default` alone, but authored samples
+/// are still an authored opinion and are reported as one.
+#[test]
+fn default_time_sees_samples() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/A")?
+        .create_attribute("x", "double")?
+        .set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?;
+
+    let info = stage.attribute("/A.x")?.resolve_info_at(None)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::None);
+    assert!(!info.has_authored_value(), "no default answers at the default time");
+    assert!(info.has_authored_value_opinion(), "the samples are authored");
+    Ok(())
+}
+
+/// A map mixing real and blocked samples supplies a value at some times and
+/// not others, so a timed resolve info has to interpolate rather than judge the
+/// map as a whole — and it must agree with the value read at that same time.
+#[test]
+fn mixed_blocks_track_time() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/A")?
+        .create_attribute("x", "double")?
+        .set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+        .set_at(vt::Value::ValueBlock, usd::TimeCode::new(10.0))?;
+
+    let attr = stage.attribute("/A.x")?;
+    let live = attr.resolve_info_at(usd::TimeCode::new(0.0))?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(1.0));
+    assert_eq!(live.source(), usd::ResolveInfoSource::TimeSamples);
+    assert!(live.has_authored_value());
+    assert!(!live.value_is_blocked());
+
+    // Before the block the earlier sample holds, and the resolve info agrees.
+    let held = attr.resolve_info_at(usd::TimeCode::new(5.0))?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(5.0))?, Some(1.0));
+    assert_eq!(held.source(), usd::ResolveInfoSource::TimeSamples);
+    assert!(!held.value_is_blocked());
+
+    let blocked = attr.resolve_info_at(usd::TimeCode::new(10.0))?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(10.0))?, None);
+    assert_eq!(blocked.source(), usd::ResolveInfoSource::None);
+    assert!(!blocked.has_authored_value());
+    assert!(blocked.value_is_blocked());
+
+    // Without a time the map is a potential source: it does supply a value.
+    assert_eq!(attr.resolve_info()?.source(), usd::ResolveInfoSource::TimeSamples);
+    Ok(())
+}
+
+/// `Attribute::block` blocks the `default` and each authored sample in place,
+/// so a sample map survives holding only blocks. It supplies no value at any
+/// time, and the resolve info must say so rather than report a value source.
+#[test]
+fn blocked_values_report_block() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage
+        .define_prim("/A")?
+        .create_attribute("x", "double")?
+        .set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+        .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?
+        .block()?;
+
+    let attr = stage.attribute("/A.x")?;
+    let at = usd::TimeCode::new(5.0);
+    assert_eq!(attr.get_at::<f64>(at)?, None);
+
+    let info = attr.resolve_info_at(at)?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::None);
+    assert!(!info.has_authored_value(), "no value survives, matching get_at");
+    assert!(info.value_is_blocked());
+    assert!(info.has_authored_value_opinion());
+    Ok(())
+}
+
+/// A blocked `timeSamples` field withholds samples from every weaker opinion
+/// too, so the introspection queries agree with the composed sample map.
+#[test]
+fn blocked_samples_hide_weaker() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("sub.usda"),
+        "#usda 1.0
+def \"A\"
+{
+    double x.timeSamples = { 0: 9.0 }
+}
+",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+(
+    subLayers = [@./sub.usda@]
+)
+def \"A\"
+{
+}
+",
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let attr = stage.create_attribute("/A.x", "double")?;
+    author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock)?;
+
+    let attr = stage.attribute("/A.x")?;
+    assert_eq!(attr.time_samples()?, None);
+    assert!(attr.time_sample_times()?.is_empty());
+    assert_eq!(attr.num_time_samples()?, 0);
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, None);
+    Ok(())
+}
+
+/// An empty sample map is no more a source than an absent field, so a weaker
+/// `default` still answers and the reported source agrees with the count.
+#[test]
+fn empty_samples_no_source() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage
+        .define_prim("/B")?
+        .create_attribute("y", "double")?
+        .set(vt::Value::Double(7.0))?;
+    author_raw_field(
+        &attr,
+        sdf::FieldKey::TimeSamples.as_str(),
+        vt::Value::TimeSamples(vec![]),
+    )?;
+
+    let attr = stage.attribute("/B.y")?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(7.0));
+    assert_eq!(attr.num_time_samples()?, 0);
+    assert_eq!(attr.resolve_info()?.source(), usd::ResolveInfoSource::Default);
+    Ok(())
+}
+
+/// A prim outside the population mask reports no sample times and a zero count,
+/// matching the masked behavior of value resolution.
+#[test]
+fn time_sample_times_masked() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/B"])?)
+        .in_memory("anon.usda")?;
+    // The stage composes nothing at `/A`, so a stage-tier write there has no
+    // declaration to validate against; the samples go onto the layer.
+    stage.root_layer().edit(|e| {
+        sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "")?;
+        let mut x = sdf::AttributeSpec::new(e.data_mut(), "/A.x", "double", sdf::Variability::Varying, true)?;
+        x.set_time_sample(0.0, vt::Value::Double(1.0))?;
+        x.set_time_sample(10.0, vt::Value::Double(3.0))?;
+        Ok(())
+    })?;
+    stage.define_prim("/B")?.create_attribute("y", "double")?;
+
+    let masked = stage.attribute("/A.x")?;
+    assert!(masked.time_sample_times()?.is_empty());
+    assert_eq!(masked.num_time_samples()?, 0);
+    Ok(())
+}
+
+/// An arc target on an instance-proxy path redirects to the shared prototype:
+/// it finds the arc authored inside the prototype and maps in the prototype's
+/// namespace, so a prototype path remaps to the arc source while the proxy
+/// path does not reach it.
+#[test]
+fn edit_target_for_instance_proxy() -> Result<()> {
+    let stage = Stage::open(&fixture_path("instancing_nested_reference.usda"))?;
+    let proxy = sdf::path("/World/Inst/OtherChild")?;
+    let target = stage.edit_target_for_node(&proxy, EditTargetArc::Reference)?;
+    assert!(target.layer_identifier().ends_with("instancing_nested_reference.usda"));
+
+    // The prototype-namespace path remaps to the shared arc source; the proxy
+    // path falls outside the mapping's domain, so it does not reach that source.
+    let proto = stage
+        .prim("/World/Inst")?
+        .prototype()?
+        .expect("instance has a prototype");
+    let proto_child = proto.append_path(sdf::path("OtherChild")?)?;
+    let source = target.map_to_spec_path(&proto_child).expect("prototype path maps");
+    assert_ne!(source, proto_child, "prototype path remaps to the arc source");
+    assert_ne!(target.map_to_spec_path(&proxy), Some(source));
+    Ok(())
+}
+
+// --- Value clips (spec 12.3.4) ---
+
+fn clip_asset(name: &str) -> String {
+    format!(
+        "{}vendor/core-spec-supplemental-release_dec2025/value_resolution/tests/assets/{name}/entry.usd",
+        env!("CARGO_WORKSPACE_DIR")
+    )
+}
+
+/// A clip read opens only the clips it needs: an unparseable clip that is
+/// never active, or that activates past the queried times, leaves the value
+/// read from the other clip intact.
+#[test]
+fn clip_reads_needed_assets() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("manifest.usda"),
+        "#usda 1.0\ndef \"Model\" {\n float size\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("a.usda"),
+        "#usda 1.0\ndef \"Model\" {\n float size.timeSamples = {0: 1, 20: 3}\n}\n",
+    )?;
+    fs::write(dir.path().join("bad.usda"), "#usda 1.0\ndef !!!")?;
+    for active in ["[(0, 0), (10, 0)]", "[(0, 0), (100, 1)]"] {
+        fs::write(
+            dir.path().join("root.usda"),
+            format!(
+                r#"#usda 1.0
+def "Model" (
+    clips = {{
+        dictionary default = {{
+            asset[] assetPaths = [@a.usda@, @bad.usda@]
+            asset manifestAssetPath = @manifest.usda@
+            string primPath = "/Model"
+            double2[] active = {active}
+        }}
+    }}
+) {{
+    float size
+}}
+"#
+            ),
+        )?;
+        let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+        for (time, expected) in [(0.0, 1.0), (5.0, 1.5), (10.0, 2.0)] {
+            assert_eq!(value_f64(&stage, "/Model.size", time), Some(expected), "{active}");
+        }
+    }
+    Ok(())
+}
+
+fn value_f64(stage: &Stage, attr: &str, time: f64) -> Option<f64> {
+    match stage
+        .attribute(attr)
+        .unwrap()
+        .get_at::<vt::Value>(usd::TimeCode::new(time))
+        .expect("value_at")
+    {
+        Some(vt::Value::Float(v)) => Some(v as f64),
+        Some(vt::Value::Double(v)) => Some(v),
+        Some(vt::Value::Int64(v)) => Some(v as f64),
+        _ => None,
+    }
+}
+
+fn write_clip_scene(dir: &std::path::Path, root_body: &str, manifest_body: &str, clip_body: &str) -> Result<String> {
+    fs::write(dir.join("root.usda"), root_body)?;
+    fs::write(dir.join("manifest.usda"), manifest_body)?;
+    fs::write(dir.join("clip.usda"), clip_body)?;
+    Ok(dir.join("root.usda").to_string_lossy().into_owned())
+}
+
+/// A clip that cannot be opened contributes nothing rather than failing the
+/// read: the set still resolves from the clips that did open, at every time, and
+/// the unreadable clip is reported as a composition error rather than silently
+/// dropping what it carried.
+///
+/// Because a manifest synthesized while a clip was missing is never reused, the
+/// clip is picked up as soon as it can be opened — a sequence still being
+/// written does not poison the stage for its lifetime. `extra` is what pins
+/// that: only the late clip declares it, so it can resolve only if the manifest
+/// was regenerated.
+#[test]
+fn clip_missing_asset_recovers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("clip0.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 1 }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Model"
+)
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip0.usda@, @./clip1.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 0), (10, 1)]
+        }
+    }
+)
+{
+    float size
+    float extra
+}
+"#,
+    )?;
+
+    let root = dir.path().join("root.usda").to_string_lossy().into_owned();
+    let stage = Stage::open(&root)?;
+    // clip1.usda does not exist yet: the read succeeds on clip0's window.
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(1.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), None);
+    assert_eq!(value_f64(&stage, "/Model.extra", 10.0), None);
+    assert!(stage.composition_errors().iter().any(
+        |error| matches!(error, openusd::pcp::CompositionDiagnostic::UnreadableClip { asset_path, .. }
+                                  if asset_path.contains("clip1.usda"))
+    ));
+
+    fs::write(
+        dir.path().join("clip1.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 10: 2 }\n    float extra.timeSamples = { 10: 7 }\n}\n",
+    )?;
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(2.0));
+    // Only the late clip declares `extra`, so this resolves only because the
+    // incomplete manifest was regenerated rather than reused.
+    assert_eq!(value_f64(&stage, "/Model.extra", 10.0), Some(7.0));
+    Ok(())
+}
+
+/// A manifest value block at a clip's activation time is the author's statement
+/// that the clip carries no samples for the attribute, and the gap search under
+/// `interpolateMissingClipValues` honours it without opening that clip — which
+/// is the whole point of authoring blocks. The empty clip at stage 10 leaves a
+/// gap at `t = 15`; the forward bracket is normally clipC at stage 20, but a
+/// block there sends the search on to clipD at stage 30 instead. The manifest
+/// wins over what clipC actually holds, so the two answers differ.
+#[test]
+fn clip_manifest_block_skips_clip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (name, body) in [
+        ("clipA.usda", "float size.timeSamples = { 0: 0.0 }"),
+        ("clipB.usda", ""),
+        ("clipC.usda", "float size.timeSamples = { 20: 100.0 }"),
+        ("clipD.usda", "float size.timeSamples = { 30: 300.0 }"),
+    ] {
+        fs::write(
+            dir.path().join(name),
+            format!("#usda 1.0\ndef \"Model\"\n{{\n    {body}\n}}\n"),
+        )?;
+    }
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Model"
+)
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clipA.usda@, @./clipB.usda@, @./clipC.usda@, @./clipD.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0), (10, 1), (20, 2), (30, 3)]
+            bool interpolateMissingClipValues = true
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    let root = dir.path().join("root.usda").to_string_lossy().into_owned();
+
+    // Unblocked: the gap at 15 brackets clipA's 0 at stage 0 and clipC's 100 at
+    // stage 20, and reading clipC's own window returns what it holds.
+    fs::write(
+        dir.path().join("manifest.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+    )?;
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/Model.size", 15.0), Some(75.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 20.0), Some(100.0));
+    // The value comes from clipC, so the stack names it.
+    let stack = stack_layers(
+        stage
+            .attribute("/Model.size")?
+            .property_stack_at(usd::TimeCode::new(20.0))?,
+    );
+    assert!(stack.iter().any(|layer| layer.ends_with("clipC.usda")), "{stack:?}");
+
+    // Blocked at clipC's activation time, the forward bracket becomes clipD's
+    // 300 at stage 30 — and reading inside clipC's own window honours the same
+    // block instead of returning the 100 the clip holds, so the two paths agree
+    // on what clipC contributes.
+    fs::write(
+        dir.path().join("manifest.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 20: None }\n}\n",
+    )?;
+    // The manifest excludes clipC even when opening that asset would fail.
+    fs::write(dir.path().join("clipC.usda"), "#usda 1.0\ndef !!!")?;
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/Model.size", 15.0), Some(150.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 20.0), Some(200.0));
+    // The block excludes clipC from sourcing the attribute, so the stack has to
+    // exclude it too rather than name a clip the value never came from.
+    let stack = stack_layers(
+        stage
+            .attribute("/Model.size")?
+            .property_stack_at(usd::TimeCode::new(20.0))?,
+    );
+    assert!(stack.iter().any(|layer| layer.ends_with("manifest.usda")), "{stack:?}");
+    assert!(!stack.iter().any(|layer| layer.ends_with("clipC.usda")), "{stack:?}");
+    Ok(())
+}
+
+/// Value-clip sample times surface through the introspection accessors (spec
+/// 12.3.4): the template set schedules clip.1 at stage 1 and clip.2 at stage 2,
+/// so `/Model.size` — which authors no local `timeSamples` — reports those.
+#[test]
+fn clip_time_samples_gathered() -> Result<()> {
+    let stage = Stage::open(&fixture_path("clip_template/root.usda"))?;
+    let size = stage.attribute("/Model.size")?;
+    assert_eq!(size.time_sample_times()?, vec![1.0, 2.0]);
+    assert_eq!(size.num_time_samples()?, 2);
+    assert!(size.might_be_time_varying()?);
+    assert_eq!(size.time_samples_in(1.5..=3.0)?, vec![2.0]);
+    Ok(())
+}
+
+/// A clip set that sources an attribute and schedules more than one clip
+/// might vary whatever its clips hold, so `might_be_time_varying` answers from
+/// the manifest and the schedule: clips that would fail to open are never
+/// read.
+#[test]
+fn clip_varying_skips_clips() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_two_clip_scene(dir.path(), UNREADABLE_CLIP, "[(0, 0), (10, 1)]")?;
+    let stage = Stage::open(&root)?;
+    assert!(stage.attribute("/Model.size")?.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A clip listed in `assetPaths` but never scheduled by `active` is never
+/// read, as C++ builds a set's clips from its schedule: an unreadable one does
+/// not fail a query that reads the set's samples.
+#[test]
+fn clip_unscheduled_never_read() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let clip = "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 5.0, 1: 6.0 }\n}\n";
+    let root = write_two_clip_scene(dir.path(), clip, "[(0, 0)]")?;
+    let stage = Stage::open(&root)?;
+    let size = stage.attribute("/Model.size")?;
+    assert_eq!(size.num_time_samples()?, 2);
+    assert!(size.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A clip layer that fails to parse, so a test fails if it is ever read.
+const UNREADABLE_CLIP: &str = "#usda 1.0\ndef !!!";
+
+/// Writes a root whose `/Model` sources `size` from a clip set over
+/// `clipA.usda` (holding `clip_a`) and an unreadable `clipB.usda`, scheduled
+/// by `active`, with an authored manifest. Returns the root's path.
+fn write_two_clip_scene(dir: &FsPath, clip_a: &str, active: &str) -> Result<String> {
+    fs::write(dir.join("clipA.usda"), clip_a)?;
+    fs::write(dir.join("clipB.usda"), UNREADABLE_CLIP)?;
+    fs::write(
+        dir.join("manifest.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+    )?;
+    let root = format!(
+        r#"#usda 1.0
+def "Model" (
+    clips = {{
+        dictionary default = {{
+            asset[] assetPaths = [@./clipA.usda@, @./clipB.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = {active}
+        }}
+    }}
+)
+{{
+    float size
+}}
+"#
+    );
+    fs::write(dir.join("root.usda"), root)?;
+    Ok(dir.join("root.usda").to_string_lossy().into_owned())
+}
+
+/// With `interpolateMissingClipValues`, `time_sample_times` reports the
+/// activation boundary of a declared but empty middle clip, and values
+/// interpolate across it (spec 12.3.4.7).
+#[test]
+fn clip_interpolate_missing_boundary_is_a_sample() -> Result<()> {
+    let stage = Stage::open(&fixture_path("clip_missing_interp/root.usda"))?;
+    let size = stage.attribute("/Model.size")?;
+    // clipA@0, the empty-clip boundary at 10, and clipC@20.
+    assert_eq!(size.time_sample_times()?, vec![0.0, 10.0, 20.0]);
+    // Values interpolate across the switch at 10, as C++ resolves them.
+    let before = value_f64(&stage, "/Model.size", 9.999).unwrap();
+    assert!((before - 49.995).abs() < 1e-4, "{before}");
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(50.0));
+    Ok(())
+}
+
+/// A clip overrides a referenced attribute that has no local opinion: the
+/// clip's samples win over the reference's (spec 12.3.4.5).
+#[test]
+fn clip_basic_overrides_reference() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_basic"))?;
+    // clip.usd authors size = stage time; the reference authors negatives.
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(10.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 7.0), Some(7.0)); // interpolated
+    Ok(())
+}
+
+/// An attribute resolved through value clips routes the query through the full
+/// resolution path (clips are time-dependent), so the query reproduces `get_at`
+/// at every time code.
+#[test]
+fn query_clip_fallback() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_basic"))?;
+    let attr = stage.attribute("/Model.size")?;
+    let q = attr.query();
+    for t in [0.0, 7.0, 10.0, 15.0] {
+        assert_eq!(
+            q.get_at::<vt::Value>(usd::TimeCode::new(t))?,
+            attr.get_at(usd::TimeCode::new(t))?
+        );
+    }
+    assert_eq!(q.get_at::<f32>(usd::TimeCode::new(7.0))?, Some(7.0));
+    Ok(())
+}
+
+/// A query over clips opens only the clip active at the time it reads: one
+/// that would fail to open, scheduled at another time, is never read.
+#[test]
+fn query_clip_opens_active() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let clip = "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 5.0 }\n}\n";
+    let root = write_two_clip_scene(dir.path(), clip, "[(0, 0), (10, 1)]")?;
+    let stage = Stage::open(&root)?;
+    let q = stage.attribute("/Model.size")?.query();
+    assert_eq!(q.get_at::<f32>(usd::TimeCode::new(0.0))?, Some(5.0));
+    Ok(())
+}
+
+/// Local time samples beat clips; a clip beats a referenced attribute that
+/// has no local opinion (spec 12.3.4.5).
+#[test]
+fn clip_strength_local_vs_reference() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_advanced"))?;
+    // `local` has a local opinion → local wins (10, not the clip's -10).
+    assert_eq!(value_f64(&stage, "/Model.local", 10.0), Some(10.0));
+    // `ref` has no local opinion → the clip wins (-10, not the reference's 10).
+    assert_eq!(value_f64(&stage, "/Model.ref", 10.0), Some(-10.0));
+    Ok(())
+}
+
+#[test]
+fn clip_local_default_wins() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float localDefault = 3
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float localDefault
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float localDefault.timeSamples = {
+        0: 7
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/Model.localDefault", 0.0), Some(3.0));
+    Ok(())
+}
+
+/// A local `default` shadows a value clip in introspection just as it does in
+/// value resolution (spec 12.3.4.5): the value is the constant default, so the
+/// attribute reports no sample times and is not time-varying — the clip's
+/// schedule must not leak through.
+#[test]
+fn clip_local_default_no_time_samples() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float localDefault = 3
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float localDefault
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float localDefault.timeSamples = {
+        0: 7,
+        5: 9,
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.localDefault")?;
+    assert_eq!(value_f64(&stage, "/Model.localDefault", 0.0), Some(3.0));
+    assert!(attr.time_sample_times()?.is_empty());
+    assert_eq!(attr.num_time_samples()?, 0);
+    assert!(!attr.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A constant local `default` shadows a multi-clip set: `value_at` is the
+/// constant default at every time, so `value_might_be_time_varying` must be
+/// false even though the shadowed clip set switches active clips. The clip
+/// schedule is only consulted once clips are the winning source.
+#[test]
+fn clip_shadowed_default_not_varying() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@, @./clip.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 0), (10, 1)]
+        }
+    }
+)
+{
+    float size = 3
+}
+"#,
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 7, 5: 9 }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(3.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 12.0), Some(3.0));
+    assert!(attr.time_sample_times()?.is_empty());
+    assert!(!attr.might_be_time_varying()?);
+    Ok(())
+}
+
+/// A manifest-less clip set sources only attributes its clips actually author.
+/// `size` (authored by the clip) reports the clip sample times, while `other`
+/// (not authored) reports none rather than the clip's activation schedule —
+/// matching the fall-through in value resolution.
+#[test]
+fn clip_manifestless_unauthored_no_times() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("clip.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 10, 4: 20 }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size
+    float other
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&dir.path().join("root.usda").to_string_lossy())?;
+    // The clip authors `size`, so its sample times surface.
+    assert_eq!(stage.attribute("/Model.size")?.time_sample_times()?, vec![0.0, 4.0]);
+    // The clip never authors `other`: no spurious clip-boundary sample times.
+    let other = stage.attribute("/Model.other")?;
+    assert!(other.time_sample_times()?.is_empty());
+    assert_eq!(other.num_time_samples()?, 0);
+    Ok(())
+}
+
+/// A manifest-less set participates only via the clips its `active` schedule
+/// names. Here `active` selects only the empty clip while an unscheduled clip
+/// authors samples, so `value_at` falls through to the referenced `timeSamples`
+/// — and introspection must surface those arc times, not the empty clip's none.
+#[test]
+fn clip_manifestless_unscheduled_clip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("sampled.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 1, 4: 2 }\n}\n",
+    )?;
+    fs::write(dir.path().join("empty.usda"), "#usda 1.0\ndef \"Model\"\n{\n}\n")?;
+    fs::write(
+        dir.path().join("ref.usda"),
+        "#usda 1.0\n(\n    defaultPrim = \"Model\"\n)\ndef \"Model\"\n{\n    float size.timeSamples = { 5: 50, 8: 80 }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Model"
+)
+def "Model" (
+    references = @./ref.usda@
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./sampled.usda@, @./empty.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 1)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&dir.path().join("root.usda").to_string_lossy())?;
+    let size = stage.attribute("/Model.size")?;
+    // The scheduled clip (index 1) is empty, so the set does not source `size`;
+    // introspection reports the reference arc's times, agreeing with value_at.
+    assert_eq!(size.time_sample_times()?, vec![5.0, 8.0]);
+    assert_eq!(value_f64(&stage, "/Model.size", 5.0), Some(50.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 8.0), Some(80.0));
+    Ok(())
+}
+
+/// A clip set that authors no manifest gets one synthesized from its clips, so
+/// clip0's `size` samples make the set own the attribute. Each clip reports the
+/// stage time it activates at — 0 and 10 — while clip0's lone sample maps to
+/// stage 50, outside its `[0, 10)` window, and clip1 authors none.
+///
+/// clip0 holds its sample back over its window, and from the switch at 10 the
+/// empty clip1 is active: the set answers authoritatively that there is no
+/// value, rather than deferring to the reference's `999`.
+#[test]
+fn clip_manifestless_held_boundary() -> Result<()> {
+    let stage = Stage::open(&fixture_path("clip_manifestless_held/root.usda"))?;
+    let size = stage.attribute("/Model.size")?;
+    assert_eq!(size.time_sample_times()?, vec![0.0, 10.0]);
+    assert_eq!(size.num_time_samples()?, 2);
+    assert!(size.might_be_time_varying()?);
+    assert_eq!(value_f64(&stage, "/Model.size", 5.0), Some(50.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 9.999), Some(50.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), None);
+    Ok(())
+}
+
+/// A manifest-less clip set with an empty interior window reports that window's
+/// boundary too: clip0 and clip2 author samples, the middle clip authors
+/// nothing, and `value_at` changes at each boundary, so all are reported.
+#[test]
+fn clip_manifestless_interior_empty() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("clip0.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 0: 0, 2: 2 }\n}\n",
+    )?;
+    fs::write(dir.path().join("clip1.usda"), "#usda 1.0\ndef \"Model\"\n{\n}\n")?;
+    fs::write(
+        dir.path().join("clip2.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 20: 20, 22: 22 }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    defaultPrim = "Model"
+)
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip0.usda@, @./clip1.usda@, @./clip2.usda@]
+            string primPath = "/Model"
+            double2[] active = [(0, 0), (10, 1), (20, 2)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    let stage = Stage::open(&dir.path().join("root.usda").to_string_lossy())?;
+    let size = stage.attribute("/Model.size")?;
+    // clip0's samples, the empty middle window's boundary at 10, clip2's samples.
+    assert_eq!(size.time_sample_times()?, vec![0.0, 2.0, 10.0, 20.0, 22.0]);
+    // value_at changes at every reported time: held 2 up to the empty window,
+    // None across it, clip2's samples from 20.
+    assert_eq!(value_f64(&stage, "/Model.size", 5.0), Some(2.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 9.999), Some(2.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), None);
+    assert_eq!(value_f64(&stage, "/Model.size", 20.0), Some(20.0));
+    Ok(())
+}
+
+/// Local `timeSamples` shadow a value clip in introspection just as in value
+/// resolution (spec 12.3.4.5): `time_sample_times` reports the local sample
+/// times, not the clip's, and `value_at` reads the local samples — the two
+/// agree on which source wins.
+#[test]
+fn clip_local_timesamples_shadow_clips() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size.timeSamples = {
+        0: 1,
+        10: 3,
+    }
+}
+"#,
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = { 1: 100, 5: 500 }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let size = stage.attribute("/Model.size")?;
+    // Local timeSamples win: their times are reported, not the clip's {1, 5}.
+    assert_eq!(size.time_sample_times()?, vec![0.0, 10.0]);
+    assert_eq!(size.num_time_samples()?, 2);
+    // value_at agrees: the local samples drive the value (1 and 3 at their
+    // times), not the clip's 100 / 500 — so introspection and resolution pick
+    // the same source.
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(1.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(3.0));
+    Ok(())
+}
+
+#[test]
+fn clip_anchor_sublayer() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("sub"))?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    subLayers = [@./sub/weak.usda@]
+)
+
+over "Model" (
+    clips = {
+        dictionary default = {
+            double2[] times = [(0, 0)]
+        }
+    }
+)
+{
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("sub").join("weak.usda"),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("sub").join("manifest.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("sub").join("clip.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size.timeSamples = {
+        0: 7
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(7.0));
+    Ok(())
+}
+
+#[test]
+fn clip_anchor_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("asset"))?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+def "ShotModel" (
+    references = @./asset/model.usda@</Model>
+)
+{
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("asset").join("model.usda"),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("asset").join("manifest.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("asset").join("clip.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size.timeSamples = {
+        0: 7
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    assert_eq!(value_f64(&stage, "/ShotModel.size", 0.0), Some(7.0));
+    Ok(())
+}
+
+/// A clip set is consulted where it is introduced, so a `default` at a stronger
+/// reference node outranks it (C++ `_ClipsApplyToNode`, checked as the walk
+/// reaches each site).
+#[test]
+fn clip_loses_to_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_split_clip_scene(dir.path(), STRONG_PLAIN, WEAK_CLIPPED)?;
+
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/A.size", 0.0), Some(3.0));
+    Ok(())
+}
+
+/// The same pairing the other way up: the clip is introduced at the stronger
+/// reference, so it outranks the weaker node's `default`.
+#[test]
+fn clip_beats_weaker_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_split_clip_scene(dir.path(), STRONG_CLIPPED, WEAK_PLAIN)?;
+
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/A.size", 0.0), Some(7.0));
+
+    // The winning site is the node the clip set was introduced at.
+    let info = stage.attribute("/A.size")?.resolve_info_at(usd::TimeCode::new(0.0))?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::ValueClips);
+    assert_eq!(
+        info.node().map(pcp::ResolveNode::arc),
+        Some(pcp::ArcType::Reference),
+        "a clip-sourced value names the node that introduced the set"
+    );
+    Ok(())
+}
+
+/// The value queries are five views of one strength-ordered walk, so for any
+/// attribute at any time they have to agree about which source answered.
+///
+/// Every regression this file pins was one view drifting from another — a
+/// blocked map the read fell through but the sample count still reported, a
+/// clip that outranked a stronger opinion in the value alone. Checking the
+/// invariants across a table of shapes catches the next one without needing to
+/// have predicted it.
+#[test]
+fn value_queries_agree() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let clipped = write_clip_scene(
+        dir.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = {\n        0: 7.0\n    }\n}\n",
+    )?;
+    let layered = tempfile::tempdir()?;
+    fs::write(
+        layered.path().join("sub.usda"),
+        "#usda 1.0\ndef \"A\"\n{\n    double x.timeSamples = { 0: 2.0 }\n}\n",
+    )?;
+    fs::write(
+        layered.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@./sub.usda@]\n)\ndef \"A\"\n{\n    double x = 1.0\n}\n",
+    )?;
+
+    let cases: Vec<(&str, Stage, &str)> = vec![
+        ("declared but unauthored", authored_shape(|_| Ok(()))?, "/A.x"),
+        (
+            "plain default",
+            authored_shape(|attr| {
+                attr.set(vt::Value::Double(1.0))?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "plain samples",
+            authored_shape(|attr| {
+                attr.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+                    .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "blocked default",
+            authored_shape(|attr| {
+                attr.set(vt::Value::Double(1.0))?.set(vt::Value::ValueBlock)?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "blocked timeSamples field",
+            authored_shape(|attr| {
+                let attr = attr.set(vt::Value::Double(5.0))?;
+                author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock)?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "every sample blocked",
+            authored_shape(|attr| {
+                attr.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+                    .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?
+                    .block()?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "mixed blocked samples",
+            authored_shape(|attr| {
+                attr.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+                    .set_at(vt::Value::ValueBlock, usd::TimeCode::new(10.0))?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            "empty sample map",
+            authored_shape(|attr| {
+                let attr = attr.set(vt::Value::Double(1.0))?;
+                author_raw_field(
+                    &attr,
+                    sdf::FieldKey::TimeSamples.as_str(),
+                    vt::Value::TimeSamples(Vec::new()),
+                )?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        ("clip sourced", Stage::open(&clipped)?, "/Model.size"),
+        (
+            "default hides weaker samples",
+            Stage::open(layered.path().join("root.usda").to_str().unwrap())?,
+            "/A.x",
+        ),
+    ];
+
+    for (name, stage, path) in cases {
+        for time in [-5.0, 0.0, 5.0, 10.0, 20.0] {
+            assert_queries_agree(&stage, path, time, name);
+        }
+    }
+    Ok(())
+}
+
+/// A stage holding one `double /A.x` shaped by `author`.
+fn authored_shape(author: impl FnOnce(usd::Attribute) -> Result<()>) -> Result<Stage> {
+    let stage = in_memory_stage()?;
+    author(stage.define_prim("/A")?.create_attribute("x", "double")?)?;
+    Ok(stage)
+}
+
+/// Asserts the invariants tying the value queries to one another at `time`.
+///
+/// The introspection queries (`num_time_samples`, `time_sample_times`,
+/// `value_might_be_time_varying`) name no time, so they are checked against the
+/// timeless `resolve_info`; the per-time queries against `resolve_info_at`.
+fn assert_queries_agree(stage: &Stage, path: &str, time: f64, case: &str) {
+    let at = usd::TimeCode::new(time);
+    let attr = stage.attribute(path).expect("attribute");
+    let where_ = format!("{case} at t={time}");
+
+    let proximal = attr.resolve_info().expect("resolve_info");
+    let count = attr.num_time_samples().expect("num_time_samples");
+    let times = attr.time_sample_times().expect("time_sample_times");
+    assert_eq!(times.len(), count, "{where_}: sample times and count disagree");
+    if count > 0 {
+        assert!(
+            matches!(
+                proximal.source(),
+                usd::ResolveInfoSource::TimeSamples | usd::ResolveInfoSource::ValueClips
+            ),
+            "{where_}: {count} samples reported but the source is {:?}",
+            proximal.source()
+        );
+    }
+    if attr.might_be_time_varying().expect("time varying") {
+        assert!(
+            proximal.value_source_might_be_time_varying(),
+            "{where_}: the attribute varies but its source cannot"
+        );
+    }
+
+    let info = attr.resolve_info_at(at).expect("resolve_info_at");
+    let value = attr.get_at::<vt::Value>(at).expect("get_at");
+    assert_eq!(
+        value.is_some(),
+        info.source() != usd::ResolveInfoSource::None,
+        "{where_}: the read and the reported source disagree ({:?})",
+        info.source()
+    );
+    if info.has_authored_value() {
+        assert!(value.is_some(), "{where_}: an authored value that reads back as none");
+        assert!(
+            !info.value_is_blocked(),
+            "{where_}: an authored value cannot be blocked"
+        );
+    }
+    if info.has_authored_value_opinion() {
+        assert!(
+            !attr.property_stack_at(at).expect("property_stack_at").is_empty(),
+            "{where_}: an authored opinion with no spec in the stack"
+        );
+    }
+}
+
+/// A `timeSamples` field that holds no usable sample map is no opinion at all,
+/// and every query mode has to agree about that.
+///
+/// An empty map is not a source (C++ requires a layer to hold at least one
+/// sample), and a field holding some other type is not a sample opinion either.
+/// Reporting one as authored at the default time alone would make
+/// `has_authored_value_opinion` depend on how the caller asked rather than on
+/// what the layers hold.
+#[test]
+fn unusable_samples_unauthored() -> Result<()> {
+    for field in [
+        vt::Value::TimeSamples(Vec::new()),
+        vt::Value::String("not a sample map".into()),
+    ] {
+        let stage = in_memory_stage()?;
+        let attr = stage.define_prim("/A")?.create_attribute("x", "double")?;
+        author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), field.clone())?;
+
+        let attr = stage.attribute("/A.x")?;
+        let modes = [
+            ("proximal", attr.resolve_info()?),
+            ("default time", attr.resolve_info_at(None)?),
+            ("numeric time", attr.resolve_info_at(usd::TimeCode::new(0.0))?),
+        ];
+        for (mode, info) in modes {
+            assert!(
+                !info.has_authored_value_opinion(),
+                "{field:?} reported as authored by the {mode} query"
+            );
+            assert_eq!(info.source(), usd::ResolveInfoSource::None, "{field:?} at {mode}");
+            assert!(!info.value_is_blocked(), "{field:?} at {mode}");
+        }
+        assert_eq!(attr.get_at::<vt::Value>(usd::TimeCode::new(0.0))?, None, "{field:?}");
+        assert_eq!(attr.num_time_samples()?, 0, "{field:?}");
+    }
+    Ok(())
+}
+
+/// A blocked `timeSamples` field is an authored opinion, and stays one whatever
+/// time the query names — the counterpart to [`unusable_samples_unauthored`],
+/// which pins the fields that are not.
+#[test]
+fn blocked_samples_every_mode() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let attr = stage.define_prim("/A")?.create_attribute("x", "double")?;
+    author_raw_field(&attr, sdf::FieldKey::TimeSamples.as_str(), vt::Value::ValueBlock)?;
+
+    let attr = stage.attribute("/A.x")?;
+    for (mode, info) in [
+        ("proximal", attr.resolve_info()?),
+        ("default time", attr.resolve_info_at(None)?),
+        ("numeric time", attr.resolve_info_at(usd::TimeCode::new(0.0))?),
+    ] {
+        assert!(info.has_authored_value_opinion(), "the block is authored at {mode}");
+        assert!(!info.has_authored_value(), "a block is not a value at {mode}");
+    }
+    Ok(())
+}
+
+/// A clip set is one source, so it contributes one site however many nodes of
+/// its layer stack the walk passes through.
+///
+/// A prim carrying both a variant set and a clip set has a `Root` node and a
+/// variant node in the same layer stack, both at a path the anchor prefixes —
+/// the shape that offers one set twice if the walk keys clips on the site alone.
+#[test]
+fn clip_contributes_one_site() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    variantSets = "v"
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+    variants = {
+        string v = "a"
+    }
+)
+{
+    float size
+    variantSet "v" = {
+        "a" {
+        }
+    }
+}
+"#,
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = {\n        0: 7.0\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(7.0));
+
+    let stack = stack_layers(attr.property_stack_at(usd::TimeCode::new(0.0))?);
+    let clips = stack.iter().filter(|layer| layer.ends_with("clip.usda")).count();
+    assert_eq!(clips, 1, "the set contributes one site: {stack:?}");
+    Ok(())
+}
+
+/// A clip set that owns the property but carries no value for it anywhere is
+/// not a value source, and the query that names no time has to say so too.
+///
+/// Its manifest declares the attribute — so the set owns it and nothing weaker
+/// contributes — while no clip authors a sample and no manifest default fills
+/// the gap. The read returns nothing at every time, and a source reported here
+/// would contradict that.
+#[test]
+fn untimed_clip_reports_no_value() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        &clipped_model_body(
+            "    float size
+",
+        ),
+        "#usda 1.0
+def \"Model\"
+{
+    float size
+}
+",
+        "#usda 1.0
+def \"Model\"
+{
+    float other.timeSamples = {
+        0: 1.0
+    }
+}
+",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(attr.get_at::<vt::Value>(usd::TimeCode::new(5.0))?, None);
+
+    let info = attr.resolve_info()?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::None);
+    assert!(!info.has_authored_value());
+    assert!(info.value_is_blocked(), "the set owns the property and blocks it");
+    // And the timed query agrees, as it did before.
+    assert_eq!(attr.resolve_info_at(usd::TimeCode::new(5.0))?.source(), info.source());
+    Ok(())
+}
+
+/// What one source candidate answers with, across every shape value resolution
+/// can reach — the conformance matrix behind [`source_answers_conform`].
+struct Conformance {
+    /// The shape under test.
+    case: &'static str,
+    /// Whether the read yields a value at the queried time.
+    reads: bool,
+    /// The source the read came from.
+    source: usd::ResolveInfoSource,
+    /// Whether an opinion blocked the value.
+    blocked: bool,
+    /// Whether any opinion was authored, blocked or not.
+    authored: bool,
+}
+
+/// Every source candidate must answer the four queries the same way, whatever
+/// withholds the value.
+///
+/// The blocked rows are the ones that drift: each has a real opinion answering
+/// the walk and no value surviving it, so a source reported there would
+/// contradict the read while a missing `value_is_blocked` would hide the
+/// opinion. A clip block is the same shape as a `default` block and has to
+/// report the same way.
+#[test]
+fn source_answers_conform() -> Result<()> {
+    let inactive = tempfile::tempdir()?;
+    let sourced = tempfile::tempdir()?;
+    let blocked = tempfile::tempdir()?;
+    // The three clip rows differ only in what the manifest declares and what the
+    // clip carries: a set that does not own `size` lets weaker sources through,
+    // one that owns and supplies it answers with a value, and one that owns it
+    // but carries nothing answers with a block (spec 12.3.4.6).
+    write_clip_scene(
+        inactive.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float other\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float other.timeSamples = {\n        0: 1.0\n    }\n}\n",
+    )?;
+    write_clip_scene(
+        sourced.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = {\n        0: 7.0\n    }\n}\n",
+    )?;
+    write_clip_scene(
+        blocked.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float other.timeSamples = {\n        0: 1.0\n    }\n}\n",
+    )?;
+
+    let rows: Vec<(Conformance, Stage, &str)> = vec![
+        (
+            Conformance {
+                case: "missing",
+                reads: false,
+                source: usd::ResolveInfoSource::None,
+                blocked: false,
+                authored: false,
+            },
+            authored_shape(|_| Ok(()))?,
+            "/A.x",
+        ),
+        (
+            Conformance {
+                case: "default value",
+                reads: true,
+                source: usd::ResolveInfoSource::Default,
+                blocked: false,
+                authored: true,
+            },
+            authored_shape(|attr| {
+                attr.set(vt::Value::Double(1.0))?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            Conformance {
+                case: "default block",
+                reads: false,
+                source: usd::ResolveInfoSource::None,
+                blocked: true,
+                authored: true,
+            },
+            authored_shape(|attr| {
+                attr.set(vt::Value::Double(1.0))?.set(vt::Value::ValueBlock)?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            Conformance {
+                case: "sample value",
+                reads: true,
+                source: usd::ResolveInfoSource::TimeSamples,
+                blocked: false,
+                authored: true,
+            },
+            authored_shape(|attr| {
+                attr.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+                    .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            Conformance {
+                case: "sample block",
+                reads: false,
+                source: usd::ResolveInfoSource::None,
+                blocked: true,
+                authored: true,
+            },
+            authored_shape(|attr| {
+                attr.set_at(vt::Value::Double(1.0), usd::TimeCode::new(0.0))?
+                    .set_at(vt::Value::Double(3.0), usd::TimeCode::new(10.0))?
+                    .block()?;
+                Ok(())
+            })?,
+            "/A.x",
+        ),
+        (
+            Conformance {
+                case: "clip does not own the property",
+                reads: false,
+                source: usd::ResolveInfoSource::None,
+                blocked: false,
+                authored: false,
+            },
+            Stage::open(inactive.path().join("root.usda").to_str().unwrap())?,
+            "/Model.size",
+        ),
+        (
+            Conformance {
+                case: "clip value",
+                reads: true,
+                source: usd::ResolveInfoSource::ValueClips,
+                blocked: false,
+                authored: true,
+            },
+            Stage::open(sourced.path().join("root.usda").to_str().unwrap())?,
+            "/Model.size",
+        ),
+        (
+            Conformance {
+                case: "clip block",
+                reads: false,
+                source: usd::ResolveInfoSource::None,
+                blocked: true,
+                authored: true,
+            },
+            Stage::open(blocked.path().join("root.usda").to_str().unwrap())?,
+            "/Model.size",
+        ),
+    ];
+
+    let at = usd::TimeCode::new(5.0);
+    for (row, stage, path) in rows {
+        let attr = stage.attribute(path)?;
+        let info = attr.resolve_info_at(at)?;
+        assert_eq!(
+            attr.get_at::<vt::Value>(at)?.is_some(),
+            row.reads,
+            "{}: the value read",
+            row.case
+        );
+        assert_eq!(info.source(), row.source, "{}: the reported source", row.case);
+        assert_eq!(info.value_is_blocked(), row.blocked, "{}: value_is_blocked", row.case);
+        assert_eq!(
+            info.has_authored_value_opinion(),
+            row.authored,
+            "{}: has_authored_value_opinion",
+            row.case
+        );
+        // The two derived predicates follow from the row rather than needing
+        // their own column: a value is authored exactly when a source answered
+        // with one, and nothing can be both authored and blocked.
+        assert_eq!(
+            info.has_authored_value(),
+            row.reads && row.source != usd::ResolveInfoSource::Fallback,
+            "{}: has_authored_value",
+            row.case
+        );
+        assert!(!(info.has_authored_value() && info.value_is_blocked()), "{}", row.case);
+    }
+    Ok(())
+}
+
+/// A numeric property stack lists the clip layer the value comes from on top of
+/// the graph specs, while the default-time stack lists the graph specs alone —
+/// value clips contribute no `default` (spec 12.3.4).
+#[test]
+fn clip_joins_timed_stack() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = {\n        0: 7.0\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(7.0));
+
+    let timed = stack_layers(attr.property_stack_at(usd::TimeCode::new(0.0))?);
+    assert!(
+        timed.iter().any(|layer| layer.ends_with("clip.usda")),
+        "the clip supplying the value joins the stack: {timed:?}"
+    );
+    let plain = stack_layers(attr.property_stack()?);
+    assert!(
+        !plain.iter().any(|layer| layer.ends_with("clip.usda")),
+        "no clip contributes at the default time: {plain:?}"
+    );
+    Ok(())
+}
+
+/// When the active clip authors no samples for the property, the value comes
+/// from the manifest — so the manifest is the spec the stack reports, as in C++.
+#[test]
+fn manifest_joins_timed_stack() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        &clipped_model_body("    float size\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size = 3\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float other.timeSamples = {\n        0: 1\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(3.0));
+
+    let timed = stack_layers(attr.property_stack_at(usd::TimeCode::new(0.0))?);
+    assert!(
+        timed.iter().any(|layer| layer.ends_with("manifest.usda")),
+        "the manifest fills the gap, so it is the reported spec: {timed:?}"
+    );
+    assert!(!timed.iter().any(|layer| layer.ends_with("clip.usda")), "{timed:?}");
+    // The resolve info names the same spec: here the manifest is both what the
+    // stack lists and where the value came from.
+    let info = attr.resolve_info_at(usd::TimeCode::new(0.0))?;
+    assert_eq!(info.source(), usd::ResolveInfoSource::ValueClips);
+    assert!(
+        info.spec_site()
+            .expect("the manifest answered")
+            .layer
+            .identifier()
+            .ends_with("manifest.usda"),
+        "{:?}",
+        info.spec_site()
+    );
+    Ok(())
+}
+
+/// One layer authoring a `default` *and* introducing a clip set: value
+/// resolution takes the `default` and never consults the clip at that site, but
+/// the stack collects every contributor, so it lists both (C++'s property-stack
+/// resolver never sets `foundOpinion`).
+#[test]
+fn timed_stack_keeps_clip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        &clipped_model_body("    float size = 5\n"),
+        "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        "#usda 1.0\ndef \"Model\"\n{\n    float size.timeSamples = {\n        0: 7.0\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(&root)?;
+    let attr = stage.attribute("/Model.size")?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(5.0));
+    assert_eq!(
+        attr.resolve_info_at(usd::TimeCode::new(0.0))?.source(),
+        usd::ResolveInfoSource::Default
+    );
+
+    let timed = stack_layers(attr.property_stack_at(usd::TimeCode::new(0.0))?);
+    assert!(timed.iter().any(|layer| layer.ends_with("root.usda")), "{timed:?}");
+    assert!(timed.iter().any(|layer| layer.ends_with("clip.usda")), "{timed:?}");
+    Ok(())
+}
+
+/// Every participating clip set contributes one site, while value resolution
+/// stops at the first that answers (spec 12.3.4.5).
+#[test]
+fn timed_stack_lists_sets() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for name in ["a", "b"] {
+        fs::write(
+            dir.path().join(format!("manifest_{name}.usda")),
+            "#usda 1.0\ndef \"Model\"\n{\n    float size\n}\n",
+        )?;
+        fs::write(
+            dir.path().join(format!("clip_{name}.usda")),
+            "#usda 1.0
+def \"Model\"
+{
+    float size.timeSamples = {
+        0: 1.0
+    }
+}
+",
+        )?;
+    }
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary a = {
+            asset[] assetPaths = [@./clip_a.usda@]
+            asset manifestAssetPath = @./manifest_a.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+        dictionary b = {
+            asset[] assetPaths = [@./clip_b.usda@]
+            asset manifestAssetPath = @./manifest_b.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let attr = stage.attribute("/Model.size")?;
+    let timed = stack_layers(attr.property_stack_at(usd::TimeCode::new(0.0))?);
+    assert!(timed.iter().any(|layer| layer.ends_with("clip_a.usda")), "{timed:?}");
+    assert!(timed.iter().any(|layer| layer.ends_with("clip_b.usda")), "{timed:?}");
+    Ok(())
+}
+
+/// A `def "Model"` introducing the one clip set [`write_clip_scene`] writes,
+/// with `body` as the prim's own contents.
+fn clipped_model_body(body: &str) -> String {
+    format!(
+        r#"#usda 1.0
+def "Model" (
+    clips = {{
+        dictionary default = {{
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }}
+    }}
+)
+{{
+{body}}}
+"#
+    )
+}
+
+/// The layer identifiers of a property stack, in strength order.
+fn stack_layers(stack: Vec<usd::SpecSite>) -> Vec<String> {
+    stack
+        .into_iter()
+        .map(|site| site.layer.identifier().to_owned())
+        .collect()
+}
+
+/// A `def "S"` with a plain `default`, the strong half of the split scene.
+const STRONG_PLAIN: &str = r#"#usda 1.0
+def "S"
+{
+    float size = 3
+}
+"#;
+
+/// The same prim as the weak half, so a stronger clip has something to outrank.
+const WEAK_PLAIN: &str = r#"#usda 1.0
+def "S"
+{
+    float size = 3
+}
+"#;
+
+/// A `def "S"` introducing a clip set, as the weak half of the split scene.
+const WEAK_CLIPPED: &str = r#"#usda 1.0
+def "S" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/S"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+    float size
+}
+"#;
+
+/// The same clip set as the strong half.
+const STRONG_CLIPPED: &str = WEAK_CLIPPED;
+
+/// Writes a stage whose root prim references two layers in strength order, plus
+/// the manifest and clip either half can point at.
+fn write_split_clip_scene(dir: &FsPath, strong: &str, weak: &str) -> Result<String> {
+    fs::write(
+        dir.join("root.usda"),
+        "#usda 1.0\ndef \"A\" (\n    references = [@./strong.usda@</S>, @./weak.usda@</S>]\n)\n{\n}\n",
+    )?;
+    fs::write(dir.join("strong.usda"), strong)?;
+    fs::write(dir.join("weak.usda"), weak)?;
+    fs::write(
+        dir.join("manifest.usda"),
+        "#usda 1.0\ndef \"S\"\n{\n    float size\n}\n",
+    )?;
+    fs::write(
+        dir.join("clip.usda"),
+        "#usda 1.0\ndef \"S\"\n{\n    float size.timeSamples = {\n        0: 7\n    }\n}\n",
+    )?;
+    Ok(dir.join("root.usda").to_string_lossy().into_owned())
+}
+
+/// A clip set anchored on an ancestor applies at the layer that introduced it
+/// even where that layer authors no spec for the descendant prim being read —
+/// the sites a spec stack alone would never reach (C++ resolves with
+/// `skipEmptyNodes = false` once a prim may have clips).
+#[test]
+fn clip_applies_without_spec() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("sub.usda"),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\n(\n    subLayers = [@./sub.usda@]\n)\ndef \"Model\"\n{\n    def \"Child\"\n    {\n        float size\n    }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("manifest.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    def \"Child\"\n    {\n        float size\n    }\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("clip.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    def \"Child\"\n    {\n        float size.timeSamples = {\n            0: 7\n        }\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), Some(7.0));
+    Ok(())
+}
+
+/// Value clips are consulted only where a prim's composition says they can
+/// exist, so authoring the first `clips` opinion on an ancestor of an
+/// already-cached prim has to reach that prim (C++
+/// `Usd_PrimData::MayHaveOpinionsInClips` plus the resync a clip add triggers).
+/// Removing the opinion again has to take it back.
+#[test]
+fn clip_added_after_read() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_child_clip_files(dir.path(), "Model")?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"Model\"\n{\n    def \"Child\"\n    {\n        float size\n    }\n}\n",
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    // Caches the prim index with no clips in sight.
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), None);
+
+    stage
+        .prim("/Model")?
+        .set_metadata(sdf::FieldKey::Clips.as_str(), clip_metadata("/Model"))?;
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), Some(7.0));
+
+    stage.prim("/Model")?.clear_metadata(sdf::FieldKey::Clips.as_str())?;
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), None);
+    Ok(())
+}
+
+/// The same edit reaching across a namespace boundary: the descendant's stage
+/// path lies outside the subtree the `clips` opinion was authored in, so it can
+/// only be reached through the dependency mappings.
+#[test]
+fn clip_added_across_reference() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    write_child_clip_files(dir.path(), "Src")?;
+    fs::write(
+        dir.path().join("root.usda"),
+        concat!(
+            "#usda 1.0\n",
+            "def \"Src\"\n{\n    def \"Child\"\n    {\n        float size\n    }\n}\n",
+            "def \"Model\" (\n    references = </Src>\n)\n{\n}\n",
+        ),
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), None);
+
+    // Authored on `/Src`, read at `/Model/Child`.
+    stage
+        .prim("/Src")?
+        .set_metadata(sdf::FieldKey::Clips.as_str(), clip_metadata("/Src"))?;
+    assert_eq!(value_f64(&stage, "/Model/Child.size", 0.0), Some(7.0));
+    Ok(())
+}
+
+/// A `clips` dictionary naming a single set whose clip carries `Child.size`,
+/// anchored at `prim_path`.
+fn clip_metadata(prim_path: &str) -> vt::Value {
+    let set = HashMap::from([
+        (
+            "assetPaths".to_string(),
+            vt::Value::AssetPathVec(vec!["./clip.usda".into()]),
+        ),
+        (
+            "manifestAssetPath".to_string(),
+            vt::Value::AssetPath("./manifest.usda".into()),
+        ),
+        ("primPath".to_string(), vt::Value::String(prim_path.to_string())),
+        (
+            "active".to_string(),
+            vt::Value::Vec2dVec(vec![openusd::gf::vec2d(0.0, 0.0)]),
+        ),
+    ]);
+    vt::Value::Dictionary(vt::Dictionary::from([(
+        "default".to_string(),
+        vt::Value::Dictionary(set.into()),
+    )]))
+}
+
+/// The manifest and clip [`clip_metadata`] points at, declaring `Child.size`
+/// under `anchor` — the prim the set's `primPath` selects inside them.
+fn write_child_clip_files(dir: &FsPath, anchor: &str) -> Result<()> {
+    fs::write(
+        dir.join("manifest.usda"),
+        format!("#usda 1.0\ndef \"{anchor}\"\n{{\n    def \"Child\"\n    {{\n        float size\n    }}\n}}\n"),
+    )?;
+    fs::write(
+        dir.join("clip.usda"),
+        format!(
+            "#usda 1.0\ndef \"{anchor}\"\n{{\n    def \"Child\"\n    {{\n        float size.timeSamples = {{\n            0: 7\n        }}\n    }}\n}}\n"
+        ),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn clip_metadata_retimed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        r#"#usda 1.0
+(
+    subLayers = [@./weak.usda@ (offset = 10)]
+)
+"#,
+    )?;
+    fs::write(
+        dir.path().join("weak.usda"),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+            double2[] times = [(0, 0), (5, 5)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("manifest.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size
+}
+"#,
+    )?;
+    fs::write(
+        dir.path().join("clip.usda"),
+        r#"#usda 1.0
+def "Model"
+{
+    float size.timeSamples = {
+        0: 0,
+        5: 5
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(dir.path().join("root.usda").to_string_lossy().as_ref())?;
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(0.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 15.0), Some(5.0));
+    Ok(())
+}
+
+#[test]
+fn clip_initial_jump() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+            double2[] times = [(0, 0), (0, 25), (10, 35)]
+        }
+    }
+)
+{
+    float size
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float size
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float size.timeSamples = {
+        0: 0.0,
+        25: 25.0,
+        35: 35.0
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&root)?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(25.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 5.0), Some(30.0));
+    Ok(())
+}
+
+/// Active-clip selection switches clips by stage time and maps stage time
+/// to clip time through the timing curve (spec 12.3.4.3, 12.3.4.4).
+#[test]
+fn clip_multi_active_switch() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_multi"))?;
+    // Stage 10 → clip1 at clip time 10 → -10.
+    assert_eq!(value_f64(&stage, "/Model_1.size", 10.0), Some(-10.0));
+    // Stage 22 → clip2 active, clip time 6 → -26.
+    assert_eq!(value_f64(&stage, "/Model_1.size", 22.0), Some(-26.0));
+    Ok(())
+}
+
+/// Clip set strength falls back to name order when `clipSets` is unauthored
+/// (spec 12.3.4.1): `clip_a` outranks `clip_b` regardless of text order.
+#[test]
+fn clip_sets_default_order() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_sets"))?;
+    // clip_a (primPath /ClipA) wins: attr at stage 0 → 10, not 100.
+    assert_eq!(value_f64(&stage, "/DefaultOrderTest.attr", 0.0), Some(10.0));
+    assert_eq!(value_f64(&stage, "/DefaultOrderTest.attr", 1.0), Some(20.0));
+    Ok(())
+}
+
+/// The timing curve maps stage time to clip time, including a jump
+/// discontinuity at stage 20 (spec 12.3.4.4, 12.3.4.8).
+#[test]
+fn clip_timings_curve() -> Result<()> {
+    let stage = Stage::open(&clip_asset("clip_timings"))?;
+    assert_eq!(value_f64(&stage, "/Model.size", 0.0), Some(10.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 10.0), Some(15.0));
+    assert_eq!(value_f64(&stage, "/Model.size", 20.0), Some(10.0)); // jump → "at and after"
+    assert_eq!(value_f64(&stage, "/Model.size", 30.0), Some(15.0));
+    Ok(())
+}
+
+// --- Sublayer mutation / layer-graph construction ---
+
+/// A weak sublayer carrying one opinion, for the sublayer-mutation tests.
+fn opinion_layer(identifier: &str, value: f64) -> Result<sdf::Layer> {
+    let mut layer = sdf::Layer::new_anonymous(identifier);
+    layer.edit(|e| {
+        sdf::AttributeSpec::new(e.data_mut(), "/A.x", "double", sdf::Variability::Varying, true)?
+            .set_default(vt::Value::Double(value))?;
+        Ok(())
+    })?;
+    Ok(layer)
+}
+
+/// The parent layer's authored `subLayers` asset paths.
+fn authored_sublayers(stage: &Stage) -> Vec<String> {
+    stage
+        .root_layer()
+        .borrow()
+        .pseudo_root()
+        .and_then(|pr| pr.sublayers())
+        .unwrap_or_default()
+}
+
+/// `insert_layer` both composes the new layer's opinion and authors the
+/// parent's `subLayers` metadata, so the edit persists on save.
+#[test]
+fn insert_layer_authors_metadata() -> Result<()> {
+    let stage = Stage::builder().in_memory("root.usda")?;
+    let root_id = stage.root_layer().identifier().to_string();
+
+    let weak = opinion_layer("weak.usda", 5.0)?;
+    let weak_id = weak.identifier().to_string();
+    stage.insert_layer(&root_id, 0, weak, sdf::LayerOffset::IDENTITY)?;
+
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+    assert_eq!(authored_sublayers(&stage), vec![weak_id]);
+    Ok(())
+}
+
+/// `remove_layer` drops both the composed opinion and the parent's
+/// authored `subLayers` entry.
+#[test]
+fn remove_layer_clears_metadata() -> Result<()> {
+    let stage = Stage::builder().in_memory("root.usda")?;
+    let root_id = stage.root_layer().identifier().to_string();
+    let weak = opinion_layer("weak.usda", 5.0)?;
+    let weak_id = weak.identifier().to_string();
+    stage.insert_layer(&root_id, 0, weak, sdf::LayerOffset::IDENTITY)?;
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        Some(vt::Value::Double(5.0))
+    );
+
+    assert!(stage.remove_layer(&root_id, &weak_id)?, "a sublayer was removed");
+
+    assert_eq!(
+        stage.attribute("/A.x")?.get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None,
+        "the removed sublayer's opinion is gone"
+    );
+    assert!(
+        authored_sublayers(&stage).is_empty(),
+        "the removed sublayer's subLayers entry is gone"
+    );
+    Ok(())
+}
+
+/// Inserting a sublayer under a file-loaded (and thus editable) parent
+/// succeeds and adds exactly one node to the graph.
+#[test]
+fn insert_layer_into_file_loaded_parent() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n")?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    let root_id = stage.root_layer().identifier().to_string();
+    let before = stage.layer_count();
+
+    stage.insert_layer(
+        &root_id,
+        0,
+        opinion_layer("weak.usda", 5.0)?,
+        sdf::LayerOffset::IDENTITY,
+    )?;
+
+    assert_eq!(
+        stage.layer_count(),
+        before + 1,
+        "the inserted sublayer adds exactly one node"
+    );
+    Ok(())
+}
+
+/// Inserting under a parent that is not in the stage fails with
+/// `LayerNotFound` and adds no node.
+#[test]
+fn insert_layer_missing_parent() -> Result<()> {
+    let stage = Stage::builder().in_memory("root.usda")?;
+
+    let err = stage
+        .insert_layer(
+            "nope.usda",
+            0,
+            opinion_layer("weak.usda", 5.0)?,
+            sdf::LayerOffset::IDENTITY,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, StageAuthoringError::LayerNotFound { .. }));
+    assert_eq!(stage.layer_count(), 1, "no node added for a missing parent");
+    Ok(())
+}
+
+/// Inserting under a parent a guard borrows fails with `Busy`, leaving the
+/// parent's sublayers and the stage's layers as they were.
+#[test]
+fn insert_layer_borrowed_parent() -> Result<()> {
+    let stage = Stage::builder().in_memory("root.usda")?;
+    let root = stage.root_layer();
+    let guard = root.try_borrow()?;
+
+    let err = stage
+        .insert_layer(
+            root.identifier(),
+            0,
+            opinion_layer("weak.usda", 5.0)?,
+            sdf::LayerOffset::IDENTITY,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, StageAuthoringError::Registry(sdf::LayerError::Busy)),
+        "{err:?}"
+    );
+    drop(guard);
+    assert_eq!(stage.layer_count(), 1, "no node added for a borrowed parent");
+    assert_eq!(root.pseudo_root()?.expect("root").sublayers()?, None);
+    Ok(())
+}
+
+/// A layer reached through both the session and the root collections is
+/// collapsed to one node, keeping the layer count, id set, and root/session
+/// split consistent. The session sublayers `shared.usda` and the root
+/// sublayers it too, so the four collected layers fold to three nodes.
+#[test]
+fn from_layers_dedups_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join("shared.usda"), "#usda 1.0\n")?;
+    fs::write(
+        dir.path().join("session.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(&root, "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n")?;
+
+    let stage = Stage::builder()
+        .session_layer(dir.path().join("session.usda").to_string_lossy().into_owned())
+        .open(root.to_str().expect("utf-8 temp path"))?;
+
+    assert_eq!(
+        stage.layer_count(),
+        3,
+        "the duplicate shared layer collapses to one node"
+    );
+    let ids = stage.layer_identifiers();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "no duplicate id survives");
+    assert!(
+        stage.root_layer().identifier().ends_with("root.usda"),
+        "the root stays the first non-session layer after dedup"
+    );
+    Ok(())
+}
+
+/// When the stage root is itself reached as a session sublayer, the root slot
+/// collapses onto that shared node — but the root must still resolve to the
+/// shared layer, not slip to its own dependency or vanish.
+#[test]
+fn from_layers_root_shared_with_session() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join("dep.usda"), "#usda 1.0\n")?;
+    fs::write(
+        dir.path().join("shared.usda"),
+        "#usda 1.0\n(\n    subLayers = [@dep.usda@]\n)\n",
+    )?;
+    fs::write(
+        dir.path().join("session.usda"),
+        "#usda 1.0\n(\n    subLayers = [@shared.usda@]\n)\n",
+    )?;
+    // Open the shared layer itself as the stage root: it is also reached as a
+    // session sublayer, so the root slot collapses onto that node.
+    let shared = dir.path().join("shared.usda");
+    let stage = Stage::builder()
+        .session_layer(dir.path().join("session.usda").to_string_lossy().into_owned())
+        .open(shared.to_str().expect("utf-8 temp path"))?;
+
+    assert_eq!(stage.layer_count(), 3, "the shared root/session layer is one node");
+    assert!(
+        stage.root_layer().identifier().ends_with("shared.usda"),
+        "the root resolves to the shared layer, not the next dependency"
+    );
+    Ok(())
+}
+
+// --- Stage-tier authoring verified through composed handles ---
+
+#[test]
+fn define_prim() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/World")?.set_type_name("Xform")?;
+    stage.define_prim("/World/Mesh")?.set_type_name("Mesh")?;
+    assert!(stage.prim("/World")?.is_defined()?);
+    assert!(stage.prim("/World/Mesh")?.is_defined()?);
+    assert_eq!(stage.prim("/World")?.type_name()?.as_deref(), Some("Xform"));
+    assert_eq!(stage.prim("/World/Mesh")?.type_name()?.as_deref(), Some("Mesh"));
+    Ok(())
+}
+
+/// A typed define authors the specifier and the type in one write, so a prim
+/// the stage will not compose — here one outside the population mask —
+/// still gets its type; an existing `over` is upgraded and retyped.
+#[test]
+fn define_typed_prim() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(usd::StagePopulationMask::new(["/Keep"])?)
+        .in_memory("anon.usda")?;
+    stage.override_prim("/Keep")?;
+    assert_eq!(
+        stage.define_typed_prim("/Keep", "Xform")?.type_name()?.as_deref(),
+        Some("Xform")
+    );
+    assert!(!stage.define_typed_prim("/Drop", "Scope")?.is_valid()?);
+    let layer = stage.root_layer();
+    assert_eq!(
+        layer.prim("/Keep")?.expect("upgraded").specifier()?,
+        Some(sdf::Specifier::Def)
+    );
+    let drop = layer.prim("/Drop")?.expect("authored outside the mask");
+    assert_eq!(drop.specifier()?, Some(sdf::Specifier::Def));
+    assert_eq!(drop.type_name()?.as_deref(), Some("Scope"));
+    Ok(())
+}
+
+/// A query that misses (the prim is not yet authored) caches the miss; authoring
+/// the prim must invalidate that cache so the next query sees it.
+#[test]
+fn authoring_invalidates_cached_miss() -> Result<()> {
+    let stage = in_memory_stage()?;
+    assert!(!stage.prim("/World")?.is_valid()?);
+
+    stage.define_prim("/World")?.set_type_name("Xform")?;
+
+    assert!(stage.prim("/World")?.is_valid()?);
+    assert_eq!(stage.prim("/World")?.type_name()?.as_deref(), Some("Xform"));
+    Ok(())
+}
+
+#[test]
+fn override_prim() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.override_prim("/A/B")?;
+    assert_eq!(stage.prim("/A")?.specifier()?, Some(sdf::Specifier::Over));
+    assert_eq!(stage.prim("/A/B")?.specifier()?, Some(sdf::Specifier::Over));
+    Ok(())
+}
+
+// --- Incremental invalidation: per-field change classification ---
+
+/// Authoring `permission = private` on an inherited class is inert metadata:
+/// composition never enforces it (C++'s counterpart is compiled out for
+/// `Usd`-mode caches), so the inherited opinion keeps resolving unchanged and no
+/// recompose is needed.
+#[test]
+fn permission_edit_does_not_inert_opinion() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n\ndef \"Class\"\n{\n    custom double attr = 5\n}\n\ndef \"Inst\" (\n    inherits = </Class>\n)\n{\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        stage.attribute("/Inst.attr")?.get::<vt::Value>()?,
+        Some(vt::Value::Double(5.0)),
+        "the inherited opinion contributes before the permission edit",
+    );
+
+    stage.prim("/Class")?.set_metadata(
+        sdf::FieldKey::Permission.as_str(),
+        vt::Value::Permission(sdf::Permission::Private),
+    )?;
+
+    assert_eq!(
+        stage.attribute("/Inst.attr")?.get::<vt::Value>()?,
+        Some(vt::Value::Double(5.0)),
+        "permission is inert metadata; the inherited opinion still resolves",
+    );
+    Ok(())
+}
+
+/// Authoring `clips` on a prim that had none is read live through the cached
+/// index's spec sites — clips need no classifier entry, since every value view
+/// rebuilds against the revision bump. The authored clip set overrides the
+/// reference's time samples once present (spec 12.3.4.5).
+#[test]
+fn clips_edit_resolves_live() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    let clip = dir.path().join("clip.usda");
+    let manifest = dir.path().join("manifest.usda");
+    let referenced = dir.path().join("ref.usda");
+    fs::write(
+        &clip,
+        "#usda 1.0\n\ndef \"Model\"\n{\n    double size.timeSamples = {\n        0: 0,\n        10: 10,\n    }\n}\n",
+    )?;
+    fs::write(&manifest, "#usda 1.0\n\ndef \"Model\"\n{\n    double size\n}\n")?;
+    fs::write(
+        &referenced,
+        "#usda 1.0\n\ndef \"Model\"\n{\n    double size.timeSamples = {\n        0: -1,\n        10: -10,\n    }\n}\n",
+    )?;
+    fs::write(
+        &root,
+        format!(
+            "#usda 1.0\n\ndef \"Model\" (\n    references = @{}@</Model>\n)\n{{\n}}\n",
+            referenced.display()
+        ),
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(
+        value_f64(&stage, "/Model.size", 10.0),
+        Some(-10.0),
+        "the reference time sample resolves before any clips are authored",
+    );
+
+    let api = usd::ClipsAPI::from_prim_unchecked(stage.prim("/Model")?);
+    api.set_clip_asset_paths("default", vec![clip.display().to_string()])?;
+    api.set_clip_prim_path("default", "/Model")?;
+    api.set_clip_manifest_asset_path("default", manifest.display().to_string())?;
+    api.set_clip_active("default", vec![gf::vec2d(0.0, 0.0)])?;
+
+    assert_eq!(
+        value_f64(&stage, "/Model.size", 10.0),
+        Some(10.0),
+        "the authored clip set overrides the reference time sample",
+    );
+    Ok(())
+}
+
+/// The cache memoizes a relationship's resolved targets on first query; editing
+/// its `targetPaths` must drop that memo so the next query recomposes them.
+/// Regression guard for the property-tier (`did_change_targets`) consumer.
+#[test]
+fn target_edit_drops_memo() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.define_prim("/C")?;
+    stage.prim("/A")?.create_relationship("r")?.set_targets(["/B"])?;
+
+    // First query populates the memo.
+    assert_eq!(stage.relationship("/A.r")?.targets()?, vec![sdf::path("/B")?]);
+
+    stage.relationship("/A.r")?.set_targets(["/C"])?;
+    assert_eq!(
+        stage.relationship("/A.r")?.targets()?,
+        vec![sdf::path("/C")?],
+        "the re-authored targets must be visible, not the memoized list",
+    );
+    Ok(())
+}
+
+/// A relationship inherited from a class translates the class's targets into the
+/// inheriting prim's namespace. Editing the class relationship must fan out to
+/// the inheriting prim's memo (a referenced site's edit restales the translated
+/// targets), not just the class's own.
+#[test]
+fn target_edit_fans_out_to_dependent() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Class")?;
+    stage.define_prim("/Class/Local")?;
+    stage.define_prim("/Class/Other")?;
+    stage
+        .prim("/Class")?
+        .create_relationship("r")?
+        .set_targets(["/Class/Local"])?;
+    stage.define_prim("/Inst")?.set_metadata(
+        sdf::FieldKey::InheritPaths.as_str(),
+        vt::Value::PathListOp(sdf::PathListOp::prepended([sdf::path("/Class")?])),
+    )?;
+    stage.define_prim("/Inst/Local")?;
+    stage.define_prim("/Inst/Other")?;
+
+    // First query memoizes the inherited relationship's translated targets.
+    assert_eq!(
+        stage.relationship("/Inst.r")?.targets()?,
+        vec![sdf::path("/Inst/Local")?],
+        "the inherited target translates into the instance namespace",
+    );
+
+    stage.relationship("/Class.r")?.set_targets(["/Class/Other"])?;
+    assert_eq!(
+        stage.relationship("/Inst.r")?.targets()?,
+        vec![sdf::path("/Inst/Other")?],
+        "editing the class relationship restales the inheriting prim's memo",
+    );
+    Ok(())
+}
+
+/// A prim that inherits a class composes the class's site without the class
+/// getting an index of its own. A reference authored on the class recomposes
+/// the inheriting prim all the same.
+#[test]
+fn unindexed_class_edit_reaches_inheritor() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+def "Lib" {
+    def "FromRef" {}
+}
+class "_Class" {
+    def "Child" {}
+}
+def "Inst" (
+    inherits = </_Class>
+)
+{
+}
+"#,
+    )?;
+    assert_eq!(child_names(&stage, "/Inst")?, vec!["Child".to_string()]);
+    assert!(!stage.is_indexed(&sdf::path("/_Class")?), "nothing asked for the class");
+
+    let reference = vt::Value::ReferenceListOp(sdf::ReferenceListOp::prepended([sdf::Reference {
+        prim_path: sdf::path("/Lib")?,
+        ..Default::default()
+    }]));
+    stage.root_layer().edit(|e| {
+        e.data_mut()
+            .set_field(&sdf::path("/_Class")?, sdf::FieldKey::References.as_str(), reference);
+        Ok(())
+    })?;
+
+    let names = child_names(&stage, "/Inst")?;
+    assert!(
+        names.contains(&"FromRef".to_string()),
+        "the class's new reference reaches the prim inheriting it: {names:?}"
+    );
+    Ok(())
+}
+
+/// Removing the relationship spec that authored the memoized targets must drop
+/// the memo so the next query recomposes. The removal carries only
+/// `REMOVE_PROPERTY`, so the producer surfaces the removed `targetPaths` to route
+/// it through `did_change_targets`; without that the stale `[/B]` would persist.
+#[test]
+fn target_spec_removal_drops_memo() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.prim("/A")?.create_relationship("r")?.set_targets(["/B"])?;
+
+    // Populate the memo.
+    assert_eq!(stage.relationship("/A.r")?.targets()?, vec![sdf::path("/B")?]);
+
+    assert!(stage.remove_property("/A.r")?);
+    assert_eq!(
+        stage.relationship("/A.r")?.targets()?,
+        Vec::<sdf::Path>::new(),
+        "the removed relationship's memoized targets must not persist",
+    );
+    Ok(())
+}
+
+/// A relationship-target value edit is a changed-info edit on the property, not a
+/// whole-prim resync: the change notice's `resynced` must not name the owning
+/// prim, while `changed_info_only` names the edited relationship.
+#[test]
+fn target_edit_is_info_only_not_resync() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.define_prim("/C")?;
+    stage.prim("/A")?.create_relationship("r")?.set_targets(["/B"])?;
+
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let (resynced, info) = (resynced.clone(), info.clone());
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+        })?
+    };
+    stage.relationship("/A.r")?.set_targets(["/C"])?;
+
+    assert!(
+        !resynced.borrow().contains(&sdf::path("/A")?),
+        "a target value edit must not resync the owning prim"
+    );
+    assert!(
+        info.borrow().contains(&sdf::path("/A.r")?),
+        "the edited relationship is reported as changed-info"
+    );
+    Ok(())
+}
+
+/// Removing an attribute is a structural removal, not a changed-info edit: the
+/// removed property must not appear in `changed_info_only`, where a consumer
+/// reading its value would find it gone. It is reported as a resync of the
+/// property instead (C++ `otherResyncChanges`).
+#[test]
+fn attr_removal_not_info_only() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.create_attribute("/P.size", "double")?;
+
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let (info, resynced) = (info.clone(), resynced.clone());
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+        })?
+    };
+    assert!(stage.remove_property("/P.size")?);
+
+    assert!(
+        !info.borrow().contains(&sdf::path("/P.size")?),
+        "a removed attribute must not be reported as a changed-info edit"
+    );
+    assert!(
+        resynced.borrow().contains(&sdf::path("/P.size")?),
+        "the removed attribute is reported as a resync, got {:?}",
+        resynced.borrow()
+    );
+    Ok(())
+}
+
+/// Removing a relationship that had authored targets surfaces its `targetPaths`
+/// for memo invalidation, but that internal signal must not surface the gone
+/// property as a changed-info edit — the removal is structural, not info-only.
+#[test]
+fn rel_removal_not_info_only() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.define_prim("/B")?;
+    stage.prim("/A")?.create_relationship("r")?.set_targets(["/B"])?;
+
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let info = info.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+        })?
+    };
+    assert!(stage.remove_property("/A.r")?);
+
+    assert!(
+        !info.borrow().contains(&sdf::path("/A.r")?),
+        "a removed relationship with targets must not be reported as a changed-info edit"
+    );
+    Ok(())
+}
+
+/// A connection authored in a class that targets an instance of that class is
+/// dropped per `_TargetInClassAndTargetsInstance` — a decision that composes the
+/// target prim to read its instance status. The resolved list must not be served
+/// from a stale memo after the target prim's instance status changes. `Owner` and
+/// `Target` are top-level siblings, so editing `Target` does not fan out to drop
+/// `Owner`'s index (their only common ancestor is the pseudo-root); the memo
+/// itself must recognize it read cross-prim instance state and resolve live.
+#[test]
+fn instance_target_memo_not_stale() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n\nclass \"Class\"\n{\n    double x\n    add double x.connect = [</Target.y>]\n    double y\n}\n\n\
+         def \"Owner\" (\n    inherits = </Class>\n)\n{\n}\n\ndef \"Target\" (\n    inherits = </Class>\n)\n{\n}\n",
+    )?;
+    let attr = "/Owner.x";
+    let target = sdf::path("/Target")?;
+    let drop_inherit = || vt::Value::PathListOp(sdf::PathListOp::explicit(Vec::<sdf::Path>::new()));
+
+    // Stage A: query first (populating any memo). `Target` is an instance of
+    // `Class`, so the class connection to it is dropped. Then drop `Target`'s
+    // inherit so it is no longer an instance, and re-query.
+    let a = Stage::open(root.to_str().unwrap())?;
+    let before = a.attribute(attr)?.connections()?;
+    a.prim(target.clone())?
+        .set_metadata(sdf::FieldKey::InheritPaths.as_str(), drop_inherit())?;
+    let after_cached = a.attribute(attr)?.connections()?;
+
+    // Stage B: apply the same edit before any query, so its result is composed
+    // from scratch with no memo in play.
+    let b = Stage::open(root.to_str().unwrap())?;
+    b.prim(target)?
+        .set_metadata(sdf::FieldKey::InheritPaths.as_str(), drop_inherit())?;
+    let fresh = b.attribute(attr)?.connections()?;
+
+    assert_eq!(after_cached, fresh, "the cached path must agree with a fresh compose");
+    assert_ne!(
+        before, after_cached,
+        "the edit must change the result (guards against a vacuous test)"
+    );
+    Ok(())
+}
+
+// --- Adapted from in-module tests: value resolution, existence, authoring ---
+
+/// A direct arc to a `permission = private` site composes normally:
+/// `permission` is inert metadata for composition (spec 10.3.3), matching C++'s
+/// own arc/target permission enforcement, which is compiled out for `Usd`-mode
+/// caches and therefore never runs for a `UsdStage`.
+#[test]
+fn permission_private_inherit_composes_normally() -> Result<()> {
+    let path = format!(
+        "{}vendor/core-spec-supplemental-release_dec2025/composition/tests/assets/\
+             ErrorPermissionDenied_root/usda/root.usd",
+        env!("CARGO_WORKSPACE_DIR")
+    );
+    let stage = Stage::builder().open(&path)?;
+
+    // /Model inherits the private /_PrivateClass; the inherited opinion stays
+    // visible and composing it raises no error.
+    assert!(
+        stage
+            .prim("/Model")?
+            .property_names()?
+            .iter()
+            .any(|n| n.as_str() == "attr"),
+        "private inherit must stay visible"
+    );
+    assert!(
+        stage.composition_errors().is_empty(),
+        "permission = private must not raise a composition error"
+    );
+
+    Ok(())
+}
+
+/// Reading a field from a single-layer stage should return the authored value.
+#[test]
+fn field_single_layer() -> Result<()> {
+    let path = composition_path("active.usda");
+    let stage = Stage::open(&path)?;
+
+    // CubeInactive composes as inactive; CubeActive as active.
+    assert!(!stage.prim("/World/CubeInactive")?.is_active()?);
+    assert!(stage.prim("/World/CubeActive")?.is_active()?);
+
+    Ok(())
+}
+
+// --- Sublayer composition ---
+
+/// `sublayer_override.usda` sublayers `sublayer_base.usda`. Both layers define
+/// /World/Cube but with different displayColor values. The stronger (override)
+/// layer's opinion should win (first-opinion-wins rule).
+#[test]
+fn sublayer_stronger_opinion_wins() -> Result<()> {
+    let path = fixture_path("sublayer_override.usda");
+    let stage = Stage::open(&path)?;
+
+    assert_eq!(stage.layer_count(), 2);
+
+    // /World/Cube.primvars:displayColor is overridden to blue [(0,0,1)] in
+    // the stronger layer, base has red [(1,0,0)].
+    let prop_path = sdf::Path::new("/World/Cube")?.append_property("primvars:displayColor")?;
+    let value = stage.attribute(&prop_path)?.get::<vt::Value>()?;
+    assert!(value.is_some(), "displayColor should have a composed value");
+
+    // The composed value must come from the stronger layer (blue),
+    // not the weaker layer (red). Verify by checking it's not the base red.
+    let value = value.unwrap();
+    let base_red = vt::Value::Vec3fVec(vec![gf::vec3f(1.0, 0.0, 0.0)]);
+    assert_ne!(value, base_red, "stronger layer opinion should win over weaker");
+
+    Ok(())
+}
+
+/// The active.usda vendor test has prims with active=true/false metadata.
+/// Verify field resolution returns the correct authored values.
+#[test]
+fn field_active_metadata() -> Result<()> {
+    let path = composition_path("active.usda");
+    let stage = Stage::open(&path)?;
+
+    assert!(!stage.prim("/World/CubeInactive")?.is_active()?);
+    assert!(stage.prim("/World/CubeActive")?.is_active()?);
+
+    Ok(())
+}
+
+// --- Reference composition ---
+
+/// An external reference with defaultPrim should pull the referenced prim's
+/// children into the referencing prim's namespace.
+/// `ref_external.usda`: /World/MyPrim references `ref_target.usda` (defaultPrim="Source").
+/// `ref_target.usda` defines /Source/Child with displayColor.
+#[test]
+fn reference_external_default_prim() -> Result<()> {
+    let path = fixture_path("ref_external.usda");
+    let stage = Stage::open(&path)?;
+
+    // /World/MyPrim should exist via the reference.
+    assert!(stage.prim("/World/MyPrim")?.is_valid()?);
+
+    // /World/MyPrim/Child should be reachable via namespace remapping.
+    let children = child_names(&stage, "/World/MyPrim")?;
+    assert!(
+        children.contains(&"Child".to_string()),
+        "referenced children should be visible"
+    );
+
+    Ok(())
+}
+
+/// `class_inherit.usda`: cubeWithSetColor inherits from /_myClass but
+/// overrides displayColor locally. Local opinion (red) should win
+/// over the inherited opinion (green).
+#[test]
+fn inherit_local_opinion_wins() -> Result<()> {
+    let path = composition_path("class_inherit.usda");
+    let stage = Stage::open(&path)?;
+
+    // The local displayColor (red) should win over inherited (green).
+    let prop = sdf::Path::new("/World/cubeWithSetColor")?.append_property("primvars:displayColor")?;
+    let value = stage.attribute(&prop)?.get::<vt::Value>()?;
+    assert!(value.is_some());
+
+    // Verify it's the local red, not the inherited green.
+    let green = vt::Value::Vec3fVec(vec![gf::vec3f(0.0, 0.8, 0.0)]);
+    assert_ne!(value.unwrap(), green, "local opinion should win over inherited");
+
+    Ok(())
+}
+
+// --- Variant selection ---
+
+/// The local opinion on radius (1) should be stronger than the variant's (2).
+#[test]
+fn variant_local_opinion_wins() -> Result<()> {
+    let path = format!(
+        "{}vendor/usd-wg-assets/docs/CompositionPuzzles/VariantSetAndLocal1/puzzle_1.usda",
+        env!("CARGO_WORKSPACE_DIR")
+    );
+    let stage = Stage::open(&path)?;
+
+    // The local radius=1 should win over variant radius=2.
+    let prop = sdf::Path::new("/World/Sphere")?.append_property("radius")?;
+    let value = stage.attribute(&prop)?.get::<f64>()?;
+    assert_eq!(value, Some(1.0), "local opinion (1) should win over variant (2)");
+
+    Ok(())
+}
+
+// --- Specialize composition ---
+
+/// The local opinion on displayColor (yellow) should win over the
+/// specialized source's displayColor (red).
+#[test]
+fn specialize_local_opinion_wins() -> Result<()> {
+    let path = composition_path("inherit_and_specialize.usda");
+    let stage = Stage::open(&path)?;
+
+    let prop = sdf::Path::new("/World/cubeScene/specializes")?.append_property("primvars:displayColor")?;
+    let value = stage.attribute(&prop)?.get::<vt::Value>()?;
+    assert!(value.is_some());
+
+    // Local is yellow (0.8, 0.8, 0), source is red (0.8, 0, 0).
+    let red = vt::Value::Vec3fVec(vec![gf::vec3f(0.8, 0.0, 0.0)]);
+    assert_ne!(value.unwrap(), red, "local opinion should win over specialized");
+
+    Ok(())
+}
+
+/// A prim with `instanceable = true` composes as instanceable.
+#[test]
+fn instanceable_true_parses_and_is_readable() -> Result<()> {
+    let path = fixture_path("instanceable_metadata.usda");
+    let stage = Stage::open(&path)?;
+
+    assert!(stage.prim("/Root/InstancePrototype")?.is_instanceable()?);
+
+    Ok(())
+}
+
+/// A prim with `instanceable = false` composes as not instanceable.
+#[test]
+fn instanceable_false_parses_and_is_readable() -> Result<()> {
+    let path = fixture_path("instanceable_metadata.usda");
+    let stage = Stage::open(&path)?;
+
+    assert!(!stage.prim("/Root/NotInstanceable")?.is_instanceable()?);
+
+    Ok(())
+}
+
+/// A prim without `instanceable` metadata defaults to not instanceable.
+#[test]
+fn instanceable_absent_defaults_false() -> Result<()> {
+    let path = fixture_path("instanceable_metadata.usda");
+    let stage = Stage::open(&path)?;
+
+    assert!(!stage.prim("/Root")?.is_instanceable()?);
+
+    Ok(())
+}
+
+// --- Variant fallback selection ---
+
+/// A variant fallback should select the specified variant when no authored
+/// selection exists. The prim should expose opinions from the fallback variant.
+#[test]
+fn variant_fallback_selects_preferred() -> Result<()> {
+    let path = fixture_path("variant_fallback.usda");
+    let fallbacks = pcp::VariantFallbackMap::new().add("shadingComplexity", ["simple"]);
+    let stage = Stage::builder().variant_fallbacks(fallbacks).open(&path)?;
+
+    // /NoSelection has no authored selection. With fallback "simple",
+    // the complexity field should be 0.5 (not 1.0 from "full").
+    let prop = sdf::Path::new("/NoSelection")?.append_property("complexity")?;
+    let value = stage.attribute(&prop)?.get::<f64>()?;
+    assert_eq!(value, Some(0.5), "fallback 'simple' should give complexity=0.5");
+
+    Ok(())
+}
+
+/// An authored selection should take priority over a variant fallback at the
+/// stage level.
+#[test]
+fn variant_fallback_does_not_override_authored() -> Result<()> {
+    let path = fixture_path("variant_fallback.usda");
+    let fallbacks = pcp::VariantFallbackMap::new().add("shadingComplexity", ["none"]);
+    let stage = Stage::builder().variant_fallbacks(fallbacks).open(&path)?;
+
+    // /Root has authored selection "full". Even with fallback "none",
+    // the authored selection should win.
+    let prop = sdf::Path::new("/Root")?.append_property("complexity")?;
+    let value = stage.attribute(&prop)?.get::<f64>()?;
+    assert_eq!(value, Some(1.0), "authored 'full' should win over fallback 'none'");
+
+    Ok(())
+}
+
+// --- Inherit child propagation ---
+
+/// A prim that inherits a class should expose the class's children even
+/// when the inheriting prim has no local override for them.
+#[test]
+fn inherit_child_exists_without_local_override() -> Result<()> {
+    let path = fixture_path("inherit_child_propagation.usda");
+    let stage = Stage::open(&path)?;
+
+    // /Instance inherits /BaseClass which has child /BaseClass/Child.
+    // /Instance/Child should exist even though Instance has no local "Child".
+    let children = child_names(&stage, "/Instance")?;
+    assert!(
+        children.contains(&"Child".to_string()),
+        "inherited child should appear: got {children:?}"
+    );
+
+    // The inherited property should be accessible.
+    assert!(
+        stage
+            .prim("/Instance/Child")?
+            .property_names()?
+            .iter()
+            .any(|n| n.as_str() == "name"),
+        "property from inherited child should be visible"
+    );
+
+    Ok(())
+}
+
+/// Nested children from an inherited class should propagate through
+/// multiple levels even without local overrides at any level.
+#[test]
+fn inherit_nested_child_propagation() -> Result<()> {
+    let path = fixture_path("inherit_nested_child.usda");
+    let stage = Stage::open(&path)?;
+
+    // /Prim inherits /Base. /Base/A/B exists with val=1.0.
+    // /Prim/A should exist, /Prim/A/B should exist.
+    let a_children = child_names(&stage, "/Prim")?;
+    assert!(
+        a_children.contains(&"A".to_string()),
+        "first-level child: got {a_children:?}"
+    );
+
+    let b_children = child_names(&stage, "/Prim/A")?;
+    assert!(
+        b_children.contains(&"B".to_string()),
+        "second-level child: got {b_children:?}"
+    );
+
+    assert!(
+        stage
+            .prim("/Prim/A/B")?
+            .property_names()?
+            .iter()
+            .any(|n| n.as_str() == "val"),
+        "deeply nested inherited property should be visible"
+    );
+
+    Ok(())
+}
+
+/// Children should propagate through an inherit chain (Leaf → Middle → `GrandBase`).
+#[test]
+fn inherit_chain_child_propagation() -> Result<()> {
+    let path = fixture_path("inherit_chain_child.usda");
+    let stage = Stage::open(&path)?;
+
+    // /Leaf inherits /Middle which inherits /GrandBase.
+    // /GrandBase/Deep exists with x=42. /Leaf/Deep should exist.
+    let children = child_names(&stage, "/Leaf")?;
+    assert!(
+        children.contains(&"Deep".to_string()),
+        "chain-inherited child: got {children:?}"
+    );
+
+    assert!(
+        stage
+            .prim("/Leaf/Deep")?
+            .property_names()?
+            .iter()
+            .any(|n| n.as_str() == "x"),
+        "property from chain-inherited child should be visible"
+    );
+
+    Ok(())
+}
+
+/// A session layer's opinions should be stronger than the root layer's.
+#[test]
+fn session_layer_opinion_wins() -> Result<()> {
+    let stage = open_with_session()?;
+
+    assert!(stage.has_session_layer());
+    assert_eq!(stage.layer_count(), 2);
+    assert!(
+        stage
+            .session_layer()
+            .expect("configured session layer")
+            .identifier()
+            .ends_with("session_layer.usda")
+    );
+
+    let prop = sdf::Path::new("/World")?.append_property("radius")?;
+    let value = stage.attribute(&prop)?.get::<f64>()?;
+    assert_eq!(value, Some(99.0), "session layer opinion should win");
+
+    Ok(())
+}
+
+/// The session layer can add properties not present in the root layer.
+#[test]
+fn session_layer_adds_properties() -> Result<()> {
+    let stage = open_with_session()?;
+
+    let prop = sdf::Path::new("/World")?.append_property("visibility")?;
+    let value = stage.attribute(&prop)?.get::<String>()?;
+    assert_eq!(value, Some("hidden".to_string()));
+
+    Ok(())
+}
+
+/// The root layer's properties not overridden by the session layer
+/// should still be accessible.
+#[test]
+fn session_layer_preserves_root_opinions() -> Result<()> {
+    let stage = open_with_session()?;
+
+    let prop = sdf::Path::new("/World")?.append_property("name")?;
+    let value = stage.attribute(&prop)?.get::<String>()?;
+    assert_eq!(value, Some("root".to_string()));
+
+    Ok(())
+}
+
+#[test]
+fn mask_traverse() -> Result<()> {
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/World/ActiveParent/Child"])?)
+        .open("fixtures/stage_queries.usda")?;
+
+    assert_eq!(
+        stage.root_prims()?.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        ["World"]
+    );
+    assert_eq!(child_names(&stage, "/World")?, vec!["ActiveParent"]);
+    assert_eq!(child_names(&stage, "/World/ActiveParent")?, vec!["Child"]);
+
+    assert!(stage.prim("/World")?.is_valid()?);
+    assert!(stage.prim("/World/ActiveParent/Child")?.is_valid()?);
+    assert!(!stage.prim("/World/Group")?.is_valid()?);
+    assert_eq!(stage.prim("/World/Group")?.kind()?, None);
+
+    let mut prims = Vec::new();
+    stage.traverse(PrimPredicate::ALL, |p| prims.push(p.as_str().to_string()))?;
+    assert_eq!(
+        prims,
+        vec!["/World", "/World/ActiveParent", "/World/ActiveParent/Child"]
+    );
+    Ok(())
+}
+
+#[test]
+fn mask_skips_dependency() -> Result<()> {
+    let path = composition_path("references/reference_invalid.usda");
+    let stage = Stage::builder()
+        .mask(StagePopulationMask::new(["/World/cube"])?)
+        .open(&path)?;
+
+    assert_eq!(
+        stage.root_prims()?.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+        ["World"]
+    );
+    assert_eq!(child_names(&stage, "/World")?, vec!["cube"]);
+    assert!(!stage.prim("/World/invalid_reference")?.is_valid()?);
+    Ok(())
+}
+
+/// `Stage::custom_layer_data` reads the root layer's `customLayerData`
+/// dictionary (C++ `UsdStage::GetRootLayer()->GetCustomLayerData`).
+#[test]
+fn custom_layer_data() -> Result<()> {
+    let stage = in_memory_stage()?;
+    assert!(stage.custom_layer_data()?.is_none());
+
+    let dict = vt::Value::Dictionary([("tool".to_string(), vt::Value::String("rs".into()))].into());
+    stage.set_custom_layer_data(dict)?;
+
+    let Some(vt::Value::Dictionary(read)) = stage.custom_layer_data()? else {
+        panic!("customLayerData should resolve to a dictionary");
+    };
+    assert_eq!(read.get("tool"), Some(&vt::Value::String("rs".into())));
+    Ok(())
+}
+
+#[test]
+fn create_attribute() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Sphere")?.set_type_name("Sphere")?;
+    stage.create_attribute("/Sphere.radius", "double")?;
+
+    let attr = stage.attribute("/Sphere.radius")?;
+    assert_eq!(attr.type_name()?, Some(sdf::ValueTypeName::DOUBLE));
+    assert!(attr.is_custom()?, "generic attributes are authored custom");
+    // The property composes as an attribute (not a relationship).
+    let radius = sdf::Path::new("/Sphere.radius")?;
+    let attrs = stage.prim("/Sphere")?.attributes()?;
+    assert!(attrs.iter().any(|a| a.path() == &radius));
+    Ok(())
+}
+
+#[test]
+fn create_relationship() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Mesh")?.set_type_name("Mesh")?;
+    let rel = stage.create_relationship("/Mesh.material:binding")?;
+
+    assert!(rel.is_custom()?, "generic relationships are authored custom");
+    // The property composes as a relationship (not an attribute).
+    let binding = sdf::Path::new("/Mesh.material:binding")?;
+    let rels = stage.prim("/Mesh")?.relationships()?;
+    assert!(rels.iter().any(|r| r.path() == &binding));
+    Ok(())
+}
+
+/// `defaultPrim` writes target the root layer regardless of `EditTarget`
+/// (mirrors C++ `UsdStage::SetDefaultPrim` going through `GetRootLayer`).
+/// In-memory root with a file-loaded session layer; setting the edit
+/// target to the read-only session layer must not block the write.
+#[test]
+fn default_prim_targets_root() -> Result<()> {
+    let session = fixture_path("session_layer.usda");
+    let stage = Stage::builder().session_layer(&session).in_memory("anon.usda")?;
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    stage.set_edit_target(EditTarget::for_layer(session_id))?;
+    stage.set_default_prim("World")?;
+    assert_eq!(stage.default_prim().as_deref(), Some("World"));
+    Ok(())
+}
+
+/// Exercises `StageBuilder::in_memory`'s session-layer branch: the
+/// anonymous root must end up at `session_layer_count`, the edit target
+/// must point there, and authoring on the in-memory root must work
+/// (with the session layer remaining read-only).
+#[test]
+fn in_memory_session_layer() -> Result<()> {
+    let session = fixture_path("session_layer.usda");
+    let stage = Stage::builder().session_layer(&session).in_memory("anon.usda")?;
+    assert!(stage.has_session_layer());
+    assert_eq!(stage.layer_count(), 2);
+    assert_eq!(stage.edit_target().layer_identifier(), stage.root_layer().identifier());
+    stage.define_prim("/World")?.set_type_name("Xform")?;
+    assert!(stage.prim("/World")?.is_defined()?);
+    Ok(())
+}
+
+/// `edit_context` restores the previous edit target when the guard drops.
+#[test]
+fn edit_context_restores_on_drop() -> Result<()> {
+    let session = fixture_path("session_layer.usda");
+    let stage = Stage::builder().session_layer(&session).in_memory("anon.usda")?;
+    let root_id = stage.root_layer().identifier().to_string();
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    assert_eq!(stage.edit_target().layer_identifier(), root_id);
+    {
+        let _ctx = stage.edit_context(EditTarget::for_layer(session_id.clone()))?;
+        assert_eq!(stage.edit_target().layer_identifier(), session_id);
+    }
+    assert_eq!(stage.edit_target().layer_identifier(), root_id);
+    Ok(())
+}
+
+/// The guard restores the target even when the scope exits early via `?`.
+#[test]
+fn edit_context_restores_on_error() -> Result<()> {
+    let session = fixture_path("session_layer.usda");
+    let stage = Stage::builder().session_layer(&session).in_memory("anon.usda")?;
+    let root_id = stage.root_layer().identifier().to_string();
+    let session_id = stage.session_layer().expect("session layer").identifier().to_string();
+    assert_eq!(stage.edit_target().layer_identifier(), root_id);
+    let authored: std::result::Result<(), StageAuthoringError> = (|| {
+        let _ctx = stage.edit_context(EditTarget::for_layer(session_id))?;
+        // Authoring a prim at a property path is invalid; the write fails and
+        // `?` returns from this closure with the guard still in scope.
+        stage.define_prim("/A.x")?;
+        Ok(())
+    })();
+    assert!(authored.is_err());
+    assert_eq!(stage.edit_target().layer_identifier(), root_id);
+    Ok(())
+}
+
+/// A significant edit inside a variant must invalidate the composed
+/// (variant-stripped) prim, whose cache key is not on the variant path's
+/// ancestor chain.
+#[test]
+fn variant_edit_invalidates_stripped_path() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.define_prim("/Prim")?;
+
+    // Cache a composed miss at the scene path.
+    assert!(!stage.prim("/Prim/child")?.is_valid()?);
+    assert!(stage.is_indexed(&sdf::path("/Prim/child")?));
+
+    // Author the child inside the variant: `/Prim/child` -> `/Prim{set=sel}child`.
+    stage.set_edit_target(EditTarget::for_local_direct_variant(
+        root,
+        sdf::path("/Prim{set=sel}")?,
+    )?)?;
+    stage.define_prim("/Prim/child")?;
+
+    // The stripped composed key is dropped, and settlement retires it, since
+    // nothing composes there yet.
+    assert!(!stage.is_indexed(&sdf::path("/Prim/child")?));
+    Ok(())
+}
+
+#[test]
+fn clip_skips_missing_attr() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = write_clip_scene(
+        dir.path(),
+        r#"#usda 1.0
+def "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./clip.usda@]
+            asset manifestAssetPath = @./manifest.usda@
+            string primPath = "/Model"
+            double2[] active = [(0, 0)]
+        }
+    }
+)
+{
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float ghost
+}
+"#,
+        r#"#usda 1.0
+def "Model"
+{
+    float ghost.timeSamples = {
+        0: 7
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(&root)?;
+    assert!(
+        !stage
+            .prim("/Model")?
+            .property_names()?
+            .iter()
+            .any(|n| n.as_str() == "ghost"),
+        "the clip must not fabricate an attribute"
+    );
+    assert_eq!(
+        stage
+            .attribute("/Model.ghost")?
+            .get_at::<vt::Value>(usd::TimeCode::new(0.0))?,
+        None
+    );
+    Ok(())
+}
+
+// Stage change listeners (C++ `UsdNotice`), exercised through the public API.
+
+/// A listener installed with `set_listener` fires once per edit, and the
+/// notice's `resynced` paths name the prim whose composition changed.
+#[test]
+fn listener_fires_on_define() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let count = Rc::new(Cell::new(0u32));
+    let _token = {
+        let (resynced, count) = (resynced.clone(), count.clone());
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            count.set(count.get() + 1);
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+        })?
+    };
+    stage.define_prim("/World")?;
+    assert_eq!(count.get(), 1);
+    assert!(resynced.borrow().contains(&sdf::Path::new("/World")?));
+    Ok(())
+}
+
+/// A pure value edit reports its path under `changed_info_only` (not
+/// `resynced`), and `changed_fields` names the authored field.
+#[test]
+fn listener_info_only() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/World")?;
+    let attr = stage.create_attribute("/World.size", "double")?;
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let has_default = Rc::new(Cell::new(false));
+    let _token = {
+        let (info, resynced, has_default) = (info.clone(), resynced.clone(), has_default.clone());
+        let size = sdf::Path::new("/World.size")?;
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+            if oc.changed_fields(&size).any(|t| t.as_str() == "default") {
+                has_default.set(true);
+            }
+        })?
+    };
+    attr.set(2.0_f64)?;
+    assert!(info.borrow().contains(&sdf::Path::new("/World.size")?));
+    assert!(resynced.borrow().is_empty());
+    assert!(has_default.get());
+    Ok(())
+}
+
+/// An info-only edit authored through a variant edit target reports its path
+/// in stage namespace (`/Prim.size`), translated from the `{set=sel}` layer
+/// namespace through the target's mapping, not the raw spec path. The
+/// stage-namespace path round-trips through `changed_fields`, which translates
+/// it back to the `{set=sel}` change-list key.
+#[test]
+fn listener_info_under_variant_target() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.define_prim("/Prim")?;
+    stage.set_edit_target(EditTarget::for_local_direct_variant(
+        root.clone(),
+        sdf::path("/Prim{set=sel}")?,
+    )?)?;
+    // Create the attribute inside the variant and select that variant before
+    // installing the listener, so the listener only observes the info-only
+    // `set` below, and so the attribute composes: the value write validates
+    // against its declaration.
+    let attr = stage.create_attribute("/Prim.size", "double")?;
+    stage.layer(&root)?.expect("root layer is live").edit(|e| {
+        let mut prim = e.prim_mut("/Prim")?.expect("the prim spec is on the root layer");
+        prim.set(
+            sdf::FieldKey::VariantSetNames.as_str(),
+            vt::Value::StringListOp(sdf::StringListOp::prepended(["set".to_owned()])),
+        );
+        prim.set_variant_selection("set", "sel")?;
+        Ok(())
+    })?;
+
+    let info: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let has_default = Rc::new(Cell::new(false));
+    let _token = {
+        let (info, has_default) = (info.clone(), has_default.clone());
+        let size = sdf::path("/Prim.size")?;
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            info.borrow_mut().extend(oc.changed_info_only.iter().cloned());
+            // `changed_fields` takes the stage-namespace path from
+            // `changed_info_only` and finds the field under the layer key.
+            if oc.changed_fields(&size).any(|t| t.as_str() == "default") {
+                has_default.set(true);
+            }
+        })?
+    };
+    attr.set(2.0_f64)?;
+
+    assert!(info.borrow().contains(&sdf::path("/Prim.size")?));
+    assert!(!info.borrow().contains(&sdf::path("/Prim{set=sel}.size")?));
+    assert!(has_default.get());
+    Ok(())
+}
+
+/// A structural edit through a variant edit target reports its resynced path in
+/// stage namespace (`/Prim/child`). The literal authored path the change
+/// pipeline fans out (`/Prim{set=sel}child`) must not leak into `resynced`.
+#[test]
+fn listener_resync_under_variant_target() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.edit_target().layer_identifier().to_string();
+    stage.define_prim("/Prim")?;
+    stage.set_edit_target(EditTarget::for_local_direct_variant(
+        root,
+        sdf::path("/Prim{set=sel}")?,
+    )?)?;
+
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let resynced = resynced.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+        })?
+    };
+    stage.define_prim("/Prim/child")?;
+
+    assert!(resynced.borrow().contains(&sdf::path("/Prim/child")?));
+    assert!(!resynced.borrow().contains(&sdf::path("/Prim{set=sel}child")?));
+    Ok(())
+}
+
+/// A variant edit target composed over a reference authors into the *referenced*
+/// layer's namespace, so the literal `/Source{set=sel}New` and its
+/// variant-stripped form `/Source/New` are both layer paths, not stage paths.
+/// Only the mapped `/MyPrim/New` may reach `resynced`.
+#[test]
+fn listener_referenced_variant() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let src = dir.path().join("src.usda");
+    fs::write(
+        &src,
+        "#usda 1.0
+
+def \"Source\" (
+    variants = { string set = \"sel\" }
+    prepend variantSets = \"set\"
+)
+{
+    variantSet \"set\" = {
+        \"sel\" {
+            def \"Kid\" {}
+        }
+    }
+}
+",
+    )?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0
+
+def \"MyPrim\" (
+    references = @src.usda@</Source>
+)
+{
+}
+",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert!(
+        stage.prim("/MyPrim/Kid")?.is_valid()?,
+        "the variant composes through the reference"
+    );
+
+    let arc = stage.edit_target_for_node(&sdf::path("/MyPrim")?, EditTargetArc::Reference)?;
+    let variant = EditTarget::for_local_direct_variant(arc.layer_identifier(), sdf::path("/Source{set=sel}")?)?;
+    stage.set_edit_target(variant.compose_over(&arc))?;
+
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let resynced = resynced.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+        })?
+    };
+    stage.define_prim("/MyPrim/New")?;
+
+    // Both authored spellings — `/Source{set=sel}New` through the variant node
+    // and `/Source` through the reference — translate onto the one composed
+    // path the new prim occupies.
+    assert_eq!(*resynced.borrow(), vec![sdf::path("/MyPrim/New")?]);
+    Ok(())
+}
+
+/// A local layer shares the stage's namespace only after variant selections are
+/// stripped: a spec authored straight into `/Prim{set=sel}child` composes into
+/// `/Prim/child`, and only that composed path may be reported.
+#[test]
+fn local_variant_resync_stripped() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Prim")?;
+    let notices = capture_notices(&stage);
+    stage.root_layer().edit(|e| {
+        sdf::PrimSpec::new(
+            e.data_mut(),
+            sdf::path("/Prim{set=sel}child").expect("valid path"),
+            sdf::Specifier::Def,
+            "",
+        )?;
+        Ok(())
+    })?;
+    stage.prim("/Prim")?.is_valid()?;
+
+    assert_eq!(notices.borrow().resynced, paths(&["/Prim/child"]));
+    Ok(())
+}
+
+/// Switching the edit target delivers `EditTargetChanged`; re-setting the same
+/// target is a no-op and fires nothing.
+#[test]
+fn listener_edit_target_changed() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.root_layer().identifier().to_string();
+    let sub = sdf::Layer::new_anonymous("sub.usda");
+    let sub_id = sub.identifier().to_string();
+    stage.insert_layer(&root, 0, sub, sdf::LayerOffset::IDENTITY)?;
+    let count = Rc::new(Cell::new(0u32));
+    let _token = {
+        let count = count.clone();
+        stage.add_sink(RecordingSink {
+            edit_target: Some(Box::new(move |_stage| count.set(count.get() + 1))),
+            ..Default::default()
+        })?
+    };
+    stage.set_edit_target(EditTarget::for_layer(sub_id.clone()))?;
+    assert_eq!(count.get(), 1);
+    stage.set_edit_target(EditTarget::for_layer(sub_id))?;
+    assert_eq!(count.get(), 1);
+    Ok(())
+}
+
+/// An `EditContext` fires `EditTargetChanged` on both entry and restore, so a
+/// listener tracking the edit target stays consistent across the scope.
+#[test]
+fn listener_edit_context_restore() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.root_layer().identifier().to_string();
+    let sub = sdf::Layer::new_anonymous("sub.usda");
+    let sub_id = sub.identifier().to_string();
+    stage.insert_layer(&root, 0, sub, sdf::LayerOffset::IDENTITY)?;
+    let count = Rc::new(Cell::new(0u32));
+    let _token = {
+        let count = count.clone();
+        stage.add_sink(RecordingSink {
+            edit_target: Some(Box::new(move |_stage| count.set(count.get() + 1))),
+            ..Default::default()
+        })?
+    };
+    {
+        let _ctx = stage.edit_context(EditTarget::for_layer(sub_id))?;
+        assert_eq!(count.get(), 1); // entry fired
+    } // drop restores the previous target → fires again
+    assert_eq!(count.get(), 2);
+    Ok(())
+}
+
+/// Muting and unmuting a layer deliver `LayerMutingChanged` with the changed
+/// identifiers; a redundant mute/unmute fires nothing.
+#[test]
+fn listener_layer_muting() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let muted = Rc::new(RefCell::new(Vec::<String>::new()));
+    let unmuted = Rc::new(RefCell::new(Vec::<String>::new()));
+    let _token = {
+        let (muted, unmuted) = (muted.clone(), unmuted.clone());
+        stage.add_sink(RecordingSink {
+            muting: Some(Box::new(move |_stage, layer, is_muted, resynced: Resynced<'_>| {
+                // No such layer is loaded, so the toggle invalidates nothing —
+                // and is still reported, unlike a no-op load-rules edit.
+                assert!(
+                    resynced.subtrees.is_empty() && resynced.prims.is_empty(),
+                    "nothing was cached against {layer}"
+                );
+                if is_muted {
+                    muted.borrow_mut().push(layer.to_string());
+                } else {
+                    unmuted.borrow_mut().push(layer.to_string());
+                }
+            })),
+            ..Default::default()
+        })?
+    };
+    stage.mute_layer("weak.usda");
+    stage.mute_layer("weak.usda"); // already muted — no notice
+    stage.unmute_layer("weak.usda");
+    stage.unmute_layer("weak.usda"); // already unmuted — no notice
+    assert_eq!(*muted.borrow(), vec!["weak.usda".to_string()]);
+    assert_eq!(*unmuted.borrow(), vec!["weak.usda".to_string()]);
+    Ok(())
+}
+
+/// Opens a two-level nested-instancing stage, returning it with both prototype
+/// roots composed (and the temp dir that must outlive it).
+///
+/// `/A` instances `Model` from `model.usda`, whose own child instances `Inner`
+/// from `inner.usda`; `model.usda` sublayers `detail.usda`. Every `instanceable`
+/// opinion sits in the layer that introduces the prim, so it is instance-local
+/// to the prototype it produces and a prototype registers only the stack its
+/// shared content composes — never its referrer's. That keeps the nested
+/// prototype off the victim lists below, so a test that sees its root saw the
+/// cascade report it rather than a victim covering it.
+fn nested_instancing_stage() -> Result<(tempfile::TempDir, Stage, sdf::Path, sdf::Path)> {
+    let dir = tempfile::tempdir()?;
+    let root = write_nested_instancing_scene(dir.path())?;
+    let stage = Stage::open(&root)?;
+    let outer = stage.prim("/A")?.prototype()?.expect("/A is an instance");
+    let nested = stage
+        .prim(outer.append_path("Nested")?)?
+        .prototype()?
+        .expect("the nested prim is an instance");
+    Ok((dir, stage, outer, nested))
+}
+
+/// Writes the scene [`nested_instancing_stage`] opens, returning the root
+/// layer's path.
+fn write_nested_instancing_scene(dir: &FsPath) -> Result<String> {
+    fs::write(
+        dir.join("inner.usda"),
+        "#usda 1.0\n\ndef \"Inner\"\n{\n    def \"Leaf\"\n    {\n        custom double v = 1\n    }\n}\n",
+    )?;
+    fs::write(
+        dir.join("detail.usda"),
+        "#usda 1.0\n\nover \"Model\"\n{\n    custom double d = 2\n}\n",
+    )?;
+    fs::write(
+        dir.join("model.usda"),
+        "#usda 1.0\n(\n    subLayers = [@detail.usda@]\n)\n\ndef \"Model\"\n{\n    def \"Nested\" (\n        instanceable = true\n        references = @inner.usda@</Inner>\n    )\n    {\n    }\n}\n",
+    )?;
+    let root = dir.join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\n\ndef \"A\" (\n    instanceable = true\n    references = @model.usda@</Model>\n)\n{\n}\n",
+    )?;
+    Ok(root.to_str().expect("utf-8 path").to_string())
+}
+
+/// A mute reports what it invalidated, prototypes included. `detail.usda`
+/// reaches only the outer prototype's stack, so the nested root is on no
+/// victim's ancestor chain and appears solely because the cascade named it.
+#[test]
+fn mute_reports_prototypes() -> Result<()> {
+    let (_dir, stage, outer, nested) = nested_instancing_stage()?;
+    let notices = capture_notices(&stage);
+    stage.mute_layer(identifier_by_leaf(&stage, "detail.usda"));
+
+    let reported = &notices.borrow().muting;
+    assert!(reported.contains(&sdf::path("/A")?), "the instance: {reported:?}");
+    assert!(reported.contains(&outer), "the outer prototype: {reported:?}");
+    assert!(reported.contains(&nested), "the nested prototype: {reported:?}");
+    Ok(())
+}
+
+/// An unload reports the prototypes it retired. Its victim list is `/A` alone —
+/// the ancestor walk stops at the root's `Rule::All` — so neither root can
+/// arrive any other way.
+#[test]
+fn unload_reports_prototypes() -> Result<()> {
+    let (_dir, stage, outer, nested) = nested_instancing_stage()?;
+    let notices = capture_notices(&stage);
+    stage.unload("/A")?;
+
+    let reported = &notices.borrow().load_rules;
+    assert!(reported.contains(&outer), "the outer prototype: {reported:?}");
+    assert!(reported.contains(&nested), "the nested prototype: {reported:?}");
+    Ok(())
+}
+
+/// An `expressionVariables` edit on a *referenced* layer flips that stack's
+/// variable source, resyncing its users. The stack is not the root's, so the
+/// resync is the affected prims rather than a blanket `/`, and the nested
+/// prototype — whose shared content composes `inner.usda`, not this stack — is
+/// named only by the cascade.
+#[test]
+fn vars_edit_reports_prototypes() -> Result<()> {
+    let (_dir, stage, outer, nested) = nested_instancing_stage()?;
+    let notices = capture_notices(&stage);
+    let model = identifier_by_leaf(&stage, "model.usda");
+    stage
+        .layer(&model)?
+        .expect("the referenced layer is live")
+        .edit(|e| e.set_expression_variables(HashMap::from([("V".to_string(), vt::Value::String("x".into()))])))?;
+    // A direct layer edit is queued; the composed notice lands on the next drain.
+    stage.prim("/A")?.is_valid()?;
+
+    let reported = &notices.borrow().resynced;
+    assert!(
+        !reported.contains(&sdf::path("/")?),
+        "a non-root stack resyncs no blanket"
+    );
+    assert!(reported.contains(&outer), "the outer prototype: {reported:?}");
+    assert!(reported.contains(&nested), "the nested prototype: {reported:?}");
+    Ok(())
+}
+
+/// An ordinary significant edit retires the prototypes its prim shared, and
+/// those roots reach the notice only through the apply phase: the tiers naming
+/// `/A` were classified before it ran.
+#[test]
+fn significant_edit_reports_prototypes() -> Result<()> {
+    let (_dir, stage, outer, nested) = nested_instancing_stage()?;
+    let notices = capture_notices(&stage);
+    stage
+        .prim("/A")?
+        .set_metadata(sdf::FieldKey::Instanceable.as_str(), vt::Value::Bool(false))?;
+
+    let reported = &notices.borrow().resynced;
+    assert!(reported.contains(&sdf::path("/A")?), "the edited prim: {reported:?}");
+    assert!(reported.contains(&outer), "the outer prototype: {reported:?}");
+    assert!(reported.contains(&nested), "the nested prototype: {reported:?}");
+    Ok(())
+}
+
+/// After `remove_sink`, no further changes are delivered.
+#[test]
+fn unset_stops_delivery() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let count = Rc::new(Cell::new(0u32));
+    let id = {
+        let count = count.clone();
+        stage.add_sink(move |_: &Stage, _: &CommittedChange<'_>| count.set(count.get() + 1))?
+    };
+    stage.define_prim("/A")?;
+    assert_eq!(count.get(), 1);
+    stage.remove_sink(id)?;
+    stage.define_prim("/B")?;
+    assert_eq!(count.get(), 1);
+    Ok(())
+}
+
+/// A layer sink's `before_commit` sees the staged edit — the edited layer, its
+/// non-empty overlay, and the derived change record — before the overlay
+/// commits, fired by an edit routed through the stage.
+#[test]
+fn layer_sink_sees_staged() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let root = stage.root_layer().identifier().to_string();
+    let seen = Rc::new(RefCell::new(String::new()));
+    let staged = Rc::new(Cell::new(false));
+    {
+        let (seen, staged) = (seen.clone(), staged.clone());
+        stage.root_layer().add_sink(RecordingLayerSink {
+            before: Some(Box::new(move |change| {
+                seen.replace(change.layer_identifier.to_string());
+                if !change.overlay.is_empty() && !change.change_list.is_empty() {
+                    staged.set(true);
+                }
+                Ok(())
+            })),
+            ..Default::default()
+        })?;
+    }
+    stage.define_prim("/World")?;
+    assert_eq!(*seen.borrow(), root, "before_commit saw the edited layer");
+    assert!(
+        staged.get(),
+        "the staged overlay and change list are populated pre-commit"
+    );
+    Ok(())
+}
+
+/// A layer sink's `before_commit` rejection aborts the edit: the error surfaces
+/// as [`StageAuthoringError::Rejected`] and the staged change rolls back,
+/// leaving the prim uncreated.
+#[test]
+fn layer_sink_veto_rolls_back() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.root_layer().add_sink(RecordingLayerSink {
+        before: Some(Box::new(|_change| {
+            Err(sdf::sink::Error::new("policy forbids this edit"))
+        })),
+        ..Default::default()
+    })?;
+    let result = stage.define_prim("/World");
+    assert!(matches!(result, Err(StageAuthoringError::Rejected(_))));
+    assert!(!stage.prim("/World")?.is_valid()?, "the rejected edit rolled back");
+    Ok(())
+}
+
+/// A batched namespace edit delivers one composed `after_commit` for the whole
+/// batch, and a dry run fires nothing.
+#[test]
+fn namespace_edit_fires_sink() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A/B")?;
+    let after = Rc::new(Cell::new(0u32));
+    {
+        let after = after.clone();
+        stage.add_sink(move |_: &Stage, _: &CommittedChange<'_>| after.set(after.get() + 1))?;
+    }
+    let mut editor = usd::NamespaceEditor::new(&stage);
+    editor.delete_prim("/A/B").unwrap();
+    // A dry run proves the batch applies but commits nothing — no sink fires.
+    editor.can_apply().unwrap();
+    assert_eq!(after.get(), 0, "a dry run does not reach after_commit");
+    editor.apply()?;
+    assert_eq!(after.get(), 1, "the namespace edit delivered after_commit once");
+    assert!(!stage.prim("/A/B")?.is_valid()?);
+    Ok(())
+}
+
+/// Planning composes an edit still sitting in the pending queue, so a dry run
+/// validates against it: deleting `/Queued` resolves rather than failing as a
+/// missing source. The dry run itself stages nothing, so the prim survives.
+#[test]
+fn can_apply_queued_edit() -> Result<()> {
+    let stage = in_memory_stage()?;
+    // Author directly and take no composed read, so the edit is still queued.
+    stage.root_layer().edit(|e| {
+        sdf::PrimSpec::new(e.data_mut(), "/Queued", sdf::Specifier::Def, "")?;
+        Ok(())
+    })?;
+
+    let mut editor = usd::NamespaceEditor::new(&stage);
+    editor.delete_prim("/Queued").unwrap();
+    editor.can_apply().expect("planning drains, so /Queued composes");
+
+    assert!(
+        stage.prim("/Queued")?.is_valid()?,
+        "the dry run staged nothing, so the queued prim survives"
+    );
+    Ok(())
+}
+
+/// A layer sink's veto on any layer aborts a multi-layer namespace edit
+/// wholesale: every layer rolls back, leaving the composed scene untouched.
+#[test]
+fn namespace_edit_veto_atomic() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A/B")?;
+    stage.root_layer().add_sink(RecordingLayerSink {
+        before: Some(Box::new(|_| Err(sdf::sink::Error::new("locked")))),
+        ..Default::default()
+    })?;
+    let mut editor = usd::NamespaceEditor::new(&stage);
+    editor.delete_prim("/A/B").unwrap();
+    assert!(matches!(
+        editor.apply(),
+        Err(usd::NamespaceEditError::Stage(StageAuthoringError::Rejected(_)))
+    ));
+    assert!(stage.prim("/A/B")?.is_valid()?, "the vetoed batch left the prim intact");
+    Ok(())
+}
+
+/// An edit authored through a `Prim` handle (not a `Stage` method) still fires
+/// the sink — capture is stage-level, not method-level.
+#[test]
+fn sink_handle_edit_fires() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let prim = stage.define_prim("/World")?;
+    let count = Rc::new(Cell::new(0u32));
+    {
+        let count = count.clone();
+        stage.add_sink(move |_: &Stage, _: &CommittedChange<'_>| count.set(count.get() + 1))?;
+    }
+    prim.set_type_name("Xform")?;
+    assert_eq!(count.get(), 1, "a handle edit reaches the stage's sink");
+    Ok(())
+}
+
+/// A sink observes only edits committed after it was installed; a prior edit is
+/// not replayed to it.
+#[test]
+fn sink_only_sees_edits_after_install() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/Before")?;
+    let count = Rc::new(Cell::new(0u32));
+    {
+        let count = count.clone();
+        stage.add_sink(move |_: &Stage, _: &CommittedChange<'_>| count.set(count.get() + 1))?;
+    }
+    stage.define_prim("/After")?;
+    assert_eq!(count.get(), 1, "only the post-install edit is observed");
+    Ok(())
+}
+
+/// A layer-stack-significant edit (here `timeCodesPerSecond`) drops every
+/// cached index, so the notice reports a stage-wide resync at the pseudo-root
+/// rather than an empty `resynced`.
+#[test]
+fn listener_layer_stack_resync() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/World")?;
+    let resynced: Rc<RefCell<Vec<sdf::Path>>> = Rc::new(RefCell::new(Vec::new()));
+    let _token = {
+        let resynced = resynced.clone();
+        stage.add_sink(move |_stage: &Stage, oc: &CommittedChange<'_>| {
+            resynced.borrow_mut().extend(oc.resynced.iter().cloned());
+        })?
+    };
+    stage.set_time_codes_per_second(48.0)?;
+    assert!(resynced.borrow().contains(&sdf::Path::abs_root()));
+    Ok(())
+}
+
+/// A sink may author another edit from within `after_commit`: the re-entrant
+/// authoring tail takes only a snapshot of the sink list (and the other cells
+/// are released before the fire), so it does not panic.
+#[test]
+fn listener_reentrant_author() -> Result<()> {
+    let stage = in_memory_stage()?;
+    let done = Rc::new(Cell::new(false));
+    let _token = {
+        let done = done.clone();
+        stage.add_sink(move |stage: &Stage, _change: &CommittedChange<'_>| {
+            if !done.replace(true) {
+                stage.define_prim("/Nested").unwrap();
+            }
+        })?
+    };
+    stage.define_prim("/World")?;
+    assert!(stage.prim("/Nested")?.is_valid()?);
+    Ok(())
+}
+
+/// Two sinks, the first authoring once from `after_commit`, see the outer
+/// event before the nested one whichever route the nested edit takes: a
+/// stage-routed edit reconciles inside the fan-out but is delivered after it,
+/// and a direct layer edit is picked up by the quiescence loop.
+#[test]
+fn two_sink_reentrant_order() -> Result<()> {
+    fn record(tag: &'static str, log: &Rc<RefCell<Vec<String>>>, change: &CommittedChange<'_>) {
+        let prim = change
+            .resynced
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        log.borrow_mut().push(format!("{tag}:{prim}"));
+    }
+
+    // Stage-routed: the nested `define_prim` is delivered after the fan-out.
+    let stage = in_memory_stage()?;
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let _first = {
+        let log = log.clone();
+        let done = Cell::new(false);
+        stage.add_sink(move |stage: &Stage, change: &CommittedChange<'_>| {
+            record("s1", &log, change);
+            if !done.replace(true) {
+                stage.define_prim("/Nested").unwrap();
+            }
+        })?
+    };
+    let _second = {
+        let log = log.clone();
+        stage.add_sink(move |_: &Stage, change: &CommittedChange<'_>| record("s2", &log, change))?
+    };
+    stage.define_prim("/World")?;
+    assert_eq!(
+        log.borrow().clone(),
+        vec!["s1:/World", "s2:/World", "s1:/Nested", "s2:/Nested"],
+        "a stage-routed re-entrant edit is delivered after the outer fan-out"
+    );
+
+    // Direct: the nested edit waits for the quiescence loop.
+    let stage = in_memory_stage()?;
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let _first = {
+        let log = log.clone();
+        let done = Cell::new(false);
+        stage.add_sink(move |stage: &Stage, change: &CommittedChange<'_>| {
+            record("s1", &log, change);
+            if !done.replace(true) {
+                stage
+                    .root_layer()
+                    .edit(|e| {
+                        sdf::PrimSpec::new(e.data_mut(), "/Nested", sdf::Specifier::Def, "")?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        })?
+    };
+    let _second = {
+        let log = log.clone();
+        stage.add_sink(move |_: &Stage, change: &CommittedChange<'_>| record("s2", &log, change))?
+    };
+    stage.define_prim("/World")?;
+    assert_eq!(
+        log.borrow().clone(),
+        vec!["s1:/World", "s2:/World", "s1:/Nested", "s2:/Nested"],
+        "a direct layer edit is picked up by the quiescence loop"
+    );
+    assert!(stage.prim("/Nested")?.is_valid()?, "the nested edit composed");
+    Ok(())
+}
+
+/// A layer that joins through the load barrier gets the stage's recorder, so
+/// editing it directly invalidates composition: the recorder reaches the load
+/// path, not only construction.
+#[test]
+fn lazy_layer_aggregated() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0
+def \"A\" (
+    payload = @payload.usda@</P>
+)
+{
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("payload.usda"),
+        "#usda 1.0
+def \"P\" {
+    custom double v = 1
+}
+",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+
+    // Composing the payload arc is what loads the layer.
+    assert_eq!(stage.attribute("/A.v")?.get::<f64>()?, Some(1.0));
+
+    let payload_id = stage
+        .layer_identifiers()
+        .into_iter()
+        .find(|id| FsPath::new(id).ends_with("payload.usda"))
+        .expect("the payload layer loaded");
+    stage.layer(&payload_id)?.expect("payload layer is live").edit(|e| {
+        e.attribute_mut("/P.v")?
+            .expect("authored attribute")
+            .set_default(vt::Value::Double(7.0))?;
+        Ok(())
+    })?;
+    assert_eq!(
+        stage.attribute("/A.v")?.get::<f64>()?,
+        Some(7.0),
+        "the demand-loaded layer's recorder drove a recompose"
+    );
+    Ok(())
+}
+
+/// A composed query runs while handles to the root, a named and the session
+/// layer are held: a handle borrows nothing.
+#[test]
+fn query_under_layer_handle() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+
+    let root = stage.root_layer();
+    assert!(
+        stage.prim("/A")?.is_valid()?,
+        "composed query under a root_layer handle"
+    );
+    let named = stage.layer(root.identifier())?.expect("layer by identifier");
+    assert!(stage.prim("/A")?.is_valid()?, "composed query under a layer handle");
+    drop(named);
+    drop(root);
+
+    let dir = tempfile::tempdir()?;
+    let session = dir.path().join("session.usda");
+    fs::write(
+        &session,
+        "#usda 1.0
+",
+    )?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0
+def \"B\" {}
+",
+    )?;
+    let stage = Stage::builder()
+        .session_layer(session.to_str().unwrap())
+        .open(dir.path().join("root.usda").to_str().unwrap())?;
+    let session = stage.session_layer().expect("session layer");
+    assert!(
+        stage.prim("/B")?.is_valid()?,
+        "composed query under a session_layer handle"
+    );
+    drop(session);
+    Ok(())
+}
+
+/// An idempotent author records no change, so the sink does not fire.
+#[test]
+fn empty_edit_no_fire() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    let count = Rc::new(Cell::new(0u32));
+    let _token = {
+        let count = count.clone();
+        stage.add_sink(move |_: &Stage, _: &CommittedChange<'_>| count.set(count.get() + 1))?
+    };
+    stage.define_prim("/A")?;
+    assert_eq!(count.get(), 0);
+    Ok(())
+}
+
+/// `remove_prim` erases the prim spec, drops it from the parent's children, and
+/// resyncs its path; a second removal is a no-op.
+#[test]
+fn remove_prim_drops_spec() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A/B")?;
+    assert!(stage.prim("/A/B")?.is_valid()?);
+    let notices = capture_notices(&stage);
+    assert!(stage.remove_prim("/A/B")?);
+    assert!(!stage.prim("/A/B")?.is_valid()?);
+    assert!(!child_names(&stage, "/A")?.contains(&"B".to_string()));
+    // `/A`'s own composition is untouched by its child's removal, so the notice
+    // names the prim that went away rather than the surviving parent.
+    assert_eq!(notices.borrow().resynced, paths(&["/A/B"]));
+    // Nothing left to remove.
+    assert!(!stage.remove_prim("/A/B")?);
+    Ok(())
+}
+
+/// `remove_property` erases the attribute spec and drops it from the owning
+/// prim's properties; a second removal is a no-op.
+#[test]
+fn remove_property_drops_spec() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.create_attribute("/A.size", "double")?;
+    assert!(stage.prim("/A")?.property_names()?.iter().any(|t| t == "size"));
+
+    assert!(stage.remove_property("/A.size")?);
+    assert!(!stage.prim("/A")?.property_names()?.iter().any(|t| t == "size"));
+    assert!(stage.prim("/A")?.is_valid()?);
+    assert!(!stage.remove_property("/A.size")?);
+    Ok(())
+}
+
+/// Each removal API rejects the wrong path kind rather than crossing into the
+/// other: a property path on `remove_prim`, a prim path on `remove_property`.
+#[test]
+fn remove_rejects_wrong_path_kind() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/A")?;
+    stage.create_attribute("/A.size", "double")?;
+
+    assert!(matches!(
+        stage.remove_prim("/A.size"),
+        Err(StageAuthoringError::Layer(sdf::AuthoringError::InvalidPath { .. }))
+    ));
+    assert!(matches!(
+        stage.remove_property("/A"),
+        Err(StageAuthoringError::Layer(sdf::AuthoringError::InvalidPath { .. }))
+    ));
+
+    // The rejected calls left both specs intact.
+    assert!(stage.prim("/A")?.is_valid()?);
+    assert!(stage.prim("/A")?.property_names()?.iter().any(|t| t == "size"));
+    Ok(())
+}
+
+/// A resync only subsumes the paths beneath it when it actually dropped the
+/// subtree. Creating an attribute over a sublayer-defined prim adds inert
+/// `over` specs on the way down, which land on the spec tier — a `has_specs`
+/// refresh, not a subtree drop — so the attribute's own entry survives beside
+/// them. The property spec appearing is itself a resync of that property, not a
+/// value change on it (C++ `otherResyncChanges`).
+#[test]
+fn spec_tier_resync_keeps_info() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        r#"#usda 1.0
+(
+    subLayers = [@sub.usda@]
+)
+"#,
+    )?;
+    fs::write(
+        dir.path().join("sub.usda"),
+        r#"#usda 1.0
+def "A" {
+    def "B" {
+        custom double x = 1
+    }
+}
+"#,
+    )?;
+
+    let stage = Stage::open(root.to_str().unwrap())?;
+    assert_eq!(stage.attribute("/A/B.x")?.get::<f64>()?, Some(1.0));
+
+    let notices = capture_notices(&stage);
+    stage.create_attribute("/A/B.x", "double")?;
+    assert!(stage.prim("/A")?.is_valid()?);
+
+    let notices = notices.borrow();
+    assert!(
+        notices.resynced.contains(&sdf::path("/A/B.x")?),
+        "the authored attribute must still be reported, got {:?}",
+        notices.resynced
+    );
+    assert_eq!(
+        notices.resynced,
+        paths(&["/A", "/A/B", "/A/B.x"]),
+        "the spec tier reports both sites; neither stands for the other's subtree"
+    );
+    Ok(())
+}
+
+/// Diagnostics from different owners fold into one list in precedence order:
+/// the graph's first, since it regenerates them on every rebuild, then the
+/// cache's. Each reads once, and a distinct diagnostic keeps its place behind
+/// the one it followed.
+///
+/// The two halves have separate lifetimes — the graph replaces its buckets per
+/// rebuild, the cache drops per-prim entries with their indices — so the order
+/// is a property of the aggregation, not of when each was discovered.
+#[test]
+fn diagnostics_owner_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A sublayer cycle (graph) and a reference to a missing layer (per-prim
+    // build), so both owners contribute.
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0
+(
+    subLayers = [@loop.usda@]
+)
+
+def \"P\" (
+    references = @missing.usda@
+)
+{
+}
+",
+    )?;
+    fs::write(
+        dir.path().join("loop.usda"),
+        "#usda 1.0
+(
+    subLayers = [@root.usda@]
+)
+",
+    )?;
+    let stage = Stage::open(dir.path().join("root.usda").to_str().unwrap())?;
+    // Compose the prim so its build diagnostic is discovered.
+    let _ = stage.prim("/P")?.is_valid()?;
+
+    let held = stage.composition_errors();
+    let cycle = held
+        .iter()
+        .position(|e| matches!(e, pcp::CompositionDiagnostic::SublayerCycle { .. }))
+        .expect("the sublayer cycle is reported");
+    let unresolved = held
+        .iter()
+        .position(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedLayer { .. }))
+        .expect("the missing reference target is reported");
+    assert!(
+        cycle < unresolved,
+        "the graph's diagnostics precede the cache's, got {held:?}"
+    );
+
+    let cycles = held
+        .iter()
+        .filter(|e| matches!(e, pcp::CompositionDiagnostic::SublayerCycle { .. }))
+        .count();
+    let unresolved_count = held
+        .iter()
+        .filter(|e| matches!(e, pcp::CompositionDiagnostic::UnresolvedLayer { .. }))
+        .count();
+    assert_eq!((cycles, unresolved_count), (1, 1), "each reads once, got {held:?}");
+    Ok(())
+}
+
+/// A text layer may list its samples in any order and repeat a time; the
+/// reader sorts them and keeps the last value of a repeated time, so reads
+/// and writes see the ordered map they rely on.
+#[test]
+fn unsorted_samples_normalized() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"A\" {\n    double x.timeSamples = { 10: 1.0, 0: 2.0, 10: 5.0 }\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let attr = stage.attribute("/A.x")?;
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(0.0))?, Some(2.0));
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(5.0))?, Some(3.5));
+
+    let attr = attr.set_at(3.0_f64, usd::TimeCode::new(10.0))?;
+    assert_eq!(attr.num_time_samples()?, 2, "the write replaces the sample at its time");
+    assert_eq!(attr.get_at::<f64>(usd::TimeCode::new(10.0))?, Some(3.0));
+    Ok(())
+}
+
+/// Authoring through an instance proxy or into a prototype composes nowhere
+/// it can be seen, so the prim-handle and define seams refuse it (C++
+/// `_ValidateEditPrim`); the instance itself and the source stay editable,
+/// removal strips a stale opinion wherever it sits, and a target that maps the
+/// prim elsewhere is trusted.
+#[test]
+fn instancing_edits_refused() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"Source\"\n{\n    def \"Child\" {}\n}\ndef \"Inst\" (\n    instanceable = true\n    references = </Source>\n) {\n    def \"Stale\" {}\n}\n",
+    )?;
+    let stage = Stage::open(root.to_str().unwrap())?;
+    let proxy = stage.prim("/Inst/Child")?;
+    assert!(proxy.is_instance_proxy()?);
+    assert!(matches!(
+        proxy.clone().apply_api("SomeAPI"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    assert!(matches!(
+        proxy.clone().set_kind("component"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    assert!(matches!(
+        stage.define_prim("/Inst/Child/New"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    // Beneath an instance is refused on the path alone, where no prim composes.
+    assert!(matches!(
+        stage.define_prim("/Inst/Missing/New"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    let prototype = proxy
+        .prim_in_prototype()?
+        .expect("the proxy stands in for a prototype prim");
+    // A define with nothing to write, the prim being defined already, is
+    // refused all the same.
+    assert!(matches!(
+        stage.define_prim("/Inst/Child"),
+        Err(StageAuthoringError::InstanceProxyEdit { .. })
+    ));
+    assert!(matches!(
+        stage.define_prim(prototype.path().clone()),
+        Err(StageAuthoringError::PrototypeEdit { .. })
+    ));
+    assert!(matches!(
+        prototype.apply_api("SomeAPI"),
+        Err(StageAuthoringError::PrototypeEdit { .. })
+    ));
+    // The prototype namespace is refused on its spelling alone.
+    assert!(matches!(
+        stage.define_prim("/__Prototype_7/Stray"),
+        Err(StageAuthoringError::PrototypeEdit { .. })
+    ));
+
+    stage.prim("/Inst")?.set_kind("component")?;
+    stage.prim("/Source/Child")?.apply_api("SomeAPI")?;
+    assert!(stage.remove_prim("/Inst/Stale")?, "the stale local spec is removable");
+    let layer = stage.root_layer();
+    assert!(
+        layer.prim("/Inst/Child")?.is_none() && layer.prim("/Inst/Stale")?.is_none(),
+        "nothing was authored under the instance"
+    );
+
+    // A target that maps the prim elsewhere — here onto the reference's
+    // source — authors the site it names.
+    stage.set_edit_target(
+        stage
+            .prim("/Inst")?
+            .edit_target_for_arc(usd::EditTargetArc::Reference)?,
+    )?;
+    proxy.set_kind("component")?;
+    let kind = stage
+        .root_layer()
+        .prim("/Source/Child")?
+        .expect("the source prim")
+        .kind()?;
+    assert_eq!(kind.as_deref(), Some("component"));
+    Ok(())
+}
+
+/// Saving a layer rebinds it to the file it wrote without an edit: no stage
+/// or layer sink fires, and the composed values and status are as before.
+#[test]
+fn save_quiet() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = quiet_save_root(dir.path())?;
+    quiet_save(Stage::open(&root)?, &root)
+}
+
+/// The same through a resolver that maps files: the save moves the layer
+/// from its view of the old file to a mapping of the one it wrote.
+#[cfg(feature = "mmap")]
+#[test]
+// The mapping opt-in is `unsafe` by contract, and this test, the only writer
+// of its directory, can make the promise.
+#[allow(unsafe_code)]
+fn save_quiet_mapped() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = quiet_save_root(dir.path())?;
+    // SAFETY: only the save under test writes the files in this directory,
+    // and a save never writes into a file it holds a view of.
+    let resolver = unsafe { ar::DefaultResolver::new().map_files() };
+    quiet_save(Stage::builder().resolver(resolver).open(&root)?, &root)
+}
+
+/// Writes the crate root layer the quiet-save tests open, returning its path.
+fn quiet_save_root(dir: &FsPath) -> Result<String> {
+    let root = dir.join("scene.usdc");
+    sdf::Layer::from_bytes(
+        "scene",
+        b"#usda 1.0\ndef \"World\"\n{\n    float[] sizes = [1, 2, 3]\n}\n".as_slice(),
+    )?
+    .export(root.to_string_lossy())?;
+    Ok(root.to_str().expect("utf-8 temp path").to_owned())
+}
+
+/// Authors an attribute on `stage`, saves its root layer, and checks that no
+/// sink fired and nothing composed changed.
+fn quiet_save(stage: Stage, root: &str) -> Result<()> {
+    stage.edit(|edit| edit.attribute_builder("/World.answer", "int").set(42).build())?;
+    let sizes = stage.attribute("/World.sizes")?.get::<Vec<f32>>()?;
+    let answer = stage.attribute("/World.answer")?.get::<i32>()?;
+    let status = stage.prim_status("/World")?;
+
+    let stage_fired = Rc::new(Cell::new(0));
+    stage.add_sink(RecordingSink {
+        after: Some(Box::new({
+            let fired = stage_fired.clone();
+            move |_, _| fired.set(fired.get() + 1)
+        })),
+        ..Default::default()
+    })?;
+    let layer_fired = Rc::new(Cell::new(0));
+    {
+        let layer = stage.root_layer();
+        let fired = layer_fired.clone();
+        layer.add_sink(move |_: &str, _: &sdf::ChangeList| fired.set(fired.get() + 1))?;
+        layer.save()?;
+    }
+
+    assert_eq!(stage_fired.get(), 0, "a save is not a stage change");
+    assert_eq!(layer_fired.get(), 0, "a save is not a layer change");
+    assert_eq!(stage.attribute("/World.sizes")?.get::<Vec<f32>>()?, sizes);
+    assert_eq!(stage.attribute("/World.answer")?.get::<i32>()?, answer);
+    assert_eq!(stage.prim_status("/World")?, status);
+    let reopened = Stage::open(root)?;
+    assert_eq!(reopened.attribute("/World.answer")?.get::<i32>()?, Some(42));
+    assert_eq!(reopened.attribute("/World.sizes")?.get::<Vec<f32>>()?, sizes);
+    Ok(())
+}
+
+/// A reference to a file that is not there is reported unresolved and its
+/// prim composes without it. Once the file appears, the next prim composed
+/// against it finds it, and the prim that reported it missing recomposes
+/// with it too.
+#[test]
+fn missing_target_found_later() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"A\" (references = @./late.usda@</Model>) {}\ndef \"Other\" { def \"B\" (references = @./late.usda@</Model>) {} }\n",
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+
+    assert!(!stage.prim("/A/Child")?.is_valid()?);
+    assert!(
+        stage
+            .composition_errors()
+            .iter()
+            .any(|error| matches!(error, pcp::CompositionDiagnostic::UnresolvedLayer { .. })),
+        "the missing target is reported"
+    );
+
+    fs::write(
+        dir.path().join("late.usda"),
+        "#usda 1.0\ndef \"Model\" { def \"Child\" {} }\n",
+    )?;
+    assert!(
+        stage.prim("/Other/B/Child")?.is_valid()?,
+        "a prim composed now finds the file"
+    );
+    assert!(
+        stage.prim("/A/Child")?.is_valid()?,
+        "and the prim that missed it recomposes"
+    );
+    Ok(())
+}
+
+/// A missing target that appears with contents that cannot be read is
+/// reported as malformed from then on, by the prim composed after it
+/// appeared and by the one that had reported it missing.
+#[test]
+fn missing_target_found_malformed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("root.usda");
+    fs::write(
+        &root,
+        "#usda 1.0\ndef \"A\" (references = @./late.usda@</Model>) {}\ndef \"Other\" { def \"B\" (references = @./late.usda@</Model>) {} }\n",
+    )?;
+    let stage = Stage::open(root.to_str().expect("utf-8 temp path"))?;
+    assert!(!stage.prim("/A/Child")?.is_valid()?);
+    let count = |stage: &Stage, malformed: bool| {
+        stage
+            .composition_errors()
+            .iter()
+            .filter(|error| match error {
+                pcp::CompositionDiagnostic::MalformedLayer { .. } => malformed,
+                pcp::CompositionDiagnostic::UnresolvedLayer { .. } => !malformed,
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!((count(&stage, false), count(&stage, true)), (1, 0));
+
+    fs::write(dir.path().join("late.usda"), "not a layer")?;
+    assert!(!stage.prim("/Other/B/Child")?.is_valid()?);
+    assert!(!stage.prim("/A/Child")?.is_valid()?);
+    assert_eq!(
+        (count(&stage, false), count(&stage, true)),
+        (0, 2),
+        "both prims report the read failure"
+    );
+    Ok(())
+}
+
+/// The children that match a predicate are told from the parent's status
+/// alone: an inactive, an undefined and an abstract sibling drop out, an
+/// instance lists its proxies only when asked to, and an instance proxy
+/// lists its own either way.
+#[test]
+fn filtered_children_predicates() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+
+def "Root"
+{
+    def "Kept" {}
+    def "Inactive" (active = false) {}
+    over "Undefined" {}
+    class "Abstract" {}
+}
+
+def "Proto"
+{
+    def "Child"
+    {
+        def "Leaf" {}
+    }
+}
+
+def "A" (instanceable = true references = </Proto>) {}
+"#,
+    )?;
+    let names = |prim: &usd::Prim, predicate| -> Result<Vec<String>> {
+        let children = prim.filtered_children(predicate)?;
+        Ok(children.iter().map(|child| child.path().to_string()).collect())
+    };
+
+    let root = stage.prim("/Root")?;
+    assert_eq!(names(&root, PrimPredicate::DEFAULT)?, ["/Root/Kept"]);
+    assert_eq!(names(&root, PrimPredicate::ALL)?.len(), root.children()?.len());
+    let defined = PrimPredicate::new(PrimStatus::DEFINED, PrimStatus::empty());
+    assert_eq!(
+        names(&root, defined)?,
+        ["/Root/Kept", "/Root/Inactive", "/Root/Abstract"]
+    );
+    assert_eq!(
+        names(&stage.prim("/")?, PrimPredicate::DEFAULT)?,
+        ["/Root", "/Proto", "/A"]
+    );
+
+    let instance = stage.prim("/A")?;
+    assert!(instance.is_instance()?);
+    assert!(names(&instance, PrimPredicate::DEFAULT)?.is_empty());
+    assert_eq!(names(&instance, PrimPredicate::DEFAULT_PROXIES)?, ["/A/Child"]);
+
+    let proxy = stage.prim("/A/Child")?;
+    assert!(proxy.is_instance_proxy()?);
+    assert_eq!(names(&proxy, PrimPredicate::DEFAULT)?, ["/A/Child/Leaf"]);
+
+    // The prototype's own children are plain prims.
+    let prototype = stage.prim(instance.prototype()?.expect("an instance"))?;
+    let children = prototype.filtered_children(PrimPredicate::DEFAULT)?;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].path(), &prototype.path().append_path("Child")?);
+    Ok(())
+}
+
+/// A walk that hands each prim's composed status to the listing of its
+/// children lists what a listing with no status does, and a status read
+/// before an edit is passed over after it.
+#[test]
+fn filtered_children_from_status() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stage = open_text(
+        &dir,
+        r#"#usda 1.0
+
+def "Root"
+{
+    def "Kept"
+    {
+        def "Leaf" {}
+        class "Abstract"
+        {
+            def "Below" {}
+        }
+    }
+    def "Inactive" (active = false) {}
+}
+
+def "Proto"
+{
+    def "Child"
+    {
+        def "Leaf" {}
+    }
+}
+
+def "A" (instanceable = true references = </Proto>) {}
+"#,
+    )?;
+    let paths = |prims: Vec<usd::Prim>| -> Vec<String> { prims.iter().map(|prim| prim.path().to_string()).collect() };
+
+    for predicate in [
+        PrimPredicate::DEFAULT,
+        PrimPredicate::DEFAULT_PROXIES,
+        PrimPredicate::ALL,
+        PrimPredicate::new(PrimStatus::DEFINED, PrimStatus::empty()),
+    ] {
+        let mut visited = 0;
+        let mut stack = vec![(stage.prim("/")?, None)];
+        while let Some((prim, composed)) = stack.pop() {
+            let children = prim.filtered_children_from(predicate, composed)?;
+            let listed = children.iter().map(|(child, _)| child.clone()).collect();
+            assert_eq!(
+                paths(listed),
+                paths(prim.filtered_children(predicate)?),
+                "{}",
+                prim.path()
+            );
+            visited += children.len();
+            stack.extend(children.into_iter().map(|(child, composed)| (child, Some(composed))));
+        }
+        assert!(visited >= 5, "{predicate:?} visited {visited}");
+    }
+
+    // The prims beneath a prim, each before its own, with a prim that does
+    // not match left out along with what is beneath it.
+    let beneath = |path: &str, predicate| -> Result<Vec<String>> {
+        let beneath = stage.prim(path)?.filtered_descendants(predicate)?;
+        Ok(paths(beneath.collect::<Result<_>>()?))
+    };
+    assert_eq!(
+        beneath("/Root", PrimPredicate::DEFAULT)?,
+        ["/Root/Kept", "/Root/Kept/Leaf"]
+    );
+    assert_eq!(
+        beneath("/", PrimPredicate::DEFAULT)?,
+        [
+            "/Root",
+            "/Root/Kept",
+            "/Root/Kept/Leaf",
+            "/Proto",
+            "/Proto/Child",
+            "/Proto/Child/Leaf",
+            "/A"
+        ]
+    );
+    assert!(beneath("/A", PrimPredicate::DEFAULT)?.is_empty());
+    assert_eq!(
+        beneath("/A", PrimPredicate::DEFAULT_PROXIES)?,
+        ["/A/Child", "/A/Child/Leaf"]
+    );
+    assert!(beneath("/Root/Kept/Leaf", PrimPredicate::ALL)?.is_empty());
+
+    // A status handed to another prim than the one it was read for is
+    // passed over: an active prim's does not make an inactive prim's
+    // children active.
+    let listed = stage
+        .prim("/Root")?
+        .filtered_children_from(PrimPredicate::new(PrimStatus::DEFINED, PrimStatus::empty()), None)?;
+    let (kept, of_kept) = listed[0].clone();
+    let (inactive, _) = listed[1].clone();
+    assert_eq!(
+        (kept.path().as_str(), inactive.path().as_str()),
+        ("/Root/Kept", "/Root/Inactive")
+    );
+    assert!(
+        inactive
+            .filtered_children_from(PrimPredicate::ALL, Some(of_kept.clone()))?
+            .is_empty()
+    );
+    assert_eq!(
+        paths(
+            (stage.prim("/Proto")?)
+                .filtered_children_from(PrimPredicate::DEFAULT, Some(of_kept))?
+                .into_iter()
+                .map(|(child, _)| child)
+                .collect()
+        ),
+        ["/Proto/Child"]
+    );
+
+    // Nor is the status of a prim at the same path on another stage taken:
+    // on a stage where `/Root` is inactive, `/Root/Kept` has no active
+    // children whatever its namesake's status says.
+    let other_dir = tempfile::tempdir()?;
+    let other = open_text(
+        &other_dir,
+        "#usda 1.0\n\ndef \"Root\" (active = false)\n{\n    def \"Kept\"\n    {\n        def \"Leaf\" {}\n    }\n}\n",
+    )?;
+    let listed = stage
+        .prim("/Root")?
+        .filtered_children_from(PrimPredicate::DEFAULT, None)?;
+    let (_, of_kept) = listed[0].clone();
+    assert_eq!(of_kept.is_instance(), Some(false));
+    let namesake = other.prim("/Root/Kept")?;
+    assert!(
+        namesake
+            .filtered_children_from(PrimPredicate::DEFAULT, Some(of_kept))?
+            .is_empty()
+    );
+
+    // The status of a prim read while it was active does not outlive the
+    // edit that deactivates the prim above it.
+    let root = stage.prim("/Root")?;
+    let listed = root.filtered_children_from(PrimPredicate::DEFAULT, None)?;
+    let (kept, composed) = listed.into_iter().next().expect("/Root/Kept");
+    assert_eq!(
+        paths(kept.filtered_children(PrimPredicate::DEFAULT)?),
+        ["/Root/Kept/Leaf"]
+    );
+    root.clone().set_active(false)?;
+    assert!(kept.filtered_children(PrimPredicate::DEFAULT)?.is_empty());
+    assert!(
+        kept.filtered_children_from(PrimPredicate::DEFAULT, Some(composed))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// Loading one element of a group on a stage that loads nothing resyncs that
+/// element alone, and recomposes its parent in place: the sibling, which
+/// composes as it did, is in neither set (#174). Unloading reports the same.
+#[test]
+fn load_reports_element_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"world\" {\n    def \"element_0\" (payload = @e.usda@</E>) {}\n    def \"element_1\" \
+         (payload = @e.usda@</E>) {}\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("e.usda"),
+        "#usda 1.0\ndef \"E\" {\n    def \"Child\" {}\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(&dir.path().join("root.usda").to_string_lossy())?;
+    let notices = capture_notices(&stage);
+    let element = sdf::path("/world/element_0")?;
+
+    stage.load(element.clone(), LoadPolicy::WithDescendants)?;
+    {
+        let notices = notices.borrow();
+        assert_eq!(notices.load_rules, slice::from_ref(&element));
+        assert_eq!(notices.load_rules_prims, [sdf::path("/world")?]);
+    }
+    notices.take();
+
+    stage.unload(element.clone())?;
+    let notices = notices.borrow();
+    assert_eq!(notices.load_rules, [element]);
+    assert_eq!(notices.load_rules_prims, [sdf::path("/world")?]);
+    Ok(())
+}
+
+/// Loading an element whose parent has a payload of its own includes the
+/// parent's payload too, which changes the parent's subtree: the parent is
+/// reported as a subtree resync, covering the element.
+#[test]
+fn load_reports_parent_payload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"world\" (payload = @w.usda@</W>) {\n    def \"element_0\" (payload = @e.usda@</E>) \
+         {}\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("w.usda"),
+        "#usda 1.0\ndef \"W\" {\n    def \"Extra\" {}\n}\n",
+    )?;
+    fs::write(dir.path().join("e.usda"), "#usda 1.0\ndef \"E\" {}\n")?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(&dir.path().join("root.usda").to_string_lossy())?;
+    let notices = capture_notices(&stage);
+
+    stage.load("/world/element_0", LoadPolicy::WithDescendants)?;
+    let notices = notices.borrow();
+    assert_eq!(notices.load_rules, [sdf::path("/world")?]);
+    assert!(notices.load_rules_prims.is_empty());
+    Ok(())
+}
+
+/// Loading an element beside an instanced sibling leaves the sibling's
+/// prototype in place, and reports nothing for it.
+#[test]
+fn load_keeps_instanced_sibling() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"world\" {\n    def \"element_0\" (payload = @e.usda@</E>) {}\n    def \"element_1\" \
+         (instanceable = true\n        references = @m.usda@</M>) {}\n}\n",
+    )?;
+    fs::write(dir.path().join("e.usda"), "#usda 1.0\ndef \"E\" {}\n")?;
+    fs::write(
+        dir.path().join("m.usda"),
+        "#usda 1.0\ndef \"M\" {\n    def \"Part\" {}\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(&dir.path().join("root.usda").to_string_lossy())?;
+    let sibling = sdf::path("/world/element_1")?;
+    let before = stage.prim(sibling.clone())?.prototype()?.expect("an instance");
+    let notices = capture_notices(&stage);
+
+    stage.load("/world/element_0", LoadPolicy::WithDescendants)?;
+    let after = stage.prim(sibling.clone())?.prototype()?.expect("an instance");
+    let notices = notices.borrow();
+    assert_eq!(after, before, "the sibling keeps its prototype");
+    assert!(!notices.load_rules.contains(&sibling), "{:?}", notices.load_rules);
+    assert_eq!(notices.load_rules_prims, [sdf::path("/world")?]);
+    Ok(())
+}
+
+/// Loading a child whose parent composes a payload through a reference, an
+/// ancestral payload of the referenced prim, includes that payload: the
+/// parent is reported as a subtree resync, covering what it brings.
+#[test]
+fn load_reports_ancestral_payload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("root.usda"),
+        "#usda 1.0\ndef \"world\" (references = @r.usda@</R/Inner>) {\n    def \"Child\" {}\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("r.usda"),
+        "#usda 1.0\ndef \"R\" (payload = @p.usda@</P>) {\n    def \"Inner\" {}\n}\n",
+    )?;
+    fs::write(
+        dir.path().join("p.usda"),
+        "#usda 1.0\ndef \"P\" {\n    def \"Inner\" {\n        def \"Extra\" {}\n    }\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(&dir.path().join("root.usda").to_string_lossy())?;
+    assert!(!stage.prim("/world/Extra")?.is_valid()?);
+    let notices = capture_notices(&stage);
+
+    stage.load("/world/Child", LoadPolicy::WithDescendants)?;
+    assert!(stage.prim("/world/Extra")?.is_valid()?, "the payload is included");
+    let notices = notices.borrow();
+    assert_eq!(notices.load_rules, [sdf::path("/world")?]);
+    assert!(notices.load_rules_prims.is_empty());
+    Ok(())
+}
+
+/// Loading one element of a group rebuilds none of its siblings: the parent
+/// has no payload of its own, so it and they compose as they did.
+#[test]
+fn load_skips_siblings() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let elements: String = (0..20)
+        .map(|i| format!("    def \"element_{i}\" (payload = @e.usda@</E>) {{}}\n"))
+        .collect();
+    fs::write(
+        dir.path().join("root.usda"),
+        format!("#usda 1.0\ndef \"world\" {{\n{elements}}}\n"),
+    )?;
+    fs::write(
+        dir.path().join("e.usda"),
+        "#usda 1.0\ndef \"E\" {\n    def \"Child\" {}\n}\n",
+    )?;
+    let stage = Stage::builder()
+        .load(InitialLoadSet::LoadNone)
+        .open(&dir.path().join("root.usda").to_string_lossy())?;
+    for i in 0..20 {
+        assert!(stage.prim(format!("/world/element_{i}").as_str())?.is_valid()?);
+    }
+    let before = stage.tally().builds;
+
+    stage.load("/world/element_0", LoadPolicy::WithDescendants)?;
+    let builds = stage.tally().builds - before;
+    assert!(builds <= 2, "the load rebuilt {builds} indices");
+    assert!(stage.prim("/world/element_0/Child")?.is_valid()?);
+
+    Ok(())
+}
+
+/// Sets each `(path, field, value)` in `stage`'s root layer in one edit.
+fn set_root_fields(stage: &Stage, fields: &[(&str, &str, vt::Value)]) -> Result<()> {
+    stage.root_layer().edit(|e| {
+        for (path, field, value) in fields {
+            e.data_mut().set_field(&sdf::path(*path)?, field, value.clone());
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// A token list value holding `names`.
+fn tokens(names: &[&str]) -> vt::Value {
+    vt::Value::TokenVec(names.iter().map(|name| (*name).into()).collect())
+}
+
+/// A layer listing a prim's children in another order, or authoring its
+/// `primOrder`, reorders the composed children and resyncs the prim, as C++
+/// `UsdStage` does for `didReorderChildren`: no other entry names the change,
+/// so a consumer that holds the children (a scene index) must hear of it.
+#[test]
+fn reorder_children_resync() -> Result<()> {
+    for field in ["primChildren", "primOrder"] {
+        let stage = in_memory_stage()?;
+        stage.define_prim("/W/a")?;
+        stage.define_prim("/W/b")?;
+        let notices = capture_notices(&stage);
+        set_root_fields(&stage, &[("/W", field, tokens(&["b", "a"]))])?;
+        assert_eq!(child_names(&stage, "/W")?, ["b", "a"], "{field}");
+        let resynced = &notices.borrow().resynced;
+        assert!(resynced.contains(&sdf::path("/W")?), "{field}: {resynced:?}");
+    }
+    Ok(())
+}
+
+/// A children reorder stands for the prim's whole subtree, as C++ recomposes
+/// it: a value set below it in the same edit is absorbed into the prim's
+/// resync.
+#[test]
+fn reorder_subsumes_descendants() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/W/a")?;
+    stage.define_prim("/W/b")?;
+    stage.create_attribute("/W/a.x", "double")?;
+    let notices = capture_notices(&stage);
+    set_root_fields(
+        &stage,
+        &[
+            ("/W", "primChildren", tokens(&["b", "a"])),
+            ("/W/a.x", "default", vt::Value::Double(1.0)),
+        ],
+    )?;
+    let notices = notices.borrow();
+    assert!(notices.resynced.contains(&sdf::path("/W")?), "{:?}", notices.resynced);
+    assert!(notices.changed_info_only.is_empty(), "{:?}", notices.changed_info_only);
+    Ok(())
+}
+
+/// A layer listing a prim's properties in another order reports the prim as
+/// an info change. C++ `UsdStage` resyncs only for `didReorderChildren`, and
+/// a `didReorderProperties` entry lands with the other info changes.
+#[test]
+fn reorder_properties_info() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.create_attribute("/W.x", "double")?;
+    stage.create_attribute("/W.y", "double")?;
+    let notices = capture_notices(&stage);
+    set_root_fields(&stage, &[("/W", "propertyChildren", tokens(&["y", "x"]))])?;
+    let notices = notices.borrow();
+    let w = sdf::path("/W")?;
+    assert!(
+        notices.changed_info_only.contains(&w),
+        "{:?}",
+        notices.changed_info_only
+    );
+    assert!(!notices.resynced.contains(&w), "{:?}", notices.resynced);
+    Ok(())
+}
+
+/// A child added is reported at the child: the parent's `primChildren`
+/// growing is bookkeeping, not a reorder, and does not resync the parent.
+#[test]
+fn child_add_parent_unsynced() -> Result<()> {
+    let stage = in_memory_stage()?;
+    stage.define_prim("/W/a")?;
+    let notices = capture_notices(&stage);
+    stage.define_prim("/W/b")?;
+    let resynced = &notices.borrow().resynced;
+    assert!(resynced.contains(&sdf::path("/W/b")?), "{resynced:?}");
+    assert!(!resynced.contains(&sdf::path("/W")?), "{resynced:?}");
+    Ok(())
+}

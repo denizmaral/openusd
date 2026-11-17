@@ -1,0 +1,3151 @@
+//! Stage-composed prim handle — a value-type wrapper around `(stage, path)`
+//! that mirrors C++ `UsdPrim`, plus the [`VariantSets`] handle reached through
+//! it. The property handles it returns, [`Attribute`] and [`Relationship`],
+//! live in sibling modules.
+//!
+//! Each handle is freely [`Clone`], holds no borrow on the composition
+//! cache, and re-acquires state from the [`Stage`] per call. They are
+//! returned by [`Stage`]'s authoring methods so callers can chain
+//! composed-scene edits without dropping to the Sdf tier.
+//!
+//! # Fluent setters
+//!
+//! Setters take `self` by value and return `Self`. Chaining writes is a
+//! single statement that ends with the final handle bound:
+//!
+//! ```no_run
+//! use openusd::{usd, vt};
+//!
+//! let stage = usd::Stage::builder().in_memory("anon.usda").unwrap();
+//! let mesh = stage
+//!     .define_prim("/World/Mesh").unwrap()
+//!     .set_type_name("Mesh").unwrap()
+//!     .set_kind("component").unwrap();
+//! let radius = mesh
+//!     .create_attribute("radius", "double").unwrap()
+//!     .set(vt::Value::Double(1.0)).unwrap();
+//! # let _ = radius;
+//! ```
+//!
+//! Each setter does its own short `borrow_mut` on the composition cache and
+//! routes invalidation through [`crate::pcp::Changes`], so only the prim
+//! indices observably affected by the write are dropped.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::{
+    ApplyApiError, Attribute, ComposedStatus, EditTarget, EditTargetArc, ListPosition, LoadPolicy, PrimDefinition,
+    PrimPredicate, PrimStatus, PrimTypeInfo, Relationship, SchemaRegistry, SpecSite, Stage, StageAuthoringError,
+    VersionFilter, list_edit,
+};
+use crate::tf::Token;
+use crate::{Result, pcp, sdf, vt};
+
+/// Which property names [`Prim::typed_properties`] walks, and whether a
+/// schema declaration may answer for a name no layer authors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PropertySource {
+    /// Every composed property name. A name with no composed spec is one only
+    /// a schema declares, so the declaration decides its kind.
+    Composed,
+    /// Only the names layers author, each classified by its composed spec.
+    Authored,
+}
+
+/// Stage-composed prim handle. Mirrors C++ `UsdPrim`.
+///
+/// Two handles are equal when they name the same path on the same stage
+/// instance, as C++ `UsdPrim`s compare, so a prim works as a key across
+/// stages. An instance proxy is its own path in the instance's namespace, so
+/// the proxies of one prototype prim are distinct keys.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Prim {
+    stage: Stage,
+    path: sdf::Path,
+}
+
+impl Prim {
+    pub(crate) fn new(stage: &Stage, path: sdf::Path) -> Self {
+        Self {
+            stage: stage.clone(),
+            path,
+        }
+    }
+
+    /// Composed namespace path of the prim.
+    pub fn path(&self) -> &sdf::Path {
+        &self.path
+    }
+
+    /// The prim's namespace parent on the same stage, or `None` for the
+    /// pseudo-root. Mirrors C++ `UsdPrim::GetParent`. The parent of an
+    /// instance proxy is the next prim up in the instance's namespace.
+    pub fn parent(&self) -> Option<Prim> {
+        self.path.parent().map(|path| Prim::new(&self.stage, path))
+    }
+
+    /// The prim and the prims above it, nearest first, ending before the
+    /// pseudo-root, as [`sdf::Path::ancestors_below_root`] walks the path.
+    /// Empty for the pseudo-root.
+    pub fn ancestors(&self) -> impl Iterator<Item = Prim> + use<> {
+        let stage = self.stage.clone();
+        self.path
+            .ancestors_below_root()
+            .map(move |path| Prim::new(&stage, path))
+    }
+
+    /// The stage this handle is anchored to.
+    pub fn stage(&self) -> &Stage {
+        &self.stage
+    }
+
+    /// Edit target that authors into the source layer of this prim's strongest
+    /// `arc` composition arc (C++ `UsdEditTarget(UsdPrim, ...)`). Delegates to
+    /// [`Stage::edit_target_for_node`](Stage::edit_target_for_node).
+    pub fn edit_target_for_arc(&self, arc: EditTargetArc) -> Result<EditTarget, StageAuthoringError> {
+        self.stage.edit_target_for_node(&self.path, arc)
+    }
+
+    /// Set the prim's `typeName` field on the edit target's layer.
+    pub fn set_type_name(self, name: impl Into<String>) -> Result<Self, StageAuthoringError> {
+        let name = name.into();
+        self.edit(|spec| {
+            spec.set_type_name(name);
+            Ok(())
+        })
+    }
+
+    /// Set the prim's `specifier` (C++ `UsdPrim::SetSpecifier`).
+    pub fn set_specifier(self, specifier: sdf::Specifier) -> Result<Self, StageAuthoringError> {
+        self.edit(|spec| {
+            spec.set_specifier(specifier);
+            Ok(())
+        })
+    }
+
+    /// Set the prim's `active` flag.
+    pub fn set_active(self, active: bool) -> Result<Self, StageAuthoringError> {
+        self.edit(|spec| {
+            spec.set_active(active);
+            Ok(())
+        })
+    }
+
+    /// Set the prim's `kind` metadata.
+    pub fn set_kind(self, kind: impl Into<String>) -> Result<Self, StageAuthoringError> {
+        let kind = kind.into();
+        self.edit(|spec| {
+            spec.set_kind(kind);
+            Ok(())
+        })
+    }
+
+    /// Set the prim's `instanceable` flag.
+    pub fn set_instanceable(self, instanceable: bool) -> Result<Self, StageAuthoringError> {
+        self.edit(|spec| {
+            spec.set_instanceable(instanceable);
+            Ok(())
+        })
+    }
+
+    /// Add an applied API schema name to this prim's `apiSchemas` metadata.
+    ///
+    /// This is the registry-free authoring operation behind C++
+    /// `UsdPrim::AddAppliedSchema`: it edits the current edit target's
+    /// `apiSchemas` list op in place rather than replacing existing list-op
+    /// opinions, and authors `name` whatever it is. Reach for
+    /// [`apply_api`](Self::apply_api) to have the registry check it first.
+    ///
+    /// The prim must exist on the stage: a handle for a path nothing defines
+    /// is rejected as [`StageAuthoringError::PrimNotValid`], so applying never
+    /// conjures a prim. The `over` carrying the opinion is authored on the
+    /// edit target when the target holds no spec for the prim, as C++
+    /// `_CreatePrimSpecForEditing` does, so a prim defined only on a weaker
+    /// layer takes the opinion on the current target.
+    pub fn add_applied_schema(self, name: impl Into<String>) -> Result<Self, StageAuthoringError> {
+        let name = name.into();
+        self.edit(|spec| {
+            spec.add_applied_schema(name)?;
+            Ok(())
+        })
+    }
+
+    /// Apply an API schema to this prim, checking it against the registry
+    /// first. Mirrors C++ `UsdPrim::ApplyAPI` (`_ApplySingleApplyAPI` /
+    /// `_ApplyMultipleApplyAPI`).
+    ///
+    /// `name` carries the instance for a multiple-apply schema, as it does
+    /// everywhere else applied names appear (`CollectionAPI:render`). The check
+    /// is the one C++ makes here: the schema must be an applied API schema, and
+    /// must be given an instance name exactly when it is multiple-apply. The
+    /// restrictions a schema places on *where* it may be applied are advisory
+    /// and are not enforced — ask [`can_apply_api`](Self::can_apply_api) for
+    /// those.
+    ///
+    /// A name the registry does not know carries no rules to break, so it is
+    /// authored as-is; that is what keeps applying schemas working while no
+    /// schema data is registered. The authoring itself, including the prim
+    /// validity it demands, is
+    /// [`add_applied_schema`](Self::add_applied_schema).
+    pub fn apply_api(self, name: impl Into<Token>) -> Result<Self, StageAuthoringError> {
+        let name = name.into();
+        self.stage.schema_registry().check_applied_name(&name)?;
+        self.add_applied_schema(name)
+    }
+
+    /// Whether [`apply_api`](Self::apply_api) would be accepted, and the whole
+    /// of what the schema demands besides. Mirrors C++ `UsdPrim::CanApplyAPI`,
+    /// whose `whyNot` this returns as the error.
+    ///
+    /// Beyond the shape `apply_api` enforces, this honours the prim itself and
+    /// the restrictions a schema declares: the instance names a multiple-apply
+    /// schema allows, and the prim types `apiSchemaCanOnlyApplyTo` limits it
+    /// to — the latter satisfied by a type that derives from one of them,
+    /// through [`is_a`](Self::is_a).
+    pub fn can_apply_api(&self, name: impl Into<Token>) -> Result<(), ApplyApiError> {
+        let name = name.into();
+        let registry = self.stage.schema_registry();
+        let checked = registry.check_applied_name(&name)?;
+        // The `IsValid()` gate of C++ `_CanApplySingleApplyAPI` /
+        // `_CanApplyMultipleApplyAPI`, reported as the `whyNot` it is.
+        if !self.stage.has_spec(&self.path)? {
+            return Err(ApplyApiError::PrimNotValid {
+                path: self.path.clone(),
+            });
+        }
+        let Some((info, instance)) = checked else {
+            return Ok(());
+        };
+        let schema = info.identifier();
+        let allowed = info.can_only_apply_to(instance.as_ref());
+
+        if let Some(instance) = instance
+            && !registry.is_allowed_instance_name(schema, &instance)
+        {
+            return Err(ApplyApiError::InstanceNameNotAllowed {
+                schema: schema.clone(),
+                instance,
+            });
+        }
+
+        if !allowed.is_empty() {
+            // The prim's type answers for every candidate, so it is resolved
+            // before the scan.
+            let type_info = self.stage.prim_type_info_composed(&self.path)?;
+            if !allowed.iter().any(|t| registry.is_a(type_info.schema_type_name(), t)) {
+                return Err(ApplyApiError::PrimTypeNotAllowed {
+                    schema: name,
+                    allowed: allowed.to_vec(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Composed value of a prim-level metadata field decoded to `T`, falling
+    /// back to what the prim's schemas declare. Mirrors C++
+    /// `UsdObject::GetMetadata(name, &value)` for a prim.
+    ///
+    /// The read counterpart of [`set_metadata`](Self::set_metadata), and the
+    /// prim-level sibling of [`Attribute::metadata`]. Decode to the field's
+    /// type (`metadata::<String>("documentation")`) or to [`vt::Value`]
+    /// for the raw value. Dictionary-valued fields come back merged key-by-key
+    /// across layers, as value resolution composes them (spec 12.2.5).
+    ///
+    /// A field the accessors resolve by their own rule rather than plain
+    /// composition — `kind`, `specifier`, `typeName` — is better read through
+    /// that accessor ([`kind`](Self::kind) and friends), which tolerates an
+    /// authored value of the wrong type where a generic decode reports it.
+    ///
+    /// A dictionary the schema declares composes under an authored one, its
+    /// keys answering where no layer authors them.
+    pub fn metadata<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        T: TryFrom<vt::Value>,
+        T::Error: Into<crate::Error>,
+    {
+        super::authoring::metadata(&self.stage, &self.path, key)
+    }
+
+    /// Author a prim-level metadata field (e.g. `assetInfo`, `customData`,
+    /// `kind`). Mirrors C++ `UsdObject::SetMetadata` for a prim.
+    ///
+    /// `key` is `&'static str` so the change-tracking layer can record it
+    /// without copying; pass a `pub const FOO: &str = "..."` token rather than
+    /// a runtime-built string.
+    ///
+    /// `value` is in stage time, so any `timecode` it holds is mapped into the
+    /// edit target's own time frame (C++ `_StageValueToFieldXf`).
+    ///
+    /// A value of another type than the field holds is converted to it where
+    /// nothing is lost (an `int` 1 to a `bool`, a string to a `token`), and is
+    /// [`StageAuthoringError::ValueType`] otherwise.
+    pub fn set_metadata(self, key: &'static str, value: impl Into<vt::Value>) -> Result<Self, StageAuthoringError> {
+        super::authoring::check_reserved(sdf::SpecType::Prim, key)?;
+        let value = self.stage.metadata_to_spec(&self.path, key, value.into())?;
+        self.edit(|spec| {
+            spec.set(key, value);
+            Ok(())
+        })
+    }
+
+    /// Remove a prim-level metadata field's opinion from the edit-target layer.
+    /// Mirrors C++ `UsdObject::ClearMetadata` for a prim.
+    ///
+    /// Only the local opinion goes away; one on a weaker layer still composes.
+    pub fn clear_metadata(self, key: &'static str) -> Result<Self, StageAuthoringError> {
+        super::authoring::check_reserved(sdf::SpecType::Prim, key)?;
+        self.erase_local(key)
+    }
+
+    /// The `inherits` arcs of this prim as an editor over the edit target
+    /// (C++ `UsdPrim::GetInherits`).
+    pub fn inherits(&self) -> super::ListEdit<sdf::Path> {
+        super::ListEdit::new(self.clone(), sdf::FieldKey::InheritPaths)
+    }
+
+    /// The `specializes` arcs of this prim as an editor over the edit target
+    /// (C++ `UsdPrim::GetSpecializes`).
+    pub fn specializes(&self) -> super::ListEdit<sdf::Path> {
+        super::ListEdit::new(self.clone(), sdf::FieldKey::Specializes)
+    }
+
+    /// The `references` of this prim as an editor over the edit target (C++
+    /// `UsdPrim::GetReferences`).
+    pub fn references(&self) -> super::ListEdit<sdf::Reference> {
+        super::ListEdit::new(self.clone(), sdf::FieldKey::References)
+    }
+
+    /// The `payload` arcs of this prim as an editor over the edit target
+    /// (C++ `UsdPrim::GetPayloads`).
+    pub fn payloads(&self) -> super::ListEdit<sdf::Payload> {
+        super::ListEdit::new(self.clone(), sdf::FieldKey::Payload)
+    }
+
+    /// Read-modify-write a prim-level metadata field on the edit-target layer.
+    /// `f` receives the field's current opinion on that layer (`None` when it
+    /// is unauthored locally) and returns the value to author, or `None` to
+    /// remove the local opinion.
+    ///
+    /// Reading the local opinion rather than the composed value keeps opinions
+    /// on weaker layers from being flattened into the edit target. This matters
+    /// for dictionary-valued metadata such as `assetInfo` / `customData`, which
+    /// value resolution merges key-by-key across layers (spec 12.2.5): a caller
+    /// that merges one nested key should leave the rest to composition.
+    ///
+    /// Both sides of `f` are in the target layer's own time frame, since it
+    /// reads and writes that one layer: a `timecode` arrives as the layer holds
+    /// it and is authored back the same way.
+    ///
+    /// `key` is `&'static str` for the same change-tracking reason as
+    /// [`set_metadata`](Self::set_metadata).
+    pub fn update_metadata<F>(self, key: &'static str, f: F) -> Result<Self, StageAuthoringError>
+    where
+        F: FnOnce(Option<vt::Value>) -> Option<vt::Value>,
+    {
+        super::authoring::check_reserved(sdf::SpecType::Prim, key)?;
+        // The local opinion is read, and `f` decided, ahead of any transaction:
+        // only a write needs a prim to author against, and only a write
+        // composes to find one.
+        let local = self.stage.local_field(&self.path, key)?;
+        let held = local.clone();
+        let value = f(local);
+        if value == held {
+            return Ok(self);
+        }
+        let Some(value) = value else {
+            return self.erase_local(key);
+        };
+        let value = self.stage.coerce_metadata(key, value)?;
+        if held.as_ref() == Some(&value) {
+            return Ok(self);
+        }
+        self.edit(|spec| {
+            spec.set(key, value);
+            Ok(())
+        })
+    }
+
+    /// Drops the edit-target layer's own opinion for `key`. Erasing reaches
+    /// only a prim spec this layer already holds: a prim it says nothing
+    /// about stays absent from it, and the pseudo-root, whose fields are the
+    /// layer's own metadata, is no more clearable here than it is
+    /// authorable.
+    fn erase_local(self, key: &str) -> Result<Self, StageAuthoringError> {
+        self.stage.with_target_layer_at(&self.path, |layer, path| {
+            if let Some(mut spec) = sdf::PrimSpecMut::get(layer.data_mut(), path) {
+                spec.erase(key);
+            }
+            Ok(())
+        })?;
+        Ok(self)
+    }
+
+    /// Author an attribute spec named `name` under this prim (C++
+    /// `UsdPrim::CreateAttribute`); see [`Stage::create_attribute`] for the
+    /// contract, under which `type_name`, `variability = Varying` and
+    /// `custom = true` apply only to an attribute nothing declares yet. To say
+    /// something else, take an [`attribute_builder`](Self::attribute_builder).
+    /// A prim nothing composes is [`StageAuthoringError::PrimNotValid`], so the
+    /// property never conjures its prim.
+    pub fn create_attribute(
+        &self,
+        name: impl Into<Token>,
+        type_name: impl Into<sdf::ValueTypeName>,
+    ) -> Result<Attribute, StageAuthoringError> {
+        self.attribute_builder(name, type_name).build()
+    }
+
+    /// The same authoring, with what the attribute is declared as — and the
+    /// value it starts with — left to the caller. Everything the builder
+    /// carries is authored as one edit of the target layer.
+    pub fn attribute_builder(
+        &self,
+        name: impl Into<Token>,
+        type_name: impl Into<sdf::ValueTypeName>,
+    ) -> super::AttributeBuilder<'static> {
+        super::AttributeBuilder::new(self.property_target(name.into()), type_name.into())
+    }
+
+    /// Author a relationship spec named `name` under this prim (C++
+    /// `UsdPrim::CreateRelationship`), under the same prim-validity rule as
+    /// [`create_attribute`](Self::create_attribute).
+    pub fn create_relationship(&self, name: impl Into<Token>) -> Result<Relationship, StageAuthoringError> {
+        self.relationship_builder(name).build()
+    }
+
+    /// The same authoring, with the declaration left to the caller.
+    pub fn relationship_builder(&self, name: impl Into<Token>) -> super::RelationshipBuilder<'static> {
+        super::RelationshipBuilder::new(self.property_target(name.into()))
+    }
+
+    /// Where a property named `name` on this prim would be authored: the stage
+    /// and the path, or what naming them hit.
+    ///
+    /// A builder carries the failure rather than reporting it, so that naming
+    /// a property and declaring it read as one expression.
+    fn property_target(&self, name: Token) -> Result<(Stage, sdf::Path), StageAuthoringError> {
+        let path = self.path.append_property(&name)?;
+        self.require_valid()?;
+        Ok((self.stage.clone(), path))
+    }
+
+    /// Author a relationship `name` with the given target paths, declared
+    /// `custom = false` as a schema's own property is where nothing else
+    /// declares it. Declaration and targets reach the stage as one edit.
+    pub fn author_relationship_targets(
+        &self,
+        name: &str,
+        targets: impl IntoIterator<Item: sdf::IntoPath>,
+    ) -> Result<Relationship, StageAuthoringError> {
+        self.relationship_builder(name)
+            .custom(false)
+            .set_targets(targets)
+            .build()
+    }
+
+    /// Names of the value-clip sets composed onto this prim, sorted by name
+    /// (spec 12.3.4, C++ `clipSetNames`). Reads the composed `clips`
+    /// dictionary across layers; returns an empty vector when none are
+    /// authored.
+    ///
+    /// This is read-only introspection — clip values are resolved through
+    /// [`Attribute::get_at`]. The strength order the `clipSets` list-op
+    /// carries is [`ClipsAPI::clip_sets`](super::ClipsAPI::clip_sets), and is
+    /// not applied to these names.
+    pub fn clip_set_names(&self) -> Result<Vec<String>> {
+        let Some(vt::Value::Dictionary(sets)) = self.stage.field::<vt::Value>(&self.path, sdf::FieldKey::Clips)? else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = sets.into_iter().map(|(name, _)| name).collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Returns `true` when one or more value-clip sets are composed onto this
+    /// prim (spec 12.3.4).
+    pub fn has_clips(&self) -> Result<bool> {
+        Ok(!self.clip_set_names()?.is_empty())
+    }
+
+    /// Composed `typeName`, if set. Mirrors C++ `UsdPrim::GetTypeName`.
+    ///
+    /// `typeName` is a token; a value of any other type is treated as untyped
+    /// (`None`), matching C++ reading the field as an empty `TfToken`.
+    pub fn type_name(&self) -> Result<Option<Token>> {
+        Ok(self.type_name_composed()?)
+    }
+
+    /// [`type_name`](Self::type_name) at the composition tier, for the type
+    /// resolution that folds the failure into its own error.
+    pub(crate) fn type_name_composed(&self) -> Result<Option<Token>, pcp::QueryError> {
+        Ok(self
+            .stage
+            .field::<vt::Value>(&self.path, sdf::FieldKey::TypeName)?
+            .and_then(|v| v.try_as_token()))
+    }
+
+    /// Composed specifier, if one resolves. Mirrors C++ `UsdPrim::GetSpecifier`.
+    pub fn specifier(&self) -> Result<Option<sdf::Specifier>> {
+        Ok(self
+            .stage
+            .field::<sdf::Specifier>(&self.path, sdf::FieldKey::Specifier)?)
+    }
+
+    /// Composed `kind` metadata, if authored. Mirrors C++ `UsdPrim::GetKind`.
+    ///
+    /// `kind` is a token; a value of any other type is treated as unauthored
+    /// (`None`), matching C++ reading the field as an empty `TfToken`.
+    pub fn kind(&self) -> Result<Option<Token>> {
+        Ok(self
+            .stage
+            .field::<vt::Value>(&self.path, sdf::FieldKey::Kind)?
+            .and_then(|v| v.try_as_token()))
+    }
+
+    /// The API schemas that apply to this prim, strongest first. Mirrors C++
+    /// `UsdPrim::GetAppliedSchemas`.
+    ///
+    /// This is the prim definition's list, so it includes the schemas a typed
+    /// schema or an applied schema builds in, not only the ones authored in
+    /// `apiSchemas`. Multi-apply instances appear as-is (e.g.
+    /// `PhysicsLimitAPI:rotZ`). Use
+    /// [`authored_api_schemas`](Self::authored_api_schemas) for the authored
+    /// list alone.
+    pub fn api_schemas(&self) -> Result<Vec<Token>> {
+        let info = self.prim_type_info()?;
+        let mut names = info.prim_definition().applied_api_schemas().to_vec();
+
+        // An authored name the registry does not know composes into no
+        // definition, but it is still what the prim asks for. Reporting it
+        // keeps the answer from depending on how much of the scene's schema
+        // data this build happens to have: C++ drops such a name, which it can
+        // afford because its registry is always fully populated.
+        // TODO(perf): both lists come off one `PrimTypeInfo`, which every prim
+        // of this identity shares, so the union could be composed once there
+        // and handed back as a slice rather than rebuilt on each call.
+        let composed: HashSet<&Token> = names.iter().collect();
+        let unknown: Vec<Token> = info
+            .id()
+            .applied_api_schemas()
+            .iter()
+            .filter(|name| !composed.contains(*name))
+            .cloned()
+            .collect();
+
+        names.extend(unknown);
+        Ok(names)
+    }
+
+    /// The instance names of every application of `schema` to this prim, in
+    /// the order [`api_schemas`](Self::api_schemas) reports them: a prim
+    /// carrying `CollectionAPI:render` and `CollectionAPI:proxy` answers
+    /// `render` and `proxy` for `CollectionAPI`. `schema` is a bare schema
+    /// identifier, so an instance-qualified name matches nothing.
+    ///
+    /// An application naming no instance contributes nothing, so a
+    /// single-apply schema answers empty. C++
+    /// `UsdAPISchemaBase::_GetMultipleApplyInstanceNames` reports an empty
+    /// instance name for one instead, which here would name a view whose
+    /// properties resolve under no instance at all.
+    // TODO: C++ keeps that function on `UsdAPISchemaBase` as a protected static
+    // keyed by the schema's own type, which the faithful home here would mirror
+    // as a provided method on the `APISchemaBase` trait over a schema-identifier
+    // const on `SchemaBase` — retiring the identifier the emitter threads
+    // through every generated view, and with it the chance of pairing a view
+    // with the wrong constant.
+    pub fn api_schema_instance_names(&self, schema: &str) -> Result<Vec<Token>> {
+        Ok(self
+            .api_schemas()?
+            .iter()
+            .filter_map(|applied| {
+                let instance = applied.strip_prefix(schema)?.strip_prefix(':')?;
+                (!instance.is_empty()).then(|| Token::from(instance))
+            })
+            .collect())
+    }
+
+    /// The prim's composed `apiSchemas` list op, flattened across all
+    /// contributing opinions. Mirrors C++ `UsdPrim::GetAppliedSchemas` before
+    /// the prim definition folds in built-ins.
+    pub fn authored_api_schemas(&self) -> Result<Vec<Token>> {
+        Ok(self.authored_api_schemas_composed()?)
+    }
+
+    /// [`authored_api_schemas`](Self::authored_api_schemas) at the composition
+    /// tier, for the type resolution that folds the failure into its own error.
+    pub(crate) fn authored_api_schemas_composed(&self) -> Result<Vec<Token>, pcp::QueryError> {
+        self.stage
+            .masked_opinions(&self.path, |g, cache| cache.api_schemas(g, &self.path))
+    }
+
+    /// `true` when this prim's type is `schema`, or derives from it. Mirrors
+    /// C++ `UsdPrim::IsA`.
+    ///
+    /// Derivation is read from the stage's
+    /// [`SchemaRegistry`](super::SchemaRegistry), so a query against an
+    /// abstract ancestor (`Boundable`, `Imageable`) answers for the concrete
+    /// types under it, and a type resolved through `fallbackPrimTypes` answers
+    /// for the type it resolved to.
+    ///
+    /// The question is asked of the prim's schema type, which is empty unless a
+    /// registered type backs it. So a prim whose `typeName` this registry does
+    /// not know is nothing — including the very name it authors.
+    pub fn is_a(&self, schema: impl Into<Token>) -> Result<bool> {
+        let info = self.prim_type_info()?;
+        Ok(self
+            .stage
+            .schema_registry()
+            .is_a(info.schema_type_name(), &schema.into()))
+    }
+
+    /// `true` when `name` is among the prim's
+    /// [`api_schemas`](Self::api_schemas) (pass the full instance name for
+    /// multi-apply schemas). Mirrors C++ `UsdPrim::HasAPI`.
+    pub fn has_api_schema(&self, name: impl Into<Token>) -> Result<bool> {
+        let name = name.into();
+        let info = self.prim_type_info()?;
+        let definition = info.prim_definition().applied_api_schemas();
+        Ok(definition
+            .iter()
+            .chain(info.id().applied_api_schemas())
+            .any(|schema| schema.as_str() == name.as_str()))
+    }
+
+    /// The registered concrete schema backing this prim's type, or `None` when
+    /// none does.
+    ///
+    /// `None` covers every prim while the stage's registry carries no schema
+    /// data, a `typeName` that registry has never heard of, and a `typeName`
+    /// naming an abstract schema — only a concrete type backs a prim, so only
+    /// one is reported here.
+    ///
+    /// Deriving the type costs composed reads, so a registry with nothing in it
+    /// answers `None` without paying them.
+    pub fn schema_type(&self) -> Result<Option<Token>> {
+        if self.stage.schema_registry().is_empty() {
+            return Ok(None);
+        }
+        let schema_type = self.prim_type_info()?.schema_type_name().clone();
+        Ok(Some(schema_type).filter(|name| !name.as_str().is_empty()))
+    }
+
+    /// Whether this prim is any version of `family` that `filter` accepts.
+    /// Mirrors C++ `UsdPrim::IsInFamily`.
+    ///
+    /// This is [`is_a`](Self::is_a) asked of a whole family rather than one
+    /// identifier, so a caller does not have to name every version a schema has
+    /// shipped under (`DomeLight`, `DomeLight_1`, …).
+    pub fn is_in_family(&self, family: impl Into<Token>, filter: VersionFilter) -> Result<bool> {
+        Ok(self.version_in_family(family, filter)?.is_some())
+    }
+
+    /// The version of `family` this prim is, or `None` when it is none of them.
+    /// Mirrors C++ `UsdPrim::GetVersionIfIsInFamily`.
+    ///
+    /// `family` names a family, not a schema: `DomeLight_1` is an identifier
+    /// within the `DomeLight` family and places a prim in no family of its own,
+    /// exactly as C++'s family-taking overload treats it.
+    ///
+    /// The newest accepted version the prim satisfies wins, which is the order
+    /// [`SchemaRegistry::schema_infos_in_family`](super::SchemaRegistry::schema_infos_in_family)
+    /// answers in.
+    pub fn version_in_family(&self, family: impl Into<Token>, filter: VersionFilter) -> Result<Option<u32>> {
+        let family = family.into();
+        let registry = self.stage.schema_registry();
+        if let Some(schema_type) = self.schema_type()? {
+            return Ok(registry.version_in_family(&schema_type, &family, filter));
+        }
+
+        // No registered schema backs the type, so the name it authors is all
+        // there is to place it by — the arm that resolves a versioned family
+        // while no schema data is registered.
+        let Some((authored_family, version)) = self
+            .type_name()?
+            .as_ref()
+            .and_then(SchemaRegistry::parse_allowed_identifier)
+        else {
+            return Ok(None);
+        };
+        Ok((authored_family == family && filter.accepts(version)).then_some(version))
+    }
+
+    /// Whether this prim has any version of the applied API schema `family`
+    /// that `filter` accepts. Mirrors C++ `UsdPrim::HasAPIInFamily`.
+    ///
+    /// `instance` narrows a multiple-apply schema to one instance; without it
+    /// any instance counts, as C++ matching on the `Schema:` prefix does.
+    pub fn has_api_in_family(
+        &self,
+        family: impl Into<Token>,
+        filter: VersionFilter,
+        instance: Option<&Token>,
+    ) -> Result<bool> {
+        Ok(self.api_version_in_family(family, filter, instance)?.is_some())
+    }
+
+    /// The version of the applied API schema `family` this prim has, or `None`.
+    /// Mirrors C++ `UsdPrim::GetVersionIfHasAPIInFamily`.
+    ///
+    /// A registered schema answers from the composed prim definition, so the
+    /// version reported is the one that actually contributes properties rather
+    /// than every version the prim names. A name no registered schema backs was
+    /// never composed at all, so it answers from what the prim authors, under
+    /// the family its own name gives it.
+    ///
+    /// `family` names a family, not a schema, as it does for
+    /// [`version_in_family`](Self::version_in_family).
+    pub fn api_version_in_family(
+        &self,
+        family: impl Into<Token>,
+        filter: VersionFilter,
+        instance: Option<&Token>,
+    ) -> Result<Option<u32>> {
+        let family = family.into();
+        let registry = self.stage.schema_registry();
+        let type_info = self.prim_type_info()?;
+
+        // A version composition rejected — one conflicting with a stronger
+        // built-in of the same family — is absent from the definition's list
+        // (C++ `GetAppliedSchemas`).
+        let composed = type_info
+            .prim_definition()
+            .applied_api_schemas()
+            .iter()
+            .filter_map(|name| {
+                let (info, applied_instance) = registry.check_applied_name(name).ok().flatten()?;
+                Some((info.family().clone(), info.version(), applied_instance))
+            });
+
+        let unregistered = type_info.id().applied_api_schemas().iter().filter_map(|name| {
+            let (schema, applied_instance) = SchemaRegistry::type_name_and_instance(name);
+            if registry.schema_info(&schema).is_some() {
+                return None;
+            }
+            let (schema_family, version) = SchemaRegistry::parse_allowed_identifier(&schema)?;
+            Some((schema_family, version, applied_instance))
+        });
+
+        // The newest accepted version among the matches answers.
+        Ok(composed
+            .chain(unregistered)
+            .filter(|(schema_family, version, applied_instance)| {
+                schema_family == &family
+                    && filter.accepts(*version)
+                    && instance.is_none_or(|wanted| applied_instance.as_ref() == Some(wanted))
+            })
+            .map(|(_, version, _)| version)
+            .max())
+    }
+
+    /// The prim's schema type — its composed `typeName` and `apiSchemas`, and
+    /// the definition they compose to. Mirrors C++ `UsdPrim::GetPrimTypeInfo`.
+    ///
+    /// Shared with every prim of the same type, and valid for as long as the
+    /// stage's [`SchemaRegistry`](super::SchemaRegistry) lives.
+    pub fn prim_type_info(&self) -> Result<Arc<PrimTypeInfo>> {
+        self.stage.prim_type_info(&self.path)
+    }
+
+    /// What this prim's schemas declare: their properties, and the fallback
+    /// values those properties take when nothing is authored. Mirrors C++
+    /// `UsdPrim::GetPrimDefinition`.
+    pub fn prim_definition(&self) -> Result<Arc<PrimDefinition>> {
+        Ok(self.prim_type_info()?.prim_definition().clone())
+    }
+
+    /// `true` if the prim and all ancestors are active. Missing `active`
+    /// opinions default to `true` and a non-existent prim is inactive, mirroring
+    /// C++ `UsdPrim::IsActive`. A prim the population mask excludes, or one
+    /// below an inactive prim, is not on this stage at all, and reads back as
+    /// the gate's "no answer" value, which
+    /// for a `bool` query is `false` — ask [`is_valid`](Self::is_valid) to tell
+    /// the two apart.
+    pub fn is_active(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .masked(&self.path, |g, cache| cache.is_active(g, &self.path))?)
+    }
+
+    /// Composed `instanceable` flag (spec 11.3.1). Mirrors C++
+    /// `UsdPrim::IsInstanceable`; an unauthored flag resolves to `false`.
+    pub fn is_instanceable(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .field::<bool>(&self.path, sdf::FieldKey::Instanceable)?
+            .unwrap_or(false))
+    }
+
+    /// `true` if the prim is loaded — active, and no payload-carrying prim at
+    /// or above it (per the stage's runtime load rules) is excluded. Mirrors
+    /// C++ `UsdPrim::IsLoaded`.
+    pub fn is_loaded(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .prim_status_masked(&self.path, PrimStatus::LOADED)?
+            .contains(PrimStatus::LOADED))
+    }
+
+    /// Loads this prim's payload, its ancestors', and — under
+    /// [`LoadPolicy::WithDescendants`] — every descendant's (C++
+    /// `UsdPrim::Load`).
+    ///
+    /// A prim inside a `/__Prototype_N` prototype namespace is silently
+    /// ignored; see [`Stage::load`].
+    pub fn load(&self, policy: LoadPolicy) {
+        self.stage.load_path(&self.path, policy);
+    }
+
+    /// Unloads this prim's payload and everything beneath it (C++
+    /// `UsdPrim::Unload`). Same prototype-namespace leniency as
+    /// [`load`](Self::load).
+    pub fn unload(&self) {
+        self.stage.unload_path(&self.path);
+    }
+
+    /// `true` if the prim and all ancestors have defining specifiers (`def` or
+    /// `class`). `over`, missing specs, and missing specifier opinions are not
+    /// defining. Mirrors C++ `UsdPrim::IsDefined`.
+    pub fn is_defined(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .prim_status_masked(&self.path, PrimStatus::DEFINED)?
+            .contains(PrimStatus::DEFINED))
+    }
+
+    /// `true` if the prim or any ancestor resolves to `class`. Mirrors C++
+    /// `UsdPrim::IsAbstract`.
+    pub fn is_abstract(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .prim_status_masked(&self.path, PrimStatus::ABSTRACT)?
+            .contains(PrimStatus::ABSTRACT))
+    }
+
+    /// `true` if the prim index contains at least one composition arc.
+    pub fn has_composition_arc(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .masked_opinions(&self.path, |g, cache| cache.has_composition_arc(g, &self.path))?)
+    }
+
+    /// `true` if this prim is an instance (spec 11.3.3): `instanceable` resolves
+    /// true and the prim has a composition arc. Mirrors C++ `UsdPrim::IsInstance`.
+    ///
+    /// A `/__Prototype_N` root is never an instance even when `instanceable`
+    /// composes true on it, which is routine for a published asset; the
+    /// composition cache resolves that rule.
+    pub fn is_instance(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .masked(&self.path, |g, cache| cache.is_instance(g, &self.path))?)
+    }
+
+    /// `true` if the prim is in the contiguous model hierarchy: its `kind` is
+    /// a `model` kind, and every ancestor below the pseudo-root is a `group`
+    /// kind. Mirrors C++ `UsdPrim::IsModel`.
+    ///
+    /// Which kinds are models and groups is what the stage's
+    /// [`kind::Registry`](crate::kind::Registry) says, so a kind a schema
+    /// family declares counts as its base kind does. The pseudo-root is a
+    /// model and a group, and so is a prototype root. An instance proxy
+    /// answers as the prototype prim it stands in for, so what is above the
+    /// instance does not reach it.
+    pub fn is_model(&self) -> Result<bool> {
+        Ok(self.model_flags()?.model)
+    }
+
+    /// `true` if the prim is a model whose `kind` is a `group` kind, the only
+    /// models that may hold other models. Mirrors C++ `UsdPrim::IsGroup`.
+    pub fn is_group(&self) -> Result<bool> {
+        Ok(self.model_flags()?.group)
+    }
+
+    /// `true` if the prim is a model whose `kind` is a `component` kind.
+    /// Mirrors C++ `UsdPrim::IsComponent`.
+    pub fn is_component(&self) -> Result<bool> {
+        Ok(self.model_flags()?.component)
+    }
+
+    /// `true` if the prim's `kind` is a `subcomponent` kind, wherever the prim
+    /// sits. Mirrors C++ `UsdPrim::IsSubComponent`.
+    pub fn is_subcomponent(&self) -> Result<bool> {
+        let kinds = self.stage.schema_registry().kinds();
+        Ok(self.kind()?.is_some_and(|kind| kinds.is_subcomponent(&kind)))
+    }
+
+    /// Returns the shared prototype path (`/__Prototype_N`) for this prim if it
+    /// is an instance, else `None` (spec 11.3.3). Mirrors C++
+    /// `UsdPrim::GetPrototype`.
+    pub fn prototype(&self) -> Result<Option<sdf::Path>> {
+        Ok(self
+            .stage
+            .masked(&self.path, |g, cache| cache.prototype_of(g, &self.path))?)
+    }
+
+    /// Returns the instance prims sharing this prototype root (a
+    /// `/__Prototype_N` prim), sorted by namespace path. Mirrors C++
+    /// `UsdPrim::GetInstances`.
+    ///
+    /// Each instance is named by the path whose index composes it, so a nested
+    /// prototype reports its prim inside the enclosing prototype rather than the
+    /// proxies standing for it — as C++ does, resolving each registered prim
+    /// index into the prototype it belongs to.
+    ///
+    /// No population filtering is applied to the results: only a prim the stage
+    /// populated can register (see `IndexCache::is_populated`), so every
+    /// instance here is one the mask exposes.
+    pub fn instances(&self) -> Result<Vec<sdf::Path>> {
+        self.stage.settle()?;
+        self.stage.resolve_prototype_path(&self.path)?;
+        Ok(self.stage.cache().instances_of(&self.path))
+    }
+
+    /// Returns `true` if this prim is a prototype root (`/__Prototype_N`).
+    /// Mirrors C++ `UsdPrim::IsPrototype`.
+    pub fn is_prototype(&self) -> Result<bool> {
+        self.stage.settle()?;
+        self.stage.resolve_prototype_path(&self.path)?;
+        Ok(self.stage.cache().is_prototype(&self.path))
+    }
+
+    /// Returns `true` if this prim lies within a prototype's namespace — the
+    /// `/__Prototype_N` root itself included, as in C++, where
+    /// `UsdPrim::IsPrototype` is `IsInPrototype` narrowed to a root prim.
+    /// Mirrors C++ `UsdPrim::IsInPrototype`.
+    ///
+    /// A composed prim is required, not just a path in the namespace: C++ can
+    /// only ask this of a prim it instantiated, so a path under a registered
+    /// root that composes to nothing answers `false`.
+    pub fn is_in_prototype(&self) -> Result<bool> {
+        self.stage.settle()?;
+        self.stage.resolve_prototype_path(&self.path)?;
+        let in_namespace = self.stage.cache().is_in_prototype(&self.path);
+        Ok(in_namespace && self.is_valid()?)
+    }
+
+    /// `true` if this prim is an instance proxy — a descendant of an instance
+    /// prim, in the instance's own namespace, standing in for a prim in the
+    /// shared prototype (spec 11.3.3). Mirrors C++ `UsdPrim::IsInstanceProxy`.
+    pub fn is_instance_proxy(&self) -> Result<bool> {
+        Ok(self
+            .stage
+            .masked(&self.path, |g, cache| cache.is_instance_proxy(g, &self.path))?)
+    }
+
+    /// Returns the prim in the shared prototype this instance proxy stands in
+    /// for (a `/__Prototype_N/...` prim), or `None` when this prim is not an
+    /// instance proxy (spec 11.3.3). Mirrors C++ `UsdPrim::GetPrimInPrototype`.
+    pub fn prim_in_prototype(&self) -> Result<Option<Prim>> {
+        let path = self
+            .stage
+            .masked(&self.path, |g, cache| cache.prim_in_prototype(g, &self.path))?;
+        Ok(path.map(|p| Prim::new(&self.stage, p)))
+    }
+
+    /// Where the prim stands in the model hierarchy.
+    ///
+    /// The pseudo-root and a prototype root are groups whatever they author,
+    /// as C++ `Usd_PrimData::_ComposeAndCacheFlags` sets them, so the walk
+    /// from a prototype's descendant ends at its root. An instance proxy has
+    /// the flags of the prototype prim it stands in for, the prim C++ reads
+    /// them from. Any other prim, an instance included, is a model only when
+    /// its own `kind` is a model kind and every ancestor's is a group kind.
+    // TODO(perf): each call reads `kind` on the prim and on every ancestor.
+    // C++ caches the three flags per prim and recomposes the prim when `kind`
+    // changes; a memo here needs an epoch a `kind` edit advances, which no
+    // existing epoch does.
+    fn model_flags(&self) -> Result<ModelFlags> {
+        self.stage.settle()?;
+        const GROUP: ModelFlags = ModelFlags {
+            model: true,
+            group: true,
+            component: false,
+        };
+        if self.path.is_abs_root() {
+            return Ok(GROUP);
+        }
+        if !self.stage.has_spec(&self.path)? {
+            return Ok(ModelFlags::default());
+        }
+        if self.stage.cache().is_prototype(&self.path) {
+            return Ok(GROUP);
+        }
+        if let Some(in_prototype) = self.prim_in_prototype()? {
+            return in_prototype.model_flags();
+        }
+
+        let kinds = self.stage.schema_registry().kinds();
+        let Some(kind) = self.kind()?.filter(|kind| kinds.is_model(kind)) else {
+            return Ok(ModelFlags::default());
+        };
+        for ancestor in self.ancestors().skip(1) {
+            if self.stage.cache().is_prototype(ancestor.path()) {
+                break;
+            }
+            let kind = ancestor.kind()?;
+            if !kind.is_some_and(|kind| kinds.is_group(&kind)) {
+                return Ok(ModelFlags::default());
+            }
+        }
+        Ok(ModelFlags {
+            model: true,
+            group: kinds.is_group(&kind),
+            component: kinds.is_component(&kind),
+        })
+    }
+
+    /// Every spec that contributes a prim spec to this prim, strongest first,
+    /// each with the cumulative layer offset that reaches it. Mirrors C++
+    /// `UsdPrim::GetPrimStack`.
+    pub fn prim_stack(&self) -> Result<Vec<SpecSite>> {
+        Ok(self
+            .stage
+            .masked_opinions(&self.path, |g, c| c.prim_stack(g, &self.path))?)
+    }
+
+    /// Returns a handle to this prim's composition index (C++
+    /// `UsdPrim::GetPrimIndex`), through which the composition graph and composed
+    /// child names + prohibited names are reachable. See
+    /// [`PrimIndexRef`](crate::usd::PrimIndexRef).
+    pub fn prim_index(&self) -> PrimIndexRef {
+        PrimIndexRef::new(&self.stage, self.path.clone())
+    }
+
+    /// Returns an [`Attribute`] handle for the property `name` under this prim.
+    /// Mirrors C++ `UsdPrim::GetAttribute`. This is a value-type wrapper; it
+    /// neither authors a spec nor asserts the attribute is composed. An invalid
+    /// property name yields a handle whose path falls back to the prim, which
+    /// resolves as empty.
+    pub fn attribute(&self, name: impl Into<Token>) -> Attribute {
+        Attribute::new(&self.stage, self.property_path(name))
+    }
+
+    /// Returns a [`Relationship`] handle for the property `name` under this
+    /// prim. Mirrors C++ `UsdPrim::GetRelationship`. See [`Self::attribute`]
+    /// for the handle's non-authoring, non-validating contract.
+    pub fn relationship(&self, name: impl Into<Token>) -> Relationship {
+        Relationship::new(&self.stage, self.property_path(name))
+    }
+
+    /// Returns the names of this prim's children on the stage, in
+    /// strongest-layer order and filtered by the stage's population mask. An
+    /// inactive prim has none. The name-only counterpart of
+    /// [`children`](Self::children).
+    pub fn child_names(&self) -> Result<Vec<Token>> {
+        Ok(self
+            .stage
+            .masked(&self.path, |g, cache| cache.populated_children(g, &self.path))?)
+    }
+
+    /// Returns this prim's children on the stage, in strongest-layer order and
+    /// filtered by the stage's population mask. An inactive prim has none, and
+    /// an instance lists its instance proxies. Mirrors C++
+    /// `UsdPrim::GetFilteredChildren` under
+    /// `UsdTraverseInstanceProxies(UsdPrimAllPrimsPredicate)`.
+    pub fn children(&self) -> Result<Vec<Prim>> {
+        Ok(self
+            .child_names()?
+            .into_iter()
+            .filter_map(|name| self.path.append_path(name.as_str()).ok())
+            .map(|path| Prim::new(&self.stage, path))
+            .collect())
+    }
+
+    /// Returns the children of this prim that match `predicate`, in the order
+    /// [`children`](Self::children) lists them. Mirrors C++
+    /// `UsdPrim::GetFilteredChildren`.
+    ///
+    /// An instance has no children unless `predicate` traverses instance
+    /// proxies; its contents are the children of its
+    /// [`prototype`](Self::prototype). An instance proxy lists its children,
+    /// which are instance proxies, under either setting.
+    pub fn filtered_children(&self, predicate: PrimPredicate) -> Result<Vec<Prim>> {
+        let children = self.stage.filtered_children(&self.path, predicate, None)?;
+        Ok(children.into_iter().map(|(child, _)| child).collect())
+    }
+
+    /// Returns the prims beneath this one that match `predicate`, each
+    /// before the prims beneath it and in the order
+    /// [`children`](Self::children) lists siblings. Mirrors C++
+    /// `UsdPrim::GetFilteredDescendants`.
+    ///
+    /// A prim that does not match is left out with everything beneath it.
+    /// Nothing beneath an instance is listed unless `predicate` traverses
+    /// instance proxies, or this prim is itself an instance proxy.
+    /// [`filtered_subtree`](Self::filtered_subtree) is the walk that starts
+    /// at this prim.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use openusd::usd::{self, PrimPredicate};
+    ///
+    /// let stage = usd::Stage::builder().in_memory("scene.usda")?;
+    /// stage.define_prim("/World")?;
+    /// stage.define_prim("/World/Set")?;
+    /// stage.define_prim("/World/Set/Chair")?;
+    /// stage.define_prim("/World/Cast")?;
+    ///
+    /// let world = stage.prim("/World")?;
+    /// let mut paths = Vec::new();
+    /// for prim in world.filtered_descendants(PrimPredicate::DEFAULT)? {
+    ///     paths.push(prim?.path().to_string());
+    /// }
+    /// assert_eq!(paths, ["/World/Set", "/World/Set/Chair", "/World/Cast"]);
+    /// # Ok::<(), openusd::Error>(())
+    /// ```
+    pub fn filtered_descendants(&self, predicate: PrimPredicate) -> Result<PrimRange> {
+        let mut stack = self.stage.filtered_children(&self.path, predicate, None)?;
+        stack.reverse();
+        Ok(PrimRange {
+            predicate,
+            stack,
+            pending: None,
+        })
+    }
+
+    /// This prim, where it matches `predicate`, and then the prims beneath
+    /// it as [`filtered_descendants`](Self::filtered_descendants) lists them
+    /// (C++ `UsdPrimRange(start, predicate)`). The walk is empty where this
+    /// prim does not match.
+    pub fn filtered_subtree(&self, predicate: PrimPredicate) -> Result<PrimRange> {
+        let root = self.stage.matching_status(&self.path, predicate)?;
+        Ok(PrimRange {
+            predicate,
+            stack: root.map(|composed| (self.clone(), composed)).into_iter().collect(),
+            pending: None,
+        })
+    }
+
+    /// [`filtered_children`](Self::filtered_children) for a walk that goes
+    /// on beneath the children: each child comes with the status it
+    /// composed, to pass as `composed` when its own children are listed.
+    ///
+    /// `composed` is this prim's status from the call that listed it, or
+    /// `None` where the walk starts at this prim. With it each child
+    /// composes its status from this prim's in one step. Without it, or
+    /// with the status of another prim, this prim's status is composed from
+    /// the pseudo-root first, which is what
+    /// [`filtered_children`](Self::filtered_children) pays at every prim of
+    /// a walk.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use openusd::usd::{self, PrimPredicate};
+    ///
+    /// let stage = usd::Stage::builder().in_memory("scene.usda")?;
+    /// stage.define_prim("/World")?;
+    /// stage.define_prim("/World/Set")?;
+    /// stage.define_prim("/World/Set/Chair")?;
+    ///
+    /// // A walk beneath `/World`, each prim handing its status down.
+    /// let mut found = Vec::new();
+    /// let mut stack = vec![(stage.prim("/World")?, None)];
+    /// while let Some((prim, composed)) = stack.pop() {
+    ///     for (child, composed) in prim.filtered_children_from(PrimPredicate::DEFAULT, composed)? {
+    ///         found.push(child.path().to_string());
+    ///         stack.push((child, Some(composed)));
+    ///     }
+    /// }
+    /// assert_eq!(found, ["/World/Set", "/World/Set/Chair"]);
+    /// # Ok::<(), openusd::Error>(())
+    /// ```
+    pub fn filtered_children_from(
+        &self,
+        predicate: PrimPredicate,
+        composed: Option<ComposedStatus>,
+    ) -> Result<Vec<(Prim, ComposedStatus)>> {
+        self.stage.filtered_children(&self.path, predicate, composed)
+    }
+
+    /// Returns every property name of this prim — the ones layers author and
+    /// the ones its schemas declare. Mirrors C++ `UsdPrim::GetPropertyNames`.
+    ///
+    /// The union is sorted as C++ `TfDictionaryLessThan` sorts it and then
+    /// reordered by the prim's `propertyOrder` (spec §11.3.2), so the result
+    /// does not depend on which half a name came from. Where no layer authors
+    /// a `propertyOrder`, the one the prim's
+    /// schema declares applies, as C++ `UsdPrim::GetPropertyOrder` reads it;
+    /// §11.3.2 reads only an authored one. Use
+    /// [`authored_property_names`](Self::authored_property_names) to scan
+    /// only what layers actually author.
+    pub fn property_names(&self) -> Result<Vec<Token>> {
+        let info = self.prim_type_info()?;
+        let definition = info.prim_definition();
+        let mut names = self.authored_names_unordered()?;
+        add_declared(&mut names, definition.property_names(), Token::clone);
+        self.order_properties(definition, &mut names)?;
+        Ok(names)
+    }
+
+    /// Returns the property names layers author on this prim, sorted and then
+    /// reordered by the prim's `propertyOrder`
+    /// (spec §11.3.2), or by the one its schema declares, as
+    /// [`property_names`](Self::property_names) orders them. Mirrors C++
+    /// `UsdPrim::GetAuthoredPropertyNames`.
+    ///
+    /// This is the set to scan when the question is "what did someone write?" —
+    /// enumerating a schema's declarations would answer a different one.
+    pub fn authored_property_names(&self) -> Result<Vec<Token>> {
+        let mut names = self.authored_names_unordered()?;
+        self.order_properties(self.prim_type_info()?.prim_definition(), &mut names)?;
+        Ok(names)
+    }
+
+    /// The property names layers author on this prim, in composed order.
+    fn authored_names_unordered(&self) -> Result<Vec<Token>> {
+        Ok(self
+            .stage
+            .masked_opinions(&self.path, |g, cache| cache.prim_properties(g, &self.path))?)
+    }
+
+    /// Puts property `names` in [`sdf::order_properties`] order under the
+    /// prim's `propertyOrder`. Where no layer authors one, the order
+    /// `definition` declares applies, as C++ `UsdPrim::GetPropertyOrder`
+    /// falls back to it.
+    fn order_properties<T: AsRef<str> + PartialEq<Token>>(
+        &self,
+        definition: &PrimDefinition,
+        names: &mut [T],
+    ) -> Result<()> {
+        // TODO(perf): every listing sorts the prim's names afresh; the sorted
+        // order could be memoized beside the cached `prim_properties`.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let authored = self
+            .stage
+            .field::<vt::Value>(&self.path, sdf::FieldKey::PropertyOrder)?;
+        let order = match &authored {
+            Some(value) => value.try_as_token_vec_ref(),
+            None => definition
+                .metadata(sdf::FieldKey::PropertyOrder.as_str())
+                .and_then(vt::Value::try_as_token_vec_ref),
+        };
+        sdf::order_properties(names, order.map(Vec::as_slice));
+        Ok(())
+    }
+
+    /// Returns handles to the composed attributes of this prim. Mirrors C++
+    /// `UsdPrim::GetAttributes`.
+    pub fn attributes(&self) -> Result<Vec<Attribute>> {
+        self.attributes_in_namespace("")
+    }
+
+    /// Returns handles to the attributes layers author on this prim. Mirrors
+    /// C++ `UsdPrim::GetAuthoredAttributes`.
+    pub fn authored_attributes(&self) -> Result<Vec<Attribute>> {
+        self.authored_attributes_in_namespace("")
+    }
+
+    /// Returns handles to the composed attributes of this prim whose names sit
+    /// under `namespace`, in the order [`attributes`](Self::attributes) lists
+    /// them. The attribute half of C++ `UsdPrim::GetPropertiesInNamespace`.
+    ///
+    /// `namespace` is one or more `:`-joined identifiers, with or without a
+    /// trailing `:`: both `"primvars"` and `"primvars:"` list `primvars:st`,
+    /// and neither lists an attribute named `primvars` or `primvarsFoo`. An
+    /// empty namespace lists every attribute.
+    pub fn attributes_in_namespace(&self, namespace: &str) -> Result<Vec<Attribute>> {
+        Ok(self
+            .properties_of_type(PropertySource::Composed, sdf::SpecType::Attribute, namespace)?
+            .into_iter()
+            .map(|path| Attribute::new(&self.stage, path))
+            .collect())
+    }
+
+    /// Returns handles to the attributes layers author on this prim under
+    /// `namespace`, read as [`attributes_in_namespace`](Self::attributes_in_namespace)
+    /// reads it. The attribute half of C++
+    /// `UsdPrim::GetAuthoredPropertiesInNamespace`.
+    pub fn authored_attributes_in_namespace(&self, namespace: &str) -> Result<Vec<Attribute>> {
+        Ok(self
+            .properties_of_type(PropertySource::Authored, sdf::SpecType::Attribute, namespace)?
+            .into_iter()
+            .map(|path| Attribute::new(&self.stage, path))
+            .collect())
+    }
+
+    /// Returns handles to the composed relationships of this prim. Mirrors C++
+    /// `UsdPrim::GetRelationships`.
+    pub fn relationships(&self) -> Result<Vec<Relationship>> {
+        self.relationships_in_namespace("")
+    }
+
+    /// Returns handles to the relationships layers author on this prim. Mirrors
+    /// C++ `UsdPrim::GetAuthoredRelationships`.
+    pub fn authored_relationships(&self) -> Result<Vec<Relationship>> {
+        self.authored_relationships_in_namespace("")
+    }
+
+    /// Returns handles to the composed relationships of this prim whose names
+    /// sit under `namespace`, read as
+    /// [`attributes_in_namespace`](Self::attributes_in_namespace) reads it.
+    /// The relationship half of C++ `UsdPrim::GetPropertiesInNamespace`.
+    pub fn relationships_in_namespace(&self, namespace: &str) -> Result<Vec<Relationship>> {
+        Ok(self
+            .properties_of_type(PropertySource::Composed, sdf::SpecType::Relationship, namespace)?
+            .into_iter()
+            .map(|path| Relationship::new(&self.stage, path))
+            .collect())
+    }
+
+    /// Returns handles to the relationships layers author on this prim under
+    /// `namespace`, read as
+    /// [`attributes_in_namespace`](Self::attributes_in_namespace) reads it.
+    /// The relationship half of C++ `UsdPrim::GetAuthoredPropertiesInNamespace`.
+    pub fn authored_relationships_in_namespace(&self, namespace: &str) -> Result<Vec<Relationship>> {
+        Ok(self
+            .properties_of_type(PropertySource::Authored, sdf::SpecType::Relationship, namespace)?
+            .into_iter()
+            .map(|path| Relationship::new(&self.stage, path))
+            .collect())
+    }
+
+    /// Returns `true` when the stage holds a prim at this path. Mirrors C++
+    /// `UsdPrim::IsValid` for a handle obtained from
+    /// [`Stage::prim`](crate::usd::Stage::prim): a path with no contributing
+    /// spec yields a handle that is not valid, and so does one the stage's
+    /// population does not reach — outside the population mask, or below an
+    /// inactive prim. The handle for a path that cannot name a prim, such as
+    /// a property path, is not valid either.
+    pub fn is_valid(&self) -> Result<bool> {
+        Ok(self.stage.has_spec(&self.path)?)
+    }
+
+    /// [`StageAuthoringError::PrimNotValid`] unless the prim
+    /// [is valid](Self::is_valid) (C++ `if (!prim)`).
+    ///
+    /// Every prim-handle write passes this gate: a prim nothing composes
+    /// cannot take an opinion, so authoring through a handle never conjures a
+    /// prim. A prim the stage will not compose but a caller still means to type
+    /// is defined through [`Stage::define_typed_prim`].
+    pub fn require_valid(&self) -> Result<(), StageAuthoringError> {
+        if self.stage.has_spec(&self.path)? {
+            return Ok(());
+        }
+        Err(StageAuthoringError::PrimNotValid {
+            path: self.path.clone(),
+        })
+    }
+
+    /// Returns handles to the attributes and to the relationships layers
+    /// author on this prim, each in the order
+    /// [`authored_attributes`](Self::authored_attributes) and
+    /// [`authored_relationships`](Self::authored_relationships) list them,
+    /// from one composition of the prim's properties (C++
+    /// `UsdPrim::GetAuthoredProperties`, split by kind).
+    pub fn authored_properties(&self) -> Result<(Vec<Attribute>, Vec<Relationship>)> {
+        let mut attributes = Vec::new();
+        let mut relationships = Vec::new();
+        for property in self.typed_properties(PropertySource::Authored, "", None)? {
+            let path = self.property_path(property.name);
+            match property.kind {
+                Some(sdf::SpecType::Attribute) => attributes.push(Attribute::new(&self.stage, path)),
+                Some(sdf::SpecType::Relationship) => relationships.push(Relationship::new(&self.stage, path)),
+                _ => {}
+            }
+        }
+        Ok((attributes, relationships))
+    }
+
+    /// The property paths of `source` under `namespace` whose spec type
+    /// matches `ty`, in the order [`order_properties`](Self::order_properties)
+    /// gives.
+    fn properties_of_type(&self, source: PropertySource, ty: sdf::SpecType, namespace: &str) -> Result<Vec<sdf::Path>> {
+        Ok(self
+            .typed_properties(source, namespace, Some(ty))?
+            .into_iter()
+            .map(|property| self.property_path(property.name))
+            .collect())
+    }
+
+    /// The property names of `source` under `namespace`, each with the spec
+    /// type it resolves to, in the order
+    /// [`order_properties`](Self::order_properties) gives.
+    ///
+    /// The names and their composed spec types come from one cache query. The
+    /// namespace, and `only` where given, narrow the names before they are
+    /// ordered, which leaves each property the place the whole list would give
+    /// it.
+    fn typed_properties(
+        &self,
+        source: PropertySource,
+        namespace: &str,
+        only: Option<sdf::SpecType>,
+    ) -> Result<Vec<TypedName>> {
+        let info = self.prim_type_info()?;
+        let definition = info.prim_definition();
+        let declared_kind = |name: &Token| definition.property(name).map(|property| property.spec_type());
+        let mut properties: Vec<TypedName> = self
+            .stage
+            .masked_opinions(&self.path, |g, cache| cache.prim_property_kinds(g, &self.path))?
+            .into_iter()
+            .map(|(name, kind)| {
+                let kind = match source {
+                    // A property with no composed spec takes its kind from
+                    // the schema declaration.
+                    PropertySource::Composed => kind.or_else(|| declared_kind(&name)),
+                    // Nothing a schema declares is authored, so a name with no
+                    // composed spec belongs to neither kind.
+                    PropertySource::Authored => kind,
+                };
+                TypedName { name, kind }
+            })
+            .collect();
+        if source == PropertySource::Composed {
+            add_declared(&mut properties, definition.property_names(), |name| TypedName {
+                name: name.clone(),
+                kind: declared_kind(name),
+            });
+        }
+        properties.retain(|property| {
+            in_namespace(&property.name, namespace) && only.is_none_or(|ty| property.kind == Some(ty))
+        });
+        self.order_properties(definition, &mut properties)?;
+        Ok(properties)
+    }
+
+    /// Property path for `name` under this prim. An invalid name yields the
+    /// empty path, so the returned handle resolves nothing — the analog of
+    /// C++'s invalid `UsdProperty` handle.
+    fn property_path(&self, name: impl Into<Token>) -> sdf::Path {
+        self.path.append_property(name).unwrap_or_default()
+    }
+
+    /// Returns the variant sets composed onto this prim. Mirrors C++
+    /// `UsdPrim::GetVariantSets`.
+    pub fn variant_sets(&self) -> VariantSets {
+        VariantSets { prim: self.clone() }
+    }
+
+    /// The variant set `name` of this prim, whether or not the prim declares
+    /// it (C++ `UsdPrim::GetVariantSet`).
+    pub fn variant_set(&self, name: impl Into<String>) -> VariantSet {
+        VariantSet {
+            prim: self.clone(),
+            name: name.into(),
+        }
+    }
+
+    /// Run `f` on this prim's spec on the edit target's layer — an `over`
+    /// authored there, with `over` ancestors, when the layer holds none (C++
+    /// `_CreatePrimSpecForEditing`, behind every prim-handle write) — and
+    /// return `self` for chaining. The layer records whatever fields `f`
+    /// writes. A prim nothing composes is
+    /// [`StageAuthoringError::PrimNotValid`]; a spec of another kind at the
+    /// path is reported by [`sdf::PrimSpec::over`]. Under a variant edit
+    /// target the spec is the variant's (`/Prim{set=sel}`).
+    pub(super) fn edit<F>(self, f: F) -> Result<Self, StageAuthoringError>
+    where
+        F: FnOnce(&mut sdf::PrimSpecMut<'_>) -> Result<(), StageAuthoringError>,
+    {
+        self.require_valid()?;
+        self.stage.with_target_layer_at(&self.path, |layer, path| {
+            let mut spec = sdf::PrimSpec::over(layer.data_mut(), path)?;
+            f(&mut spec)
+        })?;
+        Ok(self)
+    }
+}
+
+/// `true` when a non-empty `payload` opinion is composed at `prim` — the
+/// per-prim check behind [`Prim::is_loaded`].
+pub(super) fn has_payload(stage: &Stage, prim: &sdf::Path) -> Result<bool> {
+    Ok(stage.masked_opinions(prim, |g, cache| cache.has_payload(g, prim))?)
+}
+
+/// A prim's place in the model hierarchy: the three answers C++
+/// `Usd_PrimData` keeps as prim flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModelFlags {
+    model: bool,
+    group: bool,
+    component: bool,
+}
+
+/// A property name with the spec type it resolves to, which
+/// [`Prim::typed_properties`] orders by name.
+struct TypedName {
+    name: Token,
+    kind: Option<sdf::SpecType>,
+}
+
+impl PartialEq<Token> for TypedName {
+    fn eq(&self, other: &Token) -> bool {
+        self.name == *other
+    }
+}
+
+impl AsRef<str> for TypedName {
+    fn as_ref(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Adds to the authored `names` an entry, built by `declare`, for each
+/// schema-`declared` property name they lack. A schema-declared property is
+/// part of the prim's surface whether or not a layer authors a spec for it,
+/// since it still resolves a type and a fallback value.
+fn add_declared<T: AsRef<str>>(names: &mut Vec<T>, declared: &[Token], declare: impl Fn(&Token) -> T) {
+    if declared.is_empty() {
+        return;
+    }
+    let missing: Vec<T> = {
+        let authored: HashSet<&str> = names.iter().map(AsRef::as_ref).collect();
+        declared
+            .iter()
+            .filter(|name| !authored.contains(name.as_str()))
+            .map(declare)
+            .collect()
+    };
+    names.extend(missing);
+}
+
+/// Whether the property `name` sits under `namespace`: the name continues past
+/// the namespace, and the namespace ends at one of the name's `:` delimiters
+/// (C++ `UsdPrim::_GetPropertiesInNamespace`). A trailing `:` on the namespace
+/// is that delimiter, and an empty namespace holds every name.
+fn in_namespace(name: &str, namespace: &str) -> bool {
+    if namespace.is_empty() {
+        return true;
+    }
+    let terminator = namespace.len() - usize::from(namespace.ends_with(':'));
+    name.starts_with(namespace) && name.as_bytes().get(terminator) == Some(&b':')
+}
+
+/// A handle to a single prim's composition index, the analog of C++
+/// `PcpPrimIndex` reached via `UsdPrim::GetPrimIndex`.
+///
+/// Our [`pcp::PrimIndex`] is only the composition graph (its nodes hold layer
+/// *indices*, not the layers); the cache owns the layer data. This handle pairs
+/// the stage with the prim's path so the introspection that needs both — the
+/// composed child names — is reachable here, alongside the raw graph via
+/// [`graph`](Self::graph). Like [`Prim`], it is a cheap value handle: each query
+/// borrows the cache briefly. Composition diagnostics remain available through
+/// [`Stage::composition_errors`].
+///
+/// Its queries answer at the composition tier, where the stage's population
+/// plays no part: a prim the population mask excludes, or one below an inactive
+/// prim, composes here though the stage does not hold it.
+#[derive(Clone)]
+pub struct PrimIndexRef {
+    stage: Stage,
+    path: sdf::Path,
+}
+
+impl PrimIndexRef {
+    pub(super) fn new(stage: &Stage, path: sdf::Path) -> Self {
+        Self {
+            stage: stage.clone(),
+            path,
+        }
+    }
+
+    /// Returns this prim's composition graph (C++ `UsdPrim::GetPrimIndex`),
+    /// building it if needed. A clone, since the cache owns the cached index.
+    ///
+    /// The clone is a weak snapshot: its nodes name their layer stacks by
+    /// handle without keeping them alive, so once the stage drops this prim's
+    /// index and reclamation removes a stack, resolving that node's members
+    /// (e.g. [`Stage::node_layer_stack`](super::Stage::node_layer_stack))
+    /// reports `None`.
+    pub fn graph(&self) -> Result<pcp::PrimIndex> {
+        self.with(|index| pcp::PrimIndex::clone(index))
+    }
+
+    /// Runs `f` over this prim's composition graph where the cache holds it,
+    /// with the layer graph it composes over; [`graph`](Self::graph) copies
+    /// the same index out. The index is built if needed, and `f` runs again
+    /// whenever building it demanded a layer the stage then loaded. `f`
+    /// holds the cache and cannot reach back into the stage: it collects
+    /// what a stage query after it needs. A prototype root, whose opinions
+    /// are read through an empty index, hands `f` one.
+    pub fn with<R>(&self, mut f: impl FnMut(&pcp::PrimIndexView<'_>) -> R) -> Result<R> {
+        let answered = self.stage.opinions(&self.path, |graph, cache| {
+            Ok(Some(f(&pcp::PrimIndexView::new(
+                cache.index(graph, &self.path)?,
+                graph,
+            ))))
+        })?;
+        Ok(answered.unwrap_or_else(|| {
+            f(&pcp::PrimIndexView::new(
+                &pcp::PrimIndex::default(),
+                &self.stage.layers(),
+            ))
+        }))
+    }
+
+    /// [`graph`](Self::graph) at the composition tier, for the namespace
+    /// editor's validation walks.
+    pub(crate) fn graph_composed(&self) -> Result<pcp::PrimIndex, pcp::QueryError> {
+        self.stage
+            .opinions(&self.path, |g, c| Ok(c.index(g, &self.path)?.clone()))
+    }
+
+    /// Composes this prim's child names together with the names prohibited at it
+    /// — children relocated away (renamed or deleted) that cannot be
+    /// re-introduced — returned as `(children, prohibited)` (C++
+    /// `PcpPrimIndex::ComputePrimChildNames`).
+    pub fn child_names(&self) -> Result<(Vec<Token>, Vec<Token>)> {
+        Ok(self
+            .stage
+            .opinions(&self.path, |g, c| c.compute_prim_child_names(g, &self.path))?)
+    }
+
+    /// Every spec that contributes a prim spec to this prim, strongest first,
+    /// each with the cumulative layer offset that reaches it (the `primStack`
+    /// of C++ `PcpPrimIndex`).
+    pub fn prim_stack(&self) -> Result<Vec<SpecSite>> {
+        Ok(self.stage.opinions(&self.path, |g, c| c.prim_stack(g, &self.path))?)
+    }
+
+    /// Composes the variant selections in effect on this prim, as `(set,
+    /// selection)` pairs sorted by set name (C++
+    /// `PcpPrimIndex::ComposeAuthoredVariantSelections`).
+    pub fn variant_selections(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .stage
+            .opinions(&self.path, |g, c| c.variant_selections(g, &self.path))?)
+    }
+
+    /// Every spec contributing to the property `name` of this prim, strongest
+    /// first (the property stack of C++ `PcpCache::ComputePropertyIndex`).
+    pub fn property_stack(&self, name: impl Into<Token>) -> Result<Vec<SpecSite>> {
+        let path = self.property_path(name);
+        Ok(self.stage.opinions(&path, |g, c| c.property_stack(g, &path, None))?)
+    }
+
+    /// The spec type of the strongest spec of the property `name`, or `None`
+    /// when no layer authors it.
+    pub fn property_type(&self, name: impl Into<Token>) -> Result<Option<sdf::SpecType>> {
+        let path = self.property_path(name);
+        Ok(self.stage.opinions(&path, |g, c| c.spec_type(g, &path))?)
+    }
+
+    /// Composes the target paths of the relationship `name` together with the
+    /// paths its list-op deletes, as `(targets, deleted)` (C++
+    /// `PcpCache::ComputeRelationshipTargetPaths`).
+    pub fn relationship_target_paths(&self, name: impl Into<Token>) -> Result<(Vec<sdf::Path>, Vec<sdf::Path>)> {
+        let path = self.property_path(name);
+        Ok(self
+            .stage
+            .opinions(&path, |g, c| c.compute_relationship_target_paths(g, &path))?)
+    }
+
+    /// Composes the connection paths of the attribute `name` together with the
+    /// paths its list-op deletes, as `(connections, deleted)` (C++
+    /// `PcpCache::ComputeAttributeConnectionPaths`).
+    pub fn attribute_connection_paths(&self, name: impl Into<Token>) -> Result<(Vec<sdf::Path>, Vec<sdf::Path>)> {
+        let path = self.property_path(name);
+        Ok(self
+            .stage
+            .opinions(&path, |g, c| c.compute_attribute_connection_paths(g, &path))?)
+    }
+
+    /// The path of the property `name` on this prim, or the empty path for an
+    /// invalid name, which composes nothing.
+    fn property_path(&self, name: impl Into<Token>) -> sdf::Path {
+        self.path.append_property(name).unwrap_or_default()
+    }
+
+    /// Composes the names of the properties this prim's layers author, in the
+    /// order composition folds them (C++
+    /// `PcpPrimIndex::ComputePrimPropertyNames`). The prim's `propertyOrder`
+    /// plays no part in composing them; [`Prim::authored_property_names`]
+    /// applies it.
+    pub fn property_names(&self) -> Result<Vec<Token>> {
+        Ok(self
+            .stage
+            .opinions(&self.path, |g, c| c.prim_properties(g, &self.path))?)
+    }
+}
+
+/// The variant sets composed onto a prim. Mirrors C++ `UsdVariantSets`,
+/// reached through [`Prim::variant_sets`].
+#[derive(Clone)]
+pub struct VariantSets {
+    prim: Prim,
+}
+
+/// One variant set of a prim, by name. Mirrors C++ `UsdVariantSet`, reached
+/// through [`Prim::variant_set`] and [`VariantSets::get`].
+#[derive(Clone)]
+pub struct VariantSet {
+    prim: Prim,
+    name: String,
+}
+
+impl VariantSets {
+    /// Returns the variant selections composition made for the prim, as
+    /// `(set, selection)` pairs sorted by set name: authored, fallback, or
+    /// default, one per set that grafted a variant.
+    // TODO: C++ `UsdVariantSets::GetAllVariantSelections` answers the
+    // strongest authored selection of every set over the prim's nodes (C++
+    // `PcpComposeSiteVariantSelections`), dangling ones included, which needs
+    // a per-node selection read in `PrimIndex`.
+    pub fn selections(&self) -> Result<Vec<(String, String)>> {
+        let path = self.prim.path();
+        Ok(self
+            .prim
+            .stage
+            .masked_opinions(path, |g, c| c.variant_selections(g, path))?)
+    }
+
+    /// The variant set `name` of the prim, whether or not the prim declares it
+    /// (C++ `UsdVariantSets::GetVariantSet`).
+    pub fn get(&self, name: impl Into<String>) -> VariantSet {
+        self.prim.variant_set(name)
+    }
+
+    /// Declare variant set `name` on the edit target, at `position` in the
+    /// prim's `variantSetNames`, and create its spec (C++
+    /// `UsdVariantSets::AddVariantSet`).
+    pub fn add(&self, name: impl Into<String>, position: ListPosition) -> Result<VariantSet, StageAuthoringError> {
+        let set = self.get(name);
+        set.declare(position, None)?;
+        Ok(set)
+    }
+
+    /// The variant sets the prim declares, in composed order (C++
+    /// `UsdVariantSets::GetNames`).
+    pub fn names(&self) -> Result<Vec<String>> {
+        let path = self.prim.path();
+        Ok(self
+            .prim
+            .stage
+            .masked_opinions(path, |g, c| c.variant_set_names(g, path))?)
+    }
+
+    /// Whether the prim declares variant set `name` (C++
+    /// `UsdVariantSets::HasVariantSet`).
+    pub fn contains(&self, name: &str) -> Result<bool> {
+        Ok(self.names()?.iter().any(|set| set == name))
+    }
+
+    /// Select `selection` in variant set `set` on the edit target (C++
+    /// `UsdVariantSets::SetSelection`).
+    pub fn set_selection(&self, set: impl Into<String>, selection: &str) -> Result<(), StageAuthoringError> {
+        self.get(set).set_selection(selection)
+    }
+}
+
+impl VariantSet {
+    /// The prim the variant set belongs to.
+    pub fn prim(&self) -> &Prim {
+        &self.prim
+    }
+
+    /// The variant set's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Put the set at `position` in the edit target's `variantSetNames`, a set
+    /// listed there already moving to it, and create variant `name`, both on
+    /// the prim's spec there (C++ `UsdVariantSet::AddVariant`).
+    pub fn add_variant(&self, name: &str, position: ListPosition) -> Result<(), StageAuthoringError> {
+        self.declare(position, Some(name))
+    }
+
+    /// The variants the set holds across the prim's composition, sorted (C++
+    /// `UsdVariantSet::GetVariantNames`).
+    pub fn names(&self) -> Result<Vec<String>> {
+        let path = self.prim.path();
+        Ok(self
+            .prim
+            .stage
+            .masked_opinions(path, |g, c| c.variant_names(g, path, &self.name))?)
+    }
+
+    /// The variant composition selects, authored or a fallback, or `None`
+    /// where it selects none (C++ `UsdVariantSet::GetVariantSelection`).
+    pub fn selection(&self) -> Result<Option<String>> {
+        Ok(self.composed_selection()?)
+    }
+
+    /// Select `selection` on the edit target (C++
+    /// `UsdVariantSet::SetVariantSelection`). The empty name is
+    /// [`sdf::AuthoringError::EmptyVariantSelection`], where C++ clears the
+    /// selection: that is [`clear_selection`](Self::clear_selection)'s.
+    pub fn set_selection(&self, selection: &str) -> Result<(), StageAuthoringError> {
+        self.prim
+            .clone()
+            .edit(|spec| Ok(spec.set_variant_selection(&self.name, selection)?))?;
+        Ok(())
+    }
+
+    /// Drop the edit target's selection, so a weaker one composes (C++
+    /// `UsdVariantSet::ClearVariantSelection`).
+    pub fn clear_selection(&self) -> Result<(), StageAuthoringError> {
+        self.prim
+            .clone()
+            .edit(|spec| Ok(spec.clear_variant_selection(&self.name)?))?;
+        Ok(())
+    }
+
+    /// Select no variant on the edit target, hiding weaker selections (C++
+    /// `UsdVariantSet::BlockVariantSelection`).
+    pub fn block_selection(&self) -> Result<(), StageAuthoringError> {
+        self.prim
+            .clone()
+            .edit(|spec| Ok(spec.block_variant_selection(&self.name)?))?;
+        Ok(())
+    }
+
+    /// The edit target that authors inside the selected variant, on `layer`,
+    /// a local layer of the stage, or the current edit target's layer where it
+    /// is `None` (C++ `UsdVariantSet::GetVariantEditTarget`). The prim's path
+    /// maps through the current edit target, as C++ maps it.
+    ///
+    /// A set that selects no variant is
+    /// [`StageAuthoringError::NoVariantSelection`], and a layer that is not
+    /// local [`StageAuthoringError::LayerNotFound`], where C++ answers an
+    /// invalid target.
+    pub fn edit_target(&self, layer: Option<&str>) -> Result<EditTarget, StageAuthoringError> {
+        let Some(selection) = self.composed_selection()? else {
+            return Err(StageAuthoringError::NoVariantSelection {
+                prim: self.prim.path().clone(),
+                set: self.name.clone(),
+            });
+        };
+        let stage = &self.prim.stage;
+        let current = stage.edit_target();
+        let requested = layer.unwrap_or(current.layer_identifier());
+        // The local layer's own identifier, whichever spelling named it.
+        let local = stage
+            .edit_target_for_local_layer(requested)
+            .ok_or_else(|| StageAuthoringError::LayerNotFound {
+                layer: requested.to_string(),
+            })?;
+        let spec =
+            current
+                .map_to_spec_path(self.prim.path())
+                .ok_or_else(|| StageAuthoringError::OutsideEditTarget {
+                    path: self.prim.path().clone(),
+                })?;
+        Ok(EditTarget::for_local_direct_variant(
+            local.layer_identifier(),
+            spec.append_variant_selection(&self.name, &selection)?,
+        )?)
+    }
+
+    /// The variant composition selects, or `None` where it selects none.
+    fn composed_selection(&self) -> Result<Option<String>, pcp::QueryError> {
+        let path = self.prim.path();
+        self.prim
+            .stage
+            .masked_opinions(path, |g, c| c.variant_selection(g, path, &self.name))
+    }
+
+    /// List the set in the edit target's `variantSetNames` at `position` and
+    /// create its spec, with the spec of `variant` in it where one is named
+    /// (C++ `UsdVariantSet::_AddVariantSet`).
+    fn declare(&self, position: ListPosition, variant: Option<&str>) -> Result<(), StageAuthoringError> {
+        self.prim.clone().edit(|spec| {
+            spec.add_variant_set(&self.name)?;
+            spec.edit_list(sdf::FieldKey::VariantSetNames, |names| {
+                list_edit::insert(names, self.name.clone(), position);
+            })?;
+            if let Some(variant) = variant {
+                spec.add_variant(&self.name, variant)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+/// The prims a walk yields, each before the prims beneath it (C++
+/// `UsdPrimRange`): those beneath a prim, from
+/// [`Prim::filtered_descendants`], or a prim and those beneath it, from
+/// [`Prim::filtered_subtree`].
+///
+/// A prim's children are listed when the walk steps past it. A walk that
+/// stops at a prim lists nothing beneath it, and
+/// [`prune_children`](Self::prune_children) before the step leaves them
+/// out. A listing that fails is the walk's last item.
+pub struct PrimRange {
+    predicate: PrimPredicate,
+    /// The prims still to walk, the next one last, each with the status it
+    /// composed when it was listed.
+    stack: Vec<(Prim, ComposedStatus)>,
+    /// The prim last yielded, whose children the next step lists, until
+    /// pruned.
+    pending: Option<(Prim, ComposedStatus)>,
+}
+
+impl PrimRange {
+    /// Leave out the prims beneath the prim just yielded (C++
+    /// `UsdPrimRange::iterator::PruneChildren`). Before the first step, or
+    /// again after pruning, there is nothing to leave out.
+    ///
+    /// ```
+    /// use openusd::usd::{self, PrimPredicate};
+    ///
+    /// let stage = usd::Stage::builder().in_memory("scene.usda")?;
+    /// stage.define_prim("/World")?;
+    /// stage.define_prim("/World/Set")?;
+    /// stage.define_prim("/World/Set/Chair")?;
+    /// stage.define_prim("/World/Cast")?;
+    ///
+    /// let mut walk = stage.prim("/World")?.filtered_descendants(PrimPredicate::DEFAULT)?;
+    /// let mut paths = Vec::new();
+    /// while let Some(prim) = walk.next() {
+    ///     let prim = prim?;
+    ///     if prim.path().as_str() == "/World/Set" {
+    ///         walk.prune_children();
+    ///     }
+    ///     paths.push(prim.path().to_string());
+    /// }
+    /// assert_eq!(paths, ["/World/Set", "/World/Cast"]);
+    /// # Ok::<(), openusd::Error>(())
+    /// ```
+    pub fn prune_children(&mut self) {
+        self.pending = None;
+    }
+}
+
+impl Iterator for PrimRange {
+    type Item = Result<Prim>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((prim, composed)) = self.pending.take() {
+            match prim.stage.filtered_children(&prim.path, self.predicate, Some(composed)) {
+                Ok(children) => self.stack.extend(children.into_iter().rev()),
+                Err(error) => {
+                    self.stack.clear();
+                    return Some(Err(error));
+                }
+            }
+        }
+        let (prim, composed) = self.stack.pop()?;
+        self.pending = Some((prim.clone(), composed));
+        Some(Ok(prim))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vt;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::sync::Arc;
+
+    use crate::Result;
+
+    use crate::sdf;
+    use crate::tf::Token;
+    use crate::usd::stage::tests::stage;
+    use crate::usd::{
+        ApplyApiError, Attribute, Object, PrimPredicate, PrimRange, PrimStatus, Relationship, SchemaRegistry, Stage,
+        StageAuthoringError, VersionFilter,
+    };
+
+    /// A stage over the shared test schema family, so prim definitions have
+    /// something to resolve against.
+    fn schema_stage() -> Result<Stage> {
+        Stage::builder()
+            .schema_registry(SchemaRegistry::test_registry())
+            .in_memory("anon.usda")
+    }
+
+    /// Pruning leaves out what is beneath the prim just yielded and keeps
+    /// its siblings; before the first step, or twice over, it is nothing.
+    #[test]
+    fn prune_descendants() -> Result<()> {
+        let stage = stage()?;
+        for path in ["/A", "/A/Pruned", "/A/Pruned/Under", "/A/Kept", "/A/Kept/Leaf"] {
+            stage.define_prim(path)?;
+        }
+        let mut walk = stage.prim("/A")?.filtered_descendants(PrimPredicate::DEFAULT)?;
+        walk.prune_children();
+        let mut paths = Vec::new();
+        while let Some(prim) = walk.next() {
+            let prim = prim?;
+            if prim.path().as_str() == "/A/Pruned" {
+                walk.prune_children();
+                walk.prune_children();
+            }
+            paths.push(prim.path().to_string());
+        }
+        assert_eq!(paths, ["/A/Pruned", "/A/Kept", "/A/Kept/Leaf"]);
+        Ok(())
+    }
+
+    /// A pruned prim's children are never listed: a child whose reference
+    /// would load a second layer leaves that layer unloaded until something
+    /// lists it.
+    #[test]
+    fn prune_skips_listing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("ref.usda"), "#usda 1.0\ndef \"Ref\" {}\n")?;
+        fs::write(
+            dir.path().join("root.usda"),
+            "#usda 1.0\ndef \"A\" {\n    def \"Pruned\" {\n        def \"Child\" (references = @./ref.usda@</Ref>) {}\n    }\n    def \"Kept\" {}\n}\n",
+        )?;
+        let root = dir.path().join("root.usda");
+        let stage = Stage::open(root.to_str().expect("utf-8 path"))?;
+
+        let mut walk = stage.prim("/A")?.filtered_descendants(PrimPredicate::DEFAULT)?;
+        let mut paths = Vec::new();
+        while let Some(prim) = walk.next() {
+            let prim = prim?;
+            if prim.path().as_str() == "/A/Pruned" {
+                walk.prune_children();
+            }
+            paths.push(prim.path().to_string());
+        }
+        assert_eq!(paths, ["/A/Pruned", "/A/Kept"]);
+        assert!(
+            stage.layers().find_by_leaf("ref.usda").is_none(),
+            "the pruned prim's children were never listed"
+        );
+        stage.prim("/A/Pruned")?.filtered_children(PrimPredicate::DEFAULT)?;
+        assert!(
+            stage.layers().find_by_leaf("ref.usda").is_some(),
+            "premise: listing them loads the child's reference"
+        );
+        Ok(())
+    }
+
+    /// A subtree walk yields the prim first and prunes beneath it like any
+    /// other, and is empty where the prim does not match the predicate.
+    #[test]
+    fn filtered_subtree() -> Result<()> {
+        let stage = stage()?;
+        for path in ["/A", "/A/B", "/A/B/C", "/A/D"] {
+            stage.define_prim(path)?;
+        }
+        let a = stage.prim("/A")?;
+        let paths =
+            |walk: PrimRange| -> Result<Vec<String>> { walk.map(|prim| Ok(prim?.path().to_string())).collect() };
+        assert_eq!(
+            paths(a.filtered_subtree(PrimPredicate::DEFAULT)?)?,
+            ["/A", "/A/B", "/A/B/C", "/A/D"]
+        );
+
+        let mut walk = a.filtered_subtree(PrimPredicate::DEFAULT)?;
+        assert_eq!(walk.next().expect("the prim itself")?, a);
+        walk.prune_children();
+        assert!(walk.next().is_none());
+
+        a.clone().set_active(false)?;
+        assert_eq!(
+            paths(a.filtered_subtree(PrimPredicate::DEFAULT)?)?,
+            Vec::<String>::new()
+        );
+        // An inactive prim matches every prim, and has nothing beneath it.
+        assert_eq!(paths(a.filtered_subtree(PrimPredicate::ALL)?)?, ["/A"]);
+
+        // A prim nothing composes heads no walk, and the pseudo-root heads
+        // its own as the model it is.
+        assert_eq!(
+            paths(stage.prim("/Nope")?.filtered_subtree(PrimPredicate::ALL)?)?,
+            Vec::<String>::new()
+        );
+        let models = PrimPredicate::new(PrimStatus::MODEL, PrimStatus::empty());
+        assert_eq!(paths(stage.prim("/")?.filtered_subtree(models)?)?, ["/"]);
+        Ok(())
+    }
+
+    /// A prim is its stage instance and path: the same path on another stage
+    /// is a different prim, and two handles to one prim are one key.
+    #[test]
+    fn prim_identity() -> Result<()> {
+        let (one, other) = (stage()?, stage()?);
+        one.define_prim("/A")?;
+        other.define_prim("/A")?;
+
+        assert_eq!(one.prim("/A")?, one.prim("/A")?);
+        assert_ne!(one.prim("/A")?, other.prim("/A")?, "same path, different stage");
+        assert_ne!(one.prim("/A")?, one.prim("/B")?);
+
+        let keys: HashSet<_> = [one.prim("/A")?, one.prim("/A")?, other.prim("/A")?]
+            .into_iter()
+            .collect();
+        assert_eq!(keys.len(), 2);
+        Ok(())
+    }
+
+    /// A prim's ancestors are itself and the prims above it, nearest first,
+    /// the pseudo-root left out.
+    #[test]
+    fn prim_ancestors() -> Result<()> {
+        let stage = stage()?;
+        let child = stage.define_prim("/A/B")?;
+        let names: Vec<String> = child.ancestors().map(|prim| prim.path().to_string()).collect();
+        assert_eq!(names, ["/A/B", "/A"]);
+        assert_eq!(stage.prim("/")?.ancestors().count(), 0);
+        Ok(())
+    }
+
+    /// A prim's parent is the next prim up on the same stage, up to the
+    /// pseudo-root, which has none.
+    #[test]
+    fn prim_parent() -> Result<()> {
+        let stage = stage()?;
+        let child = stage.define_prim("/A/B")?;
+        let parent = child.parent().expect("/A/B has a parent");
+        assert_eq!(parent, stage.prim("/A")?);
+        let root = parent.parent().expect("/A has the pseudo-root");
+        assert!(root.path().is_abs_root());
+        assert_eq!(root.parent(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn prim_type_info_is_shared() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/A")?.set_type_name("DistantLight")?;
+        stage.define_prim("/B")?.set_type_name("DistantLight")?;
+        stage.define_prim("/C")?.set_type_name("DomeLight_1")?;
+
+        // Two prims of the same type share one composed definition; a different
+        // type gets its own.
+        let a = stage.prim("/A")?.prim_type_info()?;
+        let b = stage.prim("/B")?.prim_type_info()?;
+        let c = stage.prim("/C")?.prim_type_info()?;
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+
+        assert_eq!(
+            a.prim_definition().attribute_fallback(&Token::new("inputs:intensity")),
+            Some(vt::Value::Float(50000.0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prim_type_info_follows_edits() -> Result<()> {
+        let stage = schema_stage()?;
+        let prim = stage.define_prim("/Light")?;
+        assert!(prim.prim_definition()?.is_empty());
+
+        let prim = prim.set_type_name("DistantLight")?;
+        assert!(prim.prim_definition()?.has_property(&Token::new("inputs:angle")));
+
+        // Applying a schema recomposes the definition on the next read.
+        let prim = prim.add_applied_schema("CollectionAPI:render")?;
+        let definition = prim.prim_definition()?;
+        assert_eq!(
+            definition.attribute_fallback(&Token::new("collection:render:expansionRule")),
+            Some(vt::Value::token("expandPrims"))
+        );
+        assert_eq!(
+            prim.prim_type_info()?.id().applied_api_schemas(),
+            [Token::new("CollectionAPI:render")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_properties_are_enumerated() -> Result<()> {
+        let stage = schema_stage()?;
+        let prim = stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        prim.create_attribute("authored", "double")?;
+
+        // Authored and declared names sort together, and a property appears
+        // once whether or not it is authored.
+        let names = stage.prim("/Sun")?.property_names()?;
+        assert_eq!(
+            names,
+            [
+                Token::new("authored"),
+                Token::new("collection:lightLink:expansionRule"),
+                Token::new("collection:lightLink:includeRoot"),
+                Token::new("collection:lightLink:includes"),
+                Token::new("inputs:angle"),
+                Token::new("inputs:intensity"),
+                Token::new("light:shaderId"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_properties_split_by_kind() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // A property with no authored spec still sorts into attributes or
+        // relationships by what the schema declares it to be.
+        let attributes = stage.prim("/Sun")?.attributes()?;
+        let names: Vec<&str> = attributes.iter().map(|attr| attr.path().as_str()).collect();
+        assert!(names.contains(&"/Sun.inputs:intensity"), "{names:?}");
+        assert!(!names.iter().any(|name| name.ends_with("includes")), "{names:?}");
+
+        let relationships = stage.prim("/Sun")?.relationships()?;
+        assert_eq!(relationships.len(), 1);
+        assert!(
+            relationships[0]
+                .path()
+                .as_str()
+                .ends_with("collection:lightLink:includes")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authored_properties_by_kind() -> Result<()> {
+        let stage = schema_stage()?;
+        let prim = stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        prim.create_attribute("authored", "double")?;
+        prim.create_relationship("authoredRel")?;
+
+        // Only what a layer wrote, unlike `attributes` / `relationships`, which
+        // also report every property the schema declares.
+        let attributes = prim.authored_attributes()?;
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].path().as_str(), "/Sun.authored");
+
+        let relationships = prim.authored_relationships()?;
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].path().as_str(), "/Sun.authoredRel");
+
+        // One pass answers both kinds, in the same order.
+        let (both_attributes, both_relationships) = prim.authored_properties()?;
+        let attribute_paths = |attrs: &[Attribute]| attrs.iter().map(|attr| attr.path().clone()).collect::<Vec<_>>();
+        let relationship_paths = |rels: &[Relationship]| rels.iter().map(|rel| rel.path().clone()).collect::<Vec<_>>();
+        assert_eq!(attribute_paths(&both_attributes), attribute_paths(&attributes));
+        assert_eq!(
+            relationship_paths(&both_relationships),
+            relationship_paths(&relationships)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enumeration_ignores_unknown_schemas() -> Result<()> {
+        let stage = stage()?;
+        let prim = stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        prim.create_attribute("authored", "double")?;
+
+        // The default registry knows no schemas, so only authored properties
+        // are enumerated.
+        assert_eq!(stage.prim("/Sun")?.property_names()?, [Token::new("authored")]);
+        Ok(())
+    }
+
+    /// The session layer's `fallbackPrimTypes` maps a type too, as C++
+    /// `UsdStage::GetMetadata` composes it over the root layer's.
+    #[test]
+    fn session_fallback_type() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root.usda");
+        fs::write(&root, "#usda 1.0\n\ndef MyStudioLight \"Sun\"\n{\n}\n")?;
+        let session = dir.path().join("session.usda");
+        fs::write(
+            &session,
+            "#usda 1.0\n(\n    fallbackPrimTypes = {\n        token[] MyStudioLight = [\"DistantLight\"]\n    }\n)\n",
+        )?;
+        let stage = Stage::builder()
+            .schema_registry(SchemaRegistry::test_registry())
+            .session_layer(session.to_str().expect("utf-8 temp path"))
+            .open(root.to_str().expect("utf-8 temp path"))?;
+        assert!(!stage.prim("/Sun")?.prim_definition()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_prim_type() -> Result<()> {
+        let stage = Stage::builder()
+            .schema_registry(SchemaRegistry::test_registry())
+            .in_memory("anon.usda")?;
+        stage.define_prim("/Sun")?.set_type_name("MyStudioLight")?;
+
+        // No registry knows `MyStudioLight`, so it resolves nothing on its own.
+        assert!(stage.prim("/Sun")?.prim_definition()?.is_empty());
+
+        {
+            let root = stage.root_layer();
+            root.edit(|e| {
+                e.pseudo_root_mut().unwrap().set(
+                    "fallbackPrimTypes",
+                    vt::Value::Dictionary(vt::Dictionary::from([(
+                        "MyStudioLight".to_owned(),
+                        vt::Value::token_vec(["Unregistered", "DistantLight"]),
+                    )])),
+                );
+                Ok(())
+            })?;
+        }
+
+        // The first registered fallback supplies the definition, while the
+        // prim's own `typeName` still reads back as authored.
+        let prim = stage.prim("/Sun")?;
+        assert_eq!(prim.type_name()?, Some(Token::new("MyStudioLight")));
+        assert_eq!(
+            prim.prim_definition()?
+                .attribute_fallback(&Token::new("inputs:intensity")),
+            Some(vt::Value::Float(50000.0))
+        );
+
+        // An `IsA` query answers for the type it resolved to. The authored name
+        // is not a schema, so nothing is it.
+        assert!(prim.is_a("DistantLight")?);
+        assert!(prim.is_a("Typed")?);
+        assert!(!prim.is_a("MyStudioLight")?);
+        Ok(())
+    }
+
+    #[test]
+    fn typeless_prim_has_empty_definition() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Plain")?;
+
+        let info = stage.prim("/Plain")?.prim_type_info()?;
+        assert!(info.id().is_empty());
+        assert!(Arc::ptr_eq(&info, stage.schema_registry().empty_prim_type_info()));
+        Ok(())
+    }
+
+    #[test]
+    fn type_identity_without_definitions() -> Result<()> {
+        let stage = stage()?;
+        stage
+            .define_prim("/Sun")?
+            .set_type_name("DistantLight")?
+            .add_applied_schema("UnknownAPI:render")?;
+
+        // A registry knowing neither name means an empty *definition*, not an
+        // empty identity — two unrelated types must not share one.
+        let sun = stage.prim("/Sun")?.prim_type_info()?;
+        assert_eq!(sun.id().type_name(), &Token::new("DistantLight"));
+        assert_eq!(sun.id().applied_api_schemas(), [Token::new("UnknownAPI:render")]);
+        assert!(sun.prim_definition().is_empty());
+
+        stage.define_prim("/Ball")?.set_type_name("Sphere")?;
+        assert!(!Arc::ptr_eq(&sun, &stage.prim("/Ball")?.prim_type_info()?));
+        Ok(())
+    }
+
+    #[test]
+    fn is_a_base_chain() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        let sun = stage.prim("/Sun")?;
+        assert!(sun.is_a("DistantLight")?);
+        assert!(sun.is_a("NonboundableLightBase")?);
+        assert!(sun.is_a("Typed")?);
+        assert!(!sun.is_a("DomeLight_1")?);
+        Ok(())
+    }
+
+    #[test]
+    fn is_a_needs_schema_data() -> Result<()> {
+        let stage = stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // Nothing is registered, so `DistantLight` names no schema and the prim
+        // is not it. The typed views keep resolving because their gate checks
+        // the authored name before asking this question.
+        let sun = stage.prim("/Sun")?;
+        assert!(!sun.is_a("DistantLight")?);
+        assert!(!sun.is_a("Typed")?);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_api_checks_kind() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // A multiple-apply schema applies per instance; a single-apply one
+        // applies whole. Getting that wrong is refused before anything is
+        // authored.
+        let missing = stage.prim("/Sun")?.apply_api("CollectionAPI").expect_err("rejected");
+        assert!(matches!(
+            missing,
+            StageAuthoringError::Schema(ApplyApiError::MissingInstanceName { .. })
+        ));
+        let unexpected = stage.prim("/Sun")?.apply_api("LightAPI:extra").expect_err("rejected");
+        assert!(matches!(
+            unexpected,
+            StageAuthoringError::Schema(ApplyApiError::UnexpectedInstanceName { .. })
+        ));
+        let typed = stage.prim("/Sun")?.apply_api("DistantLight").expect_err("rejected");
+        assert!(matches!(
+            typed,
+            StageAuthoringError::Schema(ApplyApiError::NotAppliedApi { .. })
+        ));
+        assert!(stage.prim("/Sun")?.authored_api_schemas()?.is_empty());
+
+        // The well-formed spellings author.
+        stage.prim("/Sun")?.apply_api("LightAPI")?;
+        stage.prim("/Sun")?.apply_api("CollectionAPI:render")?;
+        assert_eq!(
+            stage.prim("/Sun")?.authored_api_schemas()?,
+            [Token::new("LightAPI"), Token::new("CollectionAPI:render")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_api_unknown_schema() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // A name the registry does not know carries no rules to break.
+        stage.prim("/Sun")?.apply_api("SomeUnregisteredAPI")?;
+        stage.prim("/Sun")?.can_apply_api("SomeUnregisteredAPI")?;
+        assert!(stage.prim("/Sun")?.has_api_schema("SomeUnregisteredAPI")?);
+        Ok(())
+    }
+
+    #[test]
+    fn can_apply_api_restrictions() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        stage.define_prim("/Plain")?.set_type_name("DomeLight_1")?;
+
+        // `LightAPI` declares `apiSchemaCanOnlyApplyTo = ["DistantLight"]`.
+        stage.prim("/Sun")?.can_apply_api("LightAPI")?;
+        let wrong_type = stage.prim("/Plain")?.can_apply_api("LightAPI").unwrap_err();
+        assert!(matches!(wrong_type, ApplyApiError::PrimTypeNotAllowed { .. }));
+
+        // `SlotAPI` restricts itself to `NonboundableLightBase`, which `/Sun`
+        // is not by name — it is a `DistantLight` deriving from it, so the
+        // check runs through `is_a` rather than comparing type names. It also
+        // restricts its instance names.
+        stage.prim("/Sun")?.can_apply_api("SlotAPI:left")?;
+        let wrong_instance = stage.prim("/Sun")?.can_apply_api("SlotAPI:middle").unwrap_err();
+        assert!(matches!(wrong_instance, ApplyApiError::InstanceNameNotAllowed { .. }));
+
+        // The restrictions are advisory: `apply_api` authors regardless, as
+        // C++ `ApplyAPI` does — the schema-wide one and an instance's alike.
+        stage.prim("/Plain")?.apply_api("LightAPI")?;
+        assert!(stage.prim("/Plain")?.has_api_schema("LightAPI")?);
+        stage.prim("/Sun")?.apply_api("SlotAPI:right")?;
+        assert!(stage.prim("/Sun")?.has_api_schema("SlotAPI:right")?);
+        Ok(())
+    }
+
+    #[test]
+    fn instance_restriction_wins() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        stage.define_prim("/Dome")?.set_type_name("DomeLight")?;
+
+        // `SlotAPI:right` narrows the schema-wide `NonboundableLightBase` to
+        // `DomeLight`, so the instance's list is the one that answers;
+        // `SlotAPI:left` lists nothing of its own and keeps the schema-wide one.
+        stage.prim("/Dome")?.can_apply_api("SlotAPI:right")?;
+        let err = stage.prim("/Sun")?.can_apply_api("SlotAPI:right").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApplyApiError::PrimTypeNotAllowed { ref schema, ref allowed }
+                    if schema.as_str() == "SlotAPI:right" && allowed == &[Token::new("DomeLight")]
+            ),
+            "{err:?}"
+        );
+        stage.prim("/Sun")?.can_apply_api("SlotAPI:left")?;
+        Ok(())
+    }
+
+    #[test]
+    fn edits_author_over() -> Result<()> {
+        let stage = schema_stage()?;
+        let mut weaker = sdf::Layer::new_in_memory("weaker.usda");
+        weaker.edit(|edit| {
+            sdf::PrimSpec::new(edit.data_mut(), "/Sun", sdf::Specifier::Def, "DistantLight").expect("prim spec");
+            Ok(())
+        })?;
+        let root = stage.root_layer().identifier().to_string();
+        stage.insert_layer(&root, 0, weaker, sdf::LayerOffset::IDENTITY)?;
+
+        // The prim exists only on the weaker layer; applying a schema and
+        // setting a field both author an `over` on the edit target (the root
+        // layer) carrying the opinion.
+        stage.prim("/Sun")?.apply_api("LightAPI")?.set_kind("component")?;
+        assert!(stage.prim("/Sun")?.has_api_schema("LightAPI")?);
+        assert_eq!(stage.prim("/Sun")?.kind()?.as_deref(), Some("component"));
+        let over = stage.root_layer().prim("/Sun")?.expect("an over on the edit target");
+        assert_eq!(over.specifier()?, Some(sdf::Specifier::Over));
+        assert_eq!(over.type_name()?, None, "the over adds no type of its own");
+        assert_eq!(over.kind()?.as_deref(), Some("component"));
+        Ok(())
+    }
+
+    #[test]
+    fn is_in_family_versions() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Old")?.set_type_name("DomeLight")?;
+        stage.define_prim("/New")?.set_type_name("DomeLight_1")?;
+
+        // Either version answers for the family, which is the point of asking
+        // by family rather than by identifier.
+        let family = Token::new("DomeLight");
+        assert!(stage.prim("/Old")?.is_in_family(&family, VersionFilter::All)?);
+        assert!(stage.prim("/New")?.is_in_family(&family, VersionFilter::All)?);
+        assert_eq!(
+            stage.prim("/Old")?.version_in_family(&family, VersionFilter::All)?,
+            Some(0)
+        );
+        assert_eq!(
+            stage.prim("/New")?.version_in_family(&family, VersionFilter::All)?,
+            Some(1)
+        );
+
+        // The filter narrows which versions count.
+        assert!(
+            !stage
+                .prim("/Old")?
+                .is_in_family(&family, VersionFilter::GreaterThan(0))?
+        );
+        assert!(
+            stage
+                .prim("/New")?
+                .is_in_family(&family, VersionFilter::GreaterThan(0))?
+        );
+
+        // A prim of another family is in none of it.
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        assert!(!stage.prim("/Sun")?.is_in_family(&family, VersionFilter::All)?);
+        Ok(())
+    }
+
+    #[test]
+    fn instances_per_schema() -> Result<()> {
+        let stage = schema_stage()?;
+        stage
+            .define_prim("/W")?
+            .add_applied_schema("CollectionAPI:render")?
+            .add_applied_schema("CollectionAPI:proxy")?
+            .add_applied_schema("CollectionAPI:")?; // names no instance
+
+        // The instances of the named schema, in `api_schemas` order.
+        assert_eq!(
+            stage.prim("/W")?.api_schema_instance_names("CollectionAPI")?,
+            vec![Token::new("render"), Token::new("proxy")]
+        );
+
+        // A built-in application is an instance like any authored one, and the
+        // single-apply schema that brings it in names none of its own.
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+        let sun = stage.prim("/Sun")?;
+        assert_eq!(
+            sun.api_schema_instance_names("CollectionAPI")?,
+            vec![Token::new("lightLink")]
+        );
+        assert!(sun.api_schema_instance_names("LightAPI")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn has_api_in_family_instance() -> Result<()> {
+        let stage = schema_stage()?;
+        stage
+            .define_prim("/Sun")?
+            .set_type_name("DistantLight")?
+            .apply_api("CollectionAPI:render")?;
+
+        // Any instance answers for the family; a named one has to match. Both
+        // the instance the prim applies and the `lightLink` one it inherits
+        // through `LightAPI` count, and nothing else does.
+        let family = Token::new("CollectionAPI");
+        let render = Token::new("render");
+        assert!(
+            stage
+                .prim("/Sun")?
+                .has_api_in_family(&family, VersionFilter::All, None)?
+        );
+        assert!(
+            stage
+                .prim("/Sun")?
+                .has_api_in_family(&family, VersionFilter::All, Some(&render))?
+        );
+        assert!(
+            stage
+                .prim("/Sun")?
+                .has_api_in_family(&family, VersionFilter::All, Some(&Token::new("lightLink")))?
+        );
+        assert!(
+            !stage
+                .prim("/Sun")?
+                .has_api_in_family(&family, VersionFilter::All, Some(&Token::new("other")))?
+        );
+
+        // A single-apply schema is applied whole, so it has no instance to ask
+        // after. `LightAPI` is built in to `DistantLight`.
+        let light = Token::new("LightAPI");
+        assert_eq!(
+            stage
+                .prim("/Sun")?
+                .api_version_in_family(&light, VersionFilter::All, None)?,
+            Some(0)
+        );
+        assert!(
+            !stage
+                .prim("/Sun")?
+                .has_api_in_family(&light, VersionFilter::All, Some(&render))?
+        );
+
+        // Only an applied API schema is applied at all, so the prim's own typed
+        // family answers nothing here.
+        let typed = Token::new("DistantLight");
+        assert!(
+            !stage
+                .prim("/Sun")?
+                .has_api_in_family(&typed, VersionFilter::All, None)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn family_queries_without_registry() -> Result<()> {
+        // The core family declares neither name, so both are placed by their
+        // spelling alone.
+        let stage = stage()?;
+        stage
+            .define_prim("/New")?
+            .set_type_name("DomeLight_1")?
+            .add_applied_schema("CollectionAPI:render")?;
+
+        // The prim query and the views' gate place a prim the same way, so
+        // filtering a traversal cannot drop what a view would accept.
+        assert!(stage.prim("/New")?.is_in_family("DomeLight", VersionFilter::All)?);
+        assert_eq!(
+            stage.prim("/New")?.version_in_family("DomeLight", VersionFilter::All)?,
+            Some(1)
+        );
+        assert!(!stage.prim("/New")?.is_in_family("DistantLight", VersionFilter::All)?);
+
+        // An applied schema no registry knows was never composed, so it answers
+        // from what the prim authors — as `has_api_schema` does beside it.
+        let collection = Token::new("CollectionAPI");
+        let render = Token::new("render");
+        assert!(stage.prim("/New")?.has_api_schema("CollectionAPI:render")?);
+        assert!(
+            stage
+                .prim("/New")?
+                .has_api_in_family(&collection, VersionFilter::All, None)?
+        );
+        assert!(
+            stage
+                .prim("/New")?
+                .has_api_in_family(&collection, VersionFilter::All, Some(&render))?
+        );
+        assert!(
+            !stage
+                .prim("/New")?
+                .has_api_in_family(&collection, VersionFilter::All, Some(&Token::new("other")))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_family_rejected_version() -> Result<()> {
+        let stage = schema_stage()?;
+        // `DistantLight` builds in `LightAPI`, so authoring a second version of
+        // that family conflicts and composition keeps the built-in.
+        stage
+            .define_prim("/Sun")?
+            .set_type_name("DistantLight")?
+            .add_applied_schema("LightAPI_2")?;
+
+        let family = Token::new("LightAPI");
+        assert_eq!(
+            stage
+                .prim("/Sun")?
+                .api_version_in_family(&family, VersionFilter::All, None)?,
+            Some(0)
+        );
+        // The rejected version contributes nothing, so it answers for nothing.
+        assert!(
+            !stage
+                .prim("/Sun")?
+                .has_api_in_family(&family, VersionFilter::GreaterThan(0), None)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn can_apply_api_invalid_prim() -> Result<()> {
+        let stage = schema_stage()?;
+
+        // Nothing composes at the path, so there is nothing to apply to; the
+        // authoring entry points refuse alike and conjure no prim.
+        let missing = stage.prim("/Typo")?.can_apply_api("CollectionAPI:render").unwrap_err();
+        assert!(matches!(missing, ApplyApiError::PrimNotValid { .. }));
+        let missing = stage.prim("/Typo")?.apply_api("CollectionAPI:render").unwrap_err();
+        assert!(matches!(missing, StageAuthoringError::PrimNotValid { .. }));
+        let missing = stage.prim("/Typo")?.add_applied_schema("SomeAPI").unwrap_err();
+        assert!(matches!(missing, StageAuthoringError::PrimNotValid { .. }));
+        let missing = stage.prim("/Typo")?.set_kind("component").unwrap_err();
+        assert!(matches!(missing, StageAuthoringError::PrimNotValid { .. }));
+        let missing = stage.prim("/Typo")?.create_attribute("x", "float").unwrap_err();
+        assert!(matches!(missing, StageAuthoringError::PrimNotValid { .. }));
+        let missing = stage.prim("/Typo")?.create_relationship("r").unwrap_err();
+        assert!(matches!(missing, StageAuthoringError::PrimNotValid { .. }));
+        assert!(stage.root_layer().prim("/Typo")?.is_none(), "nothing was authored");
+        Ok(())
+    }
+
+    #[test]
+    fn can_apply_api_malformed_instance() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // An instance name becomes a namespace component of every property the
+        // schema instantiates, so one that cannot be spelled there is refused.
+        for name in [
+            "CollectionAPI:my instance",
+            "CollectionAPI:render:",
+            "CollectionAPI:1st",
+        ] {
+            let rejected = stage.prim("/Sun")?.can_apply_api(name).unwrap_err();
+            assert!(
+                matches!(rejected, ApplyApiError::InstanceNameNotAllowed { .. }),
+                "{name} rejected as {rejected:?}"
+            );
+        }
+
+        // A trailing delimiter names no instance at all, so a multiple-apply
+        // schema is left without the instance it requires.
+        let empty = stage.prim("/Sun")?.can_apply_api("CollectionAPI:").unwrap_err();
+        assert!(matches!(empty, ApplyApiError::MissingInstanceName { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_api_schemas_survive_a_known_one() -> Result<()> {
+        let stage = schema_stage()?;
+        stage
+            .define_prim("/Sun")?
+            .set_type_name("DistantLight")?
+            .add_applied_schema("Unregistered")?;
+
+        // Adding a schema the registry knows must not make an unknown one
+        // disappear: the built-ins come first, then what is authored on top.
+        let names = stage.prim("/Sun")?.api_schemas()?;
+        assert_eq!(
+            names,
+            [
+                Token::new("LightAPI"),
+                Token::new("CollectionAPI:lightLink"),
+                Token::new("Unregistered"),
+            ]
+        );
+        assert!(stage.prim("/Sun")?.has_api_schema("Unregistered")?);
+        assert!(stage.prim("/Sun")?.has_api_schema("LightAPI")?);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_relationship_is_uniform_and_not_custom() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // `rel collection:lightLink:includes` declares no variability, and a
+        // relationship is uniform.
+        let includes = stage.prim("/Sun")?.relationship("collection:lightLink:includes");
+        let definition = stage.prim("/Sun")?.prim_definition()?;
+        let declared = definition
+            .property(&Token::new("collection:lightLink:includes"))
+            .expect("includes");
+        assert_eq!(declared.variability(), sdf::Variability::Uniform);
+
+        // A schema declares it, so an authored `custom` is ignored.
+        includes.clone().set_custom(true)?;
+        assert!(
+            !stage
+                .prim("/Sun")?
+                .relationship("collection:lightLink:includes")
+                .is_custom()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_relationship_is_writable() -> Result<()> {
+        let stage = schema_stage()?;
+        stage.define_prim("/Sun")?.set_type_name("DistantLight")?;
+
+        // `collection:lightLink:includes` is declared by the schema alone, so
+        // authoring targets on it has to stamp the spec first.
+        let includes = stage
+            .prim("/Sun")?
+            .relationship("collection:lightLink:includes")
+            .set_targets(["/Sun"])?;
+        assert_eq!(includes.targets()?, vec![sdf::path("/Sun")?]);
+        Ok(())
+    }
+
+    #[test]
+    fn default_registry_core_only() -> Result<()> {
+        let stage = stage()?;
+        stage.define_prim("/Light")?.set_type_name("DistantLight")?;
+
+        // The process registry carries the core `usd` family alone, so a type
+        // a domain family owns resolves to an empty definition.
+        assert!(stage.prim("/Light")?.prim_definition()?.is_empty());
+        Ok(())
+    }
+
+    /// Handles own a refcounted [`Stage`], so they can be collected and
+    /// queried after the expression — and even the original `Stage`
+    /// binding — that produced them is gone. The `'s` borrow used to forbid
+    /// this.
+    #[test]
+    fn handles_outlive_stage() -> Result<()> {
+        let prims: Vec<super::Prim> = {
+            let stage = stage()?;
+            stage.define_prim("/A")?.set_type_name("Xform")?;
+            stage.define_prim("/B")?.set_type_name("Scope")?;
+            vec![stage.prim("/A")?, stage.prim("/B")?]
+            // `stage` is dropped here; each handle's cloned `Rc` keeps the
+            // shared state alive.
+        };
+
+        assert_eq!(prims[0].path().as_str(), "/A");
+        let type_name = prims[1].stage().prim(prims[1].path())?.type_name()?;
+        assert_eq!(type_name.as_deref(), Some("Scope"));
+        Ok(())
+    }
+
+    /// `Prim::has_clips`/`clip_set_names` report composed clip sets, and
+    /// `Attribute::get_at` resolves clip values (spec 12.3.4).
+    #[test]
+    fn clip_introspection() -> Result<()> {
+        let path = format!(
+            "{}vendor/core-spec-supplemental-release_dec2025/value_resolution/tests/assets/clip_basic/entry.usd",
+            env!("CARGO_WORKSPACE_DIR")
+        );
+        let stage = Stage::open(&path)?;
+
+        let model = super::Prim::new(&stage, sdf::path("/Model")?);
+        assert!(model.has_clips()?);
+        assert_eq!(model.clip_set_names()?, vec!["default".to_string()]);
+
+        // get_at flows through clip resolution: the clip overrides the reference.
+        let size = super::Attribute::new(&stage, sdf::path("/Model.size")?);
+        assert_eq!(
+            size.get_at(crate::usd::TimeCode::new(10.0))?,
+            Some(vt::Value::Float(10.0))
+        );
+
+        // A prim with no clips reports none.
+        let other = super::Prim::new(&stage, sdf::path("/Model2")?);
+        assert!(!other.has_clips()?);
+        Ok(())
+    }
+
+    /// `Prim::is_instance`/`prototype`/`is_in_prototype` mirror the stage-level
+    /// instancing queries (spec 11.3.3).
+    #[test]
+    fn prim_prototype_handle() -> Result<()> {
+        let path = format!("{}/fixtures/instancing_shared.usda", env!("CARGO_MANIFEST_DIR"));
+        let stage = Stage::open(&path)?;
+
+        let a = super::Prim::new(&stage, sdf::path("/A")?);
+        assert!(a.is_instance()?);
+        assert!(a.prototype()?.is_some());
+        assert!(!a.is_in_prototype()?);
+
+        let proto = super::Prim::new(&stage, sdf::path("/Proto")?);
+        assert!(!proto.is_instance()?);
+        assert!(proto.prototype()?.is_none());
+        Ok(())
+    }
+
+    /// `Prim::specifier` mirrors C++ `UsdPrim::GetSpecifier`: `define_prim`
+    /// resolves to `Def`, `override_prim` to `Over`.
+    #[test]
+    fn prim_specifier() -> Result<()> {
+        let stage = stage()?;
+        stage.define_prim("/Def")?;
+        stage.override_prim("/Over")?;
+        assert_eq!(stage.prim("/Def")?.specifier()?, Some(sdf::Specifier::Def));
+        assert_eq!(stage.prim("/Over")?.specifier()?, Some(sdf::Specifier::Over));
+        Ok(())
+    }
+
+    #[test]
+    fn prim_chain() -> Result<()> {
+        let stage = stage()?;
+        stage
+            .define_prim("/World")?
+            .set_type_name("Xform")?
+            .set_kind("group")?
+            .set_active(true)?;
+        assert_eq!(
+            stage.field::<vt::Value>("/World", sdf::FieldKey::TypeName)?,
+            Some(vt::Value::Token("Xform".into())),
+        );
+        assert_eq!(stage.prim("/World")?.kind()?.as_deref(), Some("group"));
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema() -> Result<()> {
+        let stage = stage()?;
+        let prim = stage.define_prim("/World")?.add_applied_schema("MaterialBindingAPI")?;
+        assert_eq!(
+            stage.prim(prim.path())?.api_schemas()?,
+            vec![Token::from("MaterialBindingAPI")]
+        );
+        assert!(stage.prim(prim.path())?.has_api_schema("MaterialBindingAPI")?);
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_schema_merges() -> Result<()> {
+        let stage = stage()?;
+        stage.define_prim("/World")?;
+        stage.with_target_layer_at(&sdf::Path::new("/World").expect("valid path"), |layer, _path| {
+            let path = sdf::Path::new("/World").expect("valid path");
+            layer.data_mut().set_field(
+                &path,
+                sdf::FieldKey::ApiSchemas.as_str(),
+                vt::Value::TokenListOp(sdf::TokenListOp::appended(vec![Token::from("ExistingAPI")])),
+            );
+            Ok(())
+        })?;
+
+        stage
+            .override_prim("/World")?
+            .add_applied_schema("ExistingAPI")?
+            .add_applied_schema("NewAPI")?;
+
+        let op = stage
+            .root_layer()
+            .prim("/World")?
+            .expect("authored on the root layer")
+            .api_schemas()?
+            .expect("apiSchemas authored");
+        assert_eq!(op.appended_items(), [Token::from("ExistingAPI")]);
+        assert_eq!(op.prepended_items(), [Token::from("NewAPI")]);
+        Ok(())
+    }
+
+    #[test]
+    fn set_prim_metadata() -> Result<()> {
+        let stage = stage()?;
+        let mut dict = std::collections::HashMap::new();
+        dict.insert("hint".to_string(), vt::Value::String("v".to_string()));
+        stage
+            .define_prim("/World")?
+            .set_metadata("customData", vt::Value::Dictionary(dict.into()))?;
+
+        let Some(vt::Value::Dictionary(read)) = stage.field::<vt::Value>("/World", "customData")? else {
+            panic!("expected customData dictionary");
+        };
+        assert_eq!(read.get("hint"), Some(&vt::Value::String("v".to_string())));
+        Ok(())
+    }
+
+    #[test]
+    fn update_metadata_reads_local() -> Result<()> {
+        let stage = stage()?;
+        let mut dict = std::collections::HashMap::new();
+        dict.insert("a".to_string(), vt::Value::Int(1));
+        stage
+            .define_prim("/World")?
+            .set_metadata("customData", vt::Value::Dictionary(dict.into()))?;
+
+        // The closure receives the local opinion and merges into it.
+        stage.define_prim("/World")?.update_metadata("customData", |local| {
+            let Some(vt::Value::Dictionary(mut d)) = local else {
+                panic!("expected local customData dictionary");
+            };
+            d.insert("b".to_string(), vt::Value::Int(2));
+            Some(vt::Value::Dictionary(d))
+        })?;
+
+        let Some(vt::Value::Dictionary(read)) = stage.field::<vt::Value>("/World", "customData")? else {
+            panic!("expected customData dictionary");
+        };
+        assert_eq!(read.get("a"), Some(&vt::Value::Int(1)));
+        assert_eq!(read.get("b"), Some(&vt::Value::Int(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn clear_metadata_drops_local() -> Result<()> {
+        let stage = stage()?;
+        stage
+            .define_prim("/World")?
+            .set_metadata("documentation", vt::Value::String("x".into()))?;
+        assert_eq!(
+            stage.prim("/World")?.metadata::<String>("documentation")?.as_deref(),
+            Some("x")
+        );
+
+        stage.prim("/World")?.clear_metadata("documentation")?;
+        assert_eq!(stage.prim("/World")?.metadata::<String>("documentation")?, None);
+        Ok(())
+    }
+
+    /// The pseudo-root's fields are layer metadata, not prim metadata, so
+    /// clearing prim metadata through it must leave them alone — the read
+    /// counterpart of `set_metadata` rejecting the pseudo-root outright.
+    #[test]
+    fn clear_metadata_pseudo_root() -> Result<()> {
+        let stage = stage()?;
+        stage.set_default_prim("World")?;
+
+        let _ = stage.prim("/")?.clear_metadata(sdf::FieldKey::DefaultPrim.as_str());
+
+        assert_eq!(stage.default_prim().as_deref(), Some("World"));
+        Ok(())
+    }
+
+    /// Clearing a field no layer authors locally leaves the layer untouched
+    /// rather than stamping an empty `over` to hold the absence.
+    #[test]
+    fn clear_metadata_authors_nothing() -> Result<()> {
+        let stage = stage()?;
+        stage.prim("/Absent")?.clear_metadata("documentation")?;
+        assert!(!stage.prim("/Absent")?.is_defined()?);
+        Ok(())
+    }
+
+    /// `prim`'s attribute names, in the order the handles came back.
+    fn names(attributes: &[super::Attribute]) -> Vec<&str> {
+        attributes.iter().map(super::Attribute::name).collect()
+    }
+
+    /// A prim holding attributes in and around the `primvars` namespace, and
+    /// a relationship inside it.
+    fn namespaced() -> Result<super::Prim> {
+        let stage = stage()?;
+        let prim = stage.define_prim("/Mesh")?;
+        for name in [
+            "primvars:st",
+            "points",
+            "primvars:skel:weights",
+            "primvarsFoo",
+            "primvars",
+        ] {
+            prim.create_attribute(name, "float")?;
+        }
+        prim.create_relationship("primvars:link")?;
+        Ok(prim)
+    }
+
+    /// A namespace lists the attributes under it, however deep, and none of
+    /// the relationships.
+    #[test]
+    fn namespace_filters_attributes() -> Result<()> {
+        let prim = namespaced()?;
+        let expected = ["primvars:skel:weights", "primvars:st"];
+        assert_eq!(names(&prim.attributes_in_namespace("primvars")?), expected);
+        assert_eq!(names(&prim.authored_attributes_in_namespace("primvars:")?), expected);
+        assert_eq!(
+            names(&prim.attributes_in_namespace("primvars:skel")?),
+            ["primvars:skel:weights"]
+        );
+        Ok(())
+    }
+
+    /// The namespace ends at a `:` of the name: a name that merely starts
+    /// with its spelling, or is its spelling, sits outside it.
+    #[test]
+    fn namespace_needs_delimiter() {
+        assert!(super::in_namespace("primvars:st", "primvars"));
+        assert!(super::in_namespace("primvars:st", "primvars:"));
+        assert!(!super::in_namespace("primvarsFoo", "primvars"));
+        assert!(!super::in_namespace("primvars", "primvars"));
+        assert!(!super::in_namespace("primvars", "primvars:"));
+        assert!(!super::in_namespace("primvars:st", "primvars:s"));
+        assert!(!super::in_namespace("st", "primvars"));
+    }
+
+    /// An empty namespace is every attribute.
+    #[test]
+    fn empty_namespace_all() -> Result<()> {
+        let prim = namespaced()?;
+        assert_eq!(prim.attributes_in_namespace("")?, prim.attributes()?);
+        assert_eq!(prim.attributes()?.len(), 5);
+        Ok(())
+    }
+
+    /// The names layers author are sorted, then follow `propertyOrder`
+    /// exactly as the composed names do.
+    #[test]
+    fn authored_names_apply_order() -> Result<()> {
+        let prim = namespaced()?;
+        // A `:` sorts before the letters, as in C++.
+        let sorted = [
+            "points",
+            "primvars",
+            "primvars:link",
+            "primvars:skel:weights",
+            "primvars:st",
+            "primvarsFoo",
+        ];
+        assert_eq!(prim.authored_property_names()?, sorted);
+
+        let order = vec![Token::from("primvars:skel:weights"), Token::from("points")];
+        let prim = prim.set_metadata("propertyOrder", vt::Value::TokenVec(order))?;
+        // The ordered names move to the front, and the rest keep their sorted
+        // order after them.
+        let expected = [
+            "primvars:skel:weights",
+            "points",
+            "primvars",
+            "primvars:link",
+            "primvars:st",
+            "primvarsFoo",
+        ];
+        assert_eq!(prim.authored_property_names()?, expected);
+        assert_eq!(prim.property_names()?, expected);
+        Ok(())
+    }
+
+    /// A namespace keeps the order the whole property list has.
+    #[test]
+    fn namespace_keeps_property_order() -> Result<()> {
+        let order = vec![Token::from("primvars:skel:weights"), Token::from("primvars:st")];
+        let prim = namespaced()?.set_metadata("propertyOrder", vt::Value::TokenVec(order))?;
+        let expected = ["primvars:skel:weights", "primvars:st"];
+        assert_eq!(names(&prim.attributes_in_namespace("primvars")?), expected);
+        assert_eq!(names(&prim.authored_attributes_in_namespace("primvars")?), expected);
+        Ok(())
+    }
+
+    /// Authoring prim metadata on the pseudo-root reports an error rather than
+    /// panicking — the pseudo-root carries no prim spec to author into.
+    #[test]
+    fn update_metadata_on_pseudo_root_errors() -> Result<()> {
+        let stage = stage()?;
+        let result = stage
+            .prim("/")?
+            .set_metadata("documentation", vt::Value::String("x".into()));
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn doc_round_trip() -> Result<()> {
+        let stage = stage()?;
+        let prim = stage.define_prim("/World")?;
+        assert_eq!(prim.doc()?, None);
+        let prim = prim.set_doc("The world.")?;
+        assert_eq!(prim.doc()?.as_deref(), Some("The world."));
+        let prim = prim.clear_doc()?;
+        assert_eq!(prim.doc()?, None);
+        Ok(())
+    }
+
+    /// `with` sees the index `graph` copies out.
+    #[test]
+    fn prim_index_with() -> Result<()> {
+        let stage = stage()?;
+        stage.define_prim("/Base")?;
+        let child = stage.define_prim("/Child")?;
+        child.inherits().add("/Base")?;
+        let index = child.prim_index();
+        let copied: Vec<String> = index.graph()?.nodes().map(|node| node.path().to_string()).collect();
+        let borrowed = index.with(|index| index.nodes().map(|node| node.path().to_string()).collect::<Vec<_>>())?;
+        assert_eq!(borrowed, copied);
+        assert_eq!(borrowed, ["/Child", "/Base"]);
+        Ok(())
+    }
+}
