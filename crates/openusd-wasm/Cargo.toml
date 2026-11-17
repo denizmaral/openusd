@@ -1,0 +1,24 @@
+[package]
+name = "openusd-wasm"
+description = "WebAssembly mesh extraction and USDC export for the TopoJSON viewer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0.79"
+half.workspace = true
+openusd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+
+# The ported extraction code predates the workspace's lint set.
+[lints]
