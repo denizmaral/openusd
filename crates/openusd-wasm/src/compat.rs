@@ -63,6 +63,8 @@ pub enum Value {
     Vec3f(Vec<f32>),
     Vec3d(Vec<f64>),
     Matrix4d(Vec<f64>),
+    /// A quaternion as `(w, x, y, z)`, whatever its precision.
+    Quat([f64; 4]),
     PathListOp(ListOp<Path>),
     VariantSelectionMap(HashMap<String, String>),
     TimeSamples(Vec<(f64, Value)>),
@@ -111,6 +113,9 @@ impl From<&vt::Value> for Value {
             V::Vec3d(v) => Value::Vec3d(flat!(one v, [f64; 3])),
             V::Vec3dVec(v) => Value::Vec3d(flat!(many v, [f64; 3])),
             V::Matrix4d(m) => Value::Matrix4d(m.0.to_vec()),
+            V::Quatf(q) => Value::Quat([q.w, q.x, q.y, q.z].map(f64::from)),
+            V::Quatd(q) => Value::Quat([q.w, q.x, q.y, q.z]),
+            V::Quath(q) => Value::Quat([q.w, q.x, q.y, q.z].map(f64::from)),
             V::Matrix4dVec(m) => Value::Matrix4d(m.iter().flat_map(|m| m.0).collect()),
             V::PathListOp(op) => Value::PathListOp(op.into()),
             V::VariantSelectionMap(m) => Value::VariantSelectionMap(m.clone()),

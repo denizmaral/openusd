@@ -847,10 +847,9 @@ fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
                         m = inv;
                     }
                 }
-                // Column-vector convention: later ops multiply from the left.
-                // USD xformOpOrder [Op1, Op2, ...] means Op1 applied first.
-                // Composed column-vector = OpN * ... * Op2 * Op1.
-                result = multiply_4x4(&m, &result);
+                // USD lists ops outermost first, so points take the last op first:
+                // the column-vector product is Op1 * Op2 * ... * OpN.
+                result = multiply_4x4(&result, &m);
             }
         }
 
@@ -867,6 +866,7 @@ fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
 
     let translate = read_vec3d(data, prim_path, "xformOp:translate");
     let scale = read_vec3d(data, prim_path, "xformOp:scale");
+    let orient = read_quat(data, prim_path, "xformOp:orient");
     let rotate_xyz = read_vec3d(data, prim_path, "xformOp:rotateXYZ");
     let rotate_x = read_single_rotation(data, prim_path, "xformOp:rotateX");
     let rotate_y = read_single_rotation(data, prim_path, "xformOp:rotateY");
@@ -874,6 +874,7 @@ fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
 
     if translate.is_none()
         && scale.is_none()
+        && orient.is_none()
         && rotate_xyz.is_none()
         && rotate_x.is_none()
         && rotate_y.is_none()
@@ -882,19 +883,20 @@ fn read_xform_ops(data: &mut dyn AbstractData, prim_path: &sdf::Path) -> Option<
         return None;
     }
 
-    let tx = translate.unwrap_or([0.0, 0.0, 0.0]);
-    let sc = scale.unwrap_or([1.0, 1.0, 1.0]);
-    let (rx_deg, ry_deg, rz_deg) = if let Some(r) = rotate_xyz {
-        (r[0], r[1], r[2])
-    } else {
-        (
-            rotate_x.unwrap_or(0.0),
-            rotate_y.unwrap_or(0.0),
-            rotate_z.unwrap_or(0.0),
-        )
+    let rotation = match orient {
+        Some(q) => make_quat_matrix(q),
+        None => {
+            let angles = rotate_xyz.unwrap_or([
+                rotate_x.unwrap_or(0.0),
+                rotate_y.unwrap_or(0.0),
+                rotate_z.unwrap_or(0.0),
+            ]);
+            make_euler_matrix("XYZ", angles)?
+        }
     };
-
-    Some(make_trs_matrix(tx, [rx_deg, ry_deg, rz_deg], sc))
+    let translate = make_translate_matrix(translate.unwrap_or([0.0; 3]));
+    let scale = make_scale_matrix(scale.unwrap_or([1.0; 3]));
+    Some(multiply_4x4(&multiply_4x4(&translate, &rotation), &scale))
 }
 
 /// Read a single xformOp property and return as a 4x4 column-vector matrix.
@@ -912,29 +914,15 @@ fn read_single_xform_op(data: &mut dyn AbstractData, prim_path: &sdf::Path, prop
             let v = read_vec3d(data, prim_path, prop_name)?;
             Some(make_scale_matrix(v))
         }
-        "rotateXYZ" => {
+        "rotateX" | "rotateY" | "rotateZ" => {
+            let deg = read_single_rotation(data, prim_path, prop_name)?;
+            Some(make_axis_rotation(base_type.as_bytes()[6], deg))
+        }
+        "orient" => Some(make_quat_matrix(read_quat(data, prim_path, prop_name)?)),
+        _ if base_type.len() == 9 && base_type.starts_with("rotate") => {
+            // rotateXYZ, rotateZXY, ...: the value holds the X, Y and Z angles.
             let v = read_vec3d(data, prim_path, prop_name)?;
-            Some(make_trs_matrix([0.0; 3], v, [1.0, 1.0, 1.0]))
-        }
-        "rotateX" => {
-            let deg = read_single_rotation(data, prim_path, prop_name)?;
-            Some(make_trs_matrix([0.0; 3], [deg, 0.0, 0.0], [1.0, 1.0, 1.0]))
-        }
-        "rotateY" => {
-            let deg = read_single_rotation(data, prim_path, prop_name)?;
-            Some(make_trs_matrix([0.0; 3], [0.0, deg, 0.0], [1.0, 1.0, 1.0]))
-        }
-        "rotateZ" => {
-            let deg = read_single_rotation(data, prim_path, prop_name)?;
-            Some(make_trs_matrix([0.0; 3], [0.0, 0.0, deg], [1.0, 1.0, 1.0]))
-        }
-        "rotateZXY" => {
-            // ZXY rotation order: apply Z, then X, then Y
-            let v = read_vec3d(data, prim_path, prop_name)?;
-            let rz = make_trs_matrix([0.0; 3], [0.0, 0.0, v[2]], [1.0; 3]);
-            let rx = make_trs_matrix([0.0; 3], [v[0], 0.0, 0.0], [1.0; 3]);
-            let ry = make_trs_matrix([0.0; 3], [0.0, v[1], 0.0], [1.0; 3]);
-            Some(multiply_4x4(&multiply_4x4(&ry, &rx), &rz))
+            make_euler_matrix(&base_type[6..], v)
         }
         "transform" => {
             // Full 4x4 matrix — read and transpose from USD row-vector to column-vector
@@ -974,45 +962,73 @@ fn make_scale_matrix(s: [f64; 3]) -> [f64; 16] {
     ]
 }
 
-/// Build a TRS matrix from translate, rotateXYZ (degrees), scale (column-vector convention).
-fn make_trs_matrix(tx: [f64; 3], rot_deg: [f64; 3], sc: [f64; 3]) -> [f64; 16] {
-    let rx = rot_deg[0].to_radians();
-    let ry = rot_deg[1].to_radians();
-    let rz = rot_deg[2].to_radians();
+/// Build a rotation of `deg` degrees about the axis `b'X'`, `b'Y'` or `b'Z'` (column-vector convention).
+fn make_axis_rotation(axis: u8, deg: f64) -> [f64; 16] {
+    let (s, c) = deg.to_radians().sin_cos();
+    match axis {
+        b'X' => [1.0, 0.0, 0.0, 0.0, 0.0, c, -s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0],
+        b'Y' => [c, 0.0, s, 0.0, 0.0, 1.0, 0.0, 0.0, -s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0],
+        _ => [c, -s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    }
+}
 
-    let (sx, cx) = (rx.sin(), rx.cos());
-    let (sy, cy) = (ry.sin(), ry.cos());
-    let (sz, cz) = (rz.sin(), rz.cos());
+/// Build the rotation of a `rotate<order>` op (column-vector convention): `deg` holds the X, Y and Z
+/// angles, and `order` (e.g. `"XYZ"`) the axes in the order they apply, as C++ `UsdGeomXformOp` composes
+/// them. `None` when `order` is not a permutation of `XYZ`.
+fn make_euler_matrix(order: &str, deg: [f64; 3]) -> Option<[f64; 16]> {
+    let mut seen = [false; 3];
+    let mut m = make_scale_matrix([1.0; 3]);
+    for axis in order.bytes() {
+        let i = match axis {
+            b'X' => 0,
+            b'Y' => 1,
+            b'Z' => 2,
+            _ => return None,
+        };
+        if std::mem::replace(&mut seen[i], true) {
+            return None;
+        }
+        // A later axis applies after the earlier ones, so it multiplies from the left.
+        m = multiply_4x4(&make_axis_rotation(axis, deg[i]), &m);
+    }
+    seen.iter().all(|&s| s).then_some(m)
+}
 
-    // R = Rz * Ry * Rx (column-vector convention)
-    let r00 = cy * cz;
-    let r01 = -(cy * sz);
-    let r02 = sy;
-    let r10 = cx * sz + sx * sy * cz;
-    let r11 = cx * cz - sx * sy * sz;
-    let r12 = -(sx * cy);
-    let r20 = sx * sz - cx * sy * cz;
-    let r21 = sx * cz + cx * sy * sz;
-    let r22 = cx * cy;
-
+/// Build the rotation of a quaternion `(w, x, y, z)` (column-vector convention), normalized first as
+/// C++ `GfMatrix4d::SetRotate` does; a zero quaternion is no rotation.
+fn make_quat_matrix(q: [f64; 4]) -> [f64; 16] {
+    let len = q.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if len < 1e-10 {
+        return make_scale_matrix([1.0; 3]);
+    }
+    let [w, x, y, z] = q.map(|c| c / len);
     [
-        r00 * sc[0],
-        r01 * sc[1],
-        r02 * sc[2],
-        tx[0],
-        r10 * sc[0],
-        r11 * sc[1],
-        r12 * sc[2],
-        tx[1],
-        r20 * sc[0],
-        r21 * sc[1],
-        r22 * sc[2],
-        tx[2],
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y - w * z),
+        2.0 * (x * z + w * y),
+        0.0,
+        2.0 * (x * y + w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z - w * x),
+        0.0,
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
+        0.0,
         0.0,
         0.0,
         0.0,
         1.0,
     ]
+}
+
+/// Read a quaternion property (`quatf`, `quatd` or `quath`) as `(w, x, y, z)`.
+fn read_quat(data: &mut dyn AbstractData, prim_path: &sdf::Path, prop_name: &str) -> Option<[f64; 4]> {
+    let prop_path = prim_path.append_property(prop_name).ok()?;
+    match data.get(&prop_path, "default").ok()?.into_owned() {
+        Value::Quat(q) => Some(q),
+        _ => None,
+    }
 }
 
 /// Invert a 4x4 matrix. Returns None if singular.
@@ -1114,6 +1130,7 @@ fn read_vec3d(data: &mut dyn AbstractData, prim_path: &sdf::Path, prop_name: &st
     match value.into_owned() {
         Value::Vec3d(v) if v.len() >= 3 => Some([v[0], v[1], v[2]]),
         Value::Vec3f(v) if v.len() >= 3 => Some([v[0] as f64, v[1] as f64, v[2] as f64]),
+        Value::Vec3h(v) if v.len() >= 3 => Some([v[0].to_f64(), v[1].to_f64(), v[2].to_f64()]),
         Value::DoubleVec(v) if v.len() >= 3 => Some([v[0], v[1], v[2]]),
         _ => None,
     }
@@ -1140,9 +1157,12 @@ fn transform_points(points: &[f32], m: &[f64; 16]) -> Vec<f32> {
         let x2 = m[0] * x + m[1] * y + m[2] * z + m[3];
         let y2 = m[4] * x + m[5] * y + m[6] * z + m[7];
         let z2 = m[8] * x + m[9] * y + m[10] * z + m[11];
-        out.push(x2 as f32);
-        out.push(y2 as f32);
-        out.push(z2 as f32);
+        // A projective matrix leaves w != 1; divide by it, as C++ GfMatrix4d::Transform does.
+        let w = m[12] * x + m[13] * y + m[14] * z + m[15];
+        let w = if w == 0.0 { 1.0 } else { w };
+        out.push((x2 / w) as f32);
+        out.push((y2 / w) as f32);
+        out.push((z2 / w) as f32);
     }
     out
 }
@@ -1903,5 +1923,70 @@ mod tests {
             "Expected 3 geometry files (Body, Chain, Lantern)"
         );
         assert_eq!(total_meshes, 3, "Expected 3 meshes total");
+    }
+
+    /// The bounds of all points of the parsed meshes.
+    fn bounds(result: &ParseResult) -> ([f32; 3], [f32; 3]) {
+        let mut b = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in result.meshes.iter().flat_map(|m| m.points.chunks_exact(3)) {
+            for (i, &c) in p.iter().enumerate() {
+                b.0[i] = b.0[i].min(c);
+                b.1[i] = b.1[i].max(c);
+            }
+        }
+        b
+    }
+
+    fn assert_bounds(result: &ParseResult, min: [f32; 3], max: [f32; 3]) {
+        let (got_min, got_max) = bounds(result);
+        for i in 0..3 {
+            assert!((got_min[i] - min[i]).abs() < 1e-3, "min {got_min:?} vs {min:?}");
+            assert!((got_max[i] - max[i]).abs() < 1e-3, "max {got_max:?} vs {max:?}");
+        }
+    }
+
+    /// `xformOp:orient` turns (0, 1, 0) onto +Z, and the translate listed before it applies after it.
+    #[test]
+    fn orient_then_translate() {
+        let usda = r#"#usda 1.0
+def Mesh "Tri"
+{
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    point3f[] points = [(0, 1, 0), (1, 0, 0), (0, 0, 0)]
+    quatf xformOp:orient = (0.70710677, 0.70710677, 0, 0)
+    double3 xformOp:translate = (1, 2, 3)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+}
+"#;
+        let result = parse_usd_meshes_inner(usda.as_bytes()).unwrap();
+        let points = &result.meshes[0].points;
+        let expected = [1.0, 2.0, 4.0, 2.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+        for (got, want) in points.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-5, "{points:?}");
+        }
+    }
+
+    /// translate, rotateXYZ (X applied first) and scale, composed outermost first. The bounds are
+    /// those openusd-schemas' `XformCache` computes for the same file.
+    #[test]
+    fn xform_ops_compose() {
+        let data = std::fs::read(asset(
+            "test_assets/schemaTests/usdGeom/transforms/simple_transform.usda",
+        ))
+        .unwrap();
+        let result = parse_usd_meshes_inner(&data).unwrap();
+        assert_bounds(&result, [2.384, 3.192, 4.667], [5.616, 6.808, 7.333]);
+    }
+
+    /// A matrix whose last column is not (0, 0, 0, 1) divides each point by its w.
+    #[test]
+    fn projective_matrix_divides() {
+        let data = std::fs::read(asset(
+            "test_assets/schemaTests/usdGeom/transforms/weird_matrix_transform.usda",
+        ))
+        .unwrap();
+        let result = parse_usd_meshes_inner(&data).unwrap();
+        assert_bounds(&result, [-3.5, -3.667, -3.833], [14.5, 15.0, 15.5]);
     }
 }
