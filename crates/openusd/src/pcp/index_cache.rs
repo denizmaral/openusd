@@ -466,6 +466,63 @@ impl Default for ValueRead {
     }
 }
 
+/// An attribute query's answer, or the report that the answer turns on
+/// whether a schema declares the attribute, which only `usd` knows (see
+/// [`IndexCache::ensure_attr_index`]).
+#[derive(Debug)]
+pub(crate) enum Gated<T> {
+    /// What the query resolved.
+    Answer(T),
+    /// No layer authors the attribute and a value clip reaches its prim: a
+    /// clip answers for the attribute if a schema declares it, and the query
+    /// asked as though none does. `undeclared` is the answer where none does.
+    NeedsDeclaration { undeclared: T },
+}
+
+impl<T> Gated<T> {
+    /// Either answer passed through `f`.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Gated<U> {
+        match self {
+            Self::Answer(answer) => Gated::Answer(f(answer)),
+            Self::NeedsDeclaration { undeclared } => Gated::NeedsDeclaration {
+                undeclared: f(undeclared),
+            },
+        }
+    }
+}
+
+impl<T: Default> Default for Gated<T> {
+    /// The answer for a prim the stage does not hold.
+    fn default() -> Self {
+        Self::Answer(T::default())
+    }
+}
+
+/// Where an attribute query reads, as [`IndexCache::ensure_attr_index`]
+/// finds it.
+enum AttrIndex {
+    /// The owning prim, composed, and the property suffix.
+    Indexed(Path, String),
+    /// Value resolution has nothing to answer for.
+    Absent,
+    /// A value clip answers if a schema declares the attribute
+    /// ([`Gated::NeedsDeclaration`]).
+    NeedsDeclaration,
+}
+
+impl AttrIndex {
+    /// The owning prim and property suffix to read, or the answer a query
+    /// gives without reading: `absent` where nothing answers, and where a
+    /// declaration decides, gated on it.
+    fn read<T>(self, absent: impl FnOnce() -> T) -> Result<(Path, String), Gated<T>> {
+        match self {
+            Self::Indexed(prim, suffix) => Ok((prim, suffix)),
+            Self::Absent => Err(Gated::Answer(absent())),
+            Self::NeedsDeclaration => Err(Gated::NeedsDeclaration { undeclared: absent() }),
+        }
+    }
+}
+
 /// Resolves an attribute's value (the resolver behind
 /// [`IndexCache::value_at`]).
 ///
@@ -752,6 +809,12 @@ impl OpinionResolver for SampleTimesResolver {
         // A map supplying no value is not a value source, so it contributes no
         // times — the same judgement the value read and the resolve info make of
         // it. It still answers, blocking weaker sources.
+        // TODO: C++ names such a map the source and lists its times, as this
+        // walk lists the times of a clip set that blocks the value. A layer
+        // flattened from such a set writes its blocks as samples, and reopened
+        // lists none. Reporting a blocking sample map or clip set as the
+        // source, with the block recorded beside it, is the C++ model; the
+        // conformance matrix in `tests/stage.rs` pins the present one.
         if !value_resolve::samples_supply_any_value(samples) {
             self.answered = true;
             return Step::Stop;
@@ -877,7 +940,6 @@ impl InfoResolver<'_> {
             self.resolution.source = kind;
             self.resolution.node = Some(ResolveNode::capture(self.graph, site.node, self.stage));
             self.resolution.spec = spec;
-            self.resolution.value = ValueState::Present;
             return self.compose(value, site).step();
         }
         // Only a composing value reads this far, so a source that varies with
@@ -891,6 +953,17 @@ impl InfoResolver<'_> {
             self.resolution.weaker.push(ResolvedSite { kind, node, spec });
         }
         folded.step()
+    }
+
+    /// Records that an opinion of `kind` answered by blocking the value.
+    ///
+    /// Only the source that answers is blocked; a stronger one this would
+    /// have composed into keeps the value it has.
+    fn block(&mut self, kind: ResolveSourceKind) {
+        if matches!(self.resolution.source, ResolveSourceKind::None) {
+            self.resolution.blocked_by = Some(kind);
+            self.resolution.withheld = self.time.is_some() && !matches!(kind, ResolveSourceKind::Default);
+        }
     }
 
     /// Folds a source's value in, so the walk knows whether anything weaker
@@ -925,11 +998,7 @@ impl OpinionResolver for InfoResolver<'_> {
         // falls through to the schema tier, and reporting `TimeSamples` would
         // disagree with it. It still answers the walk, blocking weaker sources.
         if !supplies {
-            // Only the source that answers is blocked; a stronger one this
-            // would have composed into keeps the value it has.
-            if matches!(self.resolution.source, ResolveSourceKind::None) {
-                self.resolution.value = ValueState::Blocked;
-            }
+            self.block(ResolveSourceKind::TimeSamples);
             return Step::Stop;
         }
         let spec = Some(site.spec_record(self.graph));
@@ -956,11 +1025,7 @@ impl OpinionResolver for InfoResolver<'_> {
         self.resolution.authored = true;
         match kind {
             Withheld::DefaultBlock => {
-                // Only the source that answers is blocked; a stronger one this
-                // composed into keeps the value it has.
-                if matches!(self.resolution.source, ResolveSourceKind::None) {
-                    self.resolution.value = ValueState::Blocked;
-                }
+                self.block(ResolveSourceKind::Default);
                 Step::Stop
             }
             Withheld::TimeSamplesFieldBlock => Step::Continue,
@@ -1000,10 +1065,8 @@ impl OpinionResolver for InfoResolver<'_> {
         // sends the read to the schema tier, and naming the clip would disagree
         // with that — C++ reports the clip either way.
         self.resolution.authored = true;
-        if matches!(self.resolution.source, ResolveSourceKind::None) {
-            self.resolution.value = state;
-        }
-        if !matches!(state, ValueState::Present) {
+        if matches!(state, ValueState::Blocked) {
+            self.block(ResolveSourceKind::ValueClips);
             return Ok(Step::Stop);
         }
         // The site the set was reached at authors the `clips` metadata, not
@@ -1800,7 +1863,8 @@ impl IndexCache {
     /// value (C++ `UsdStage::_GetResolveInfo`). `mode` selects the walk:
     /// [`Proximal`](ResolveMode::Proximal) reports the source that would answer
     /// without naming a time, while a timed mode reports the one that answers
-    /// there.
+    /// there. `declared` is whether a schema declares the attribute
+    /// ([`Self::ensure_attr_index`]).
     pub(crate) fn resolve_info(
         &mut self,
         graph: &LayerView<'_>,
@@ -1808,11 +1872,16 @@ impl IndexCache {
         attr_path: &Path,
         mode: ResolveMode,
         interp: &dyn Fn(&sdf::TimeSampleMap, f64) -> Option<Value>,
-    ) -> Result<Resolution, QueryError> {
-        let Some((prim, suffix)) = self.ensure_attr_index(graph, attr_path)? else {
-            // Nothing authored, nothing blocked: what a prim the stage does
-            // not hold resolves to, so the gated path needs no special case.
-            return Ok(Resolution::default());
+        declared: bool,
+    ) -> Result<Gated<Resolution>, QueryError> {
+        // Nothing authored, nothing blocked: what a prim the stage does not
+        // hold resolves to, so the gated path needs no special case.
+        let (prim, suffix) = match self
+            .ensure_attr_index(graph, attr_path, mode, declared)?
+            .read(Resolution::default)
+        {
+            Ok(found) => found,
+            Err(answer) => return Ok(answer),
         };
         let mut resolver = InfoResolver {
             graph,
@@ -1840,7 +1909,7 @@ impl IndexCache {
         // answer, and `usd` reports that tier as the chain's last link — which
         // a query that asks for no chain does not want either.
         resolution.open = resolver_chains && composing.is_open();
-        Ok(resolution)
+        Ok(Gated::Answer(resolution))
     }
 
     /// Resolves an attribute's value at `time`, honoring value clips
@@ -1864,6 +1933,11 @@ impl IndexCache {
     /// `asset` path in the value ([`ValueRead`]). The chosen value is
     /// finalized at its own site, and whether the type accepts its kind is the
     /// decoder's to check.
+    ///
+    /// `declared` is whether a schema declares the attribute. A walk that
+    /// consults value clips for an attribute no layer authors answers
+    /// [`Gated::NeedsDeclaration`] where it is unset
+    /// ([`Self::ensure_attr_index`]).
     pub(crate) fn value_at(
         &mut self,
         graph: &LayerView<'_>,
@@ -1871,22 +1945,25 @@ impl IndexCache {
         time: Option<f64>,
         interp: &dyn Fn(&sdf::TimeSampleMap, f64) -> Option<Value>,
         read: ValueRead,
-    ) -> Result<TimedValue, QueryError> {
+        declared: bool,
+    ) -> Result<Gated<TimedValue>, QueryError> {
         let (owner, suffix) = attr_path.split_prim();
         let prim = self.effective_prim(graph, &owner)?;
         self.ensure_index(graph, &prim)?;
         // The spec-stack walk finds no opinion for an attribute no layer
-        // authors, which resolves to the fallback. A value clip answers at sites
-        // beyond the spec stack. Where clips are in reach, only an attribute
-        // some layer authors takes a value from them.
+        // authors, which resolves to the fallback. A value clip answers at
+        // sites beyond the spec stack, and only for an attribute the stage
+        // holds ([`Self::ensure_attr_index`]).
         let mode = ResolveMode::at(time);
-        if self.consults_clips(mode, &prim) {
+        if self.consults_clips(mode, &prim) && !declared {
             let redirected = match prim == owner {
                 true => Cow::Borrowed(attr_path),
                 false => Cow::Owned(Path::from_string_unchecked([prim.as_str(), suffix].concat())),
             };
             if !self.has_spec_at(graph, &redirected)? {
-                return Ok(TimedValue::Fallback);
+                return Ok(Gated::NeedsDeclaration {
+                    undeclared: TimedValue::Fallback,
+                });
             }
         }
         let mut resolver = ValueAtResolver {
@@ -1906,11 +1983,11 @@ impl IndexCache {
             ..
         } = resolver;
         self.query_diagnostics.extend(errors);
-        Ok(match composing.into_open() {
+        Ok(Gated::Answer(match composing.into_open() {
             Some(value) => TimedValue::Value(value),
             None if withheld => TimedValue::NoValue,
             None => TimedValue::Fallback,
-        })
+        }))
     }
 
     /// Resolves the cacheable value source for an attribute (the source half of
@@ -1918,16 +1995,21 @@ impl IndexCache {
     /// time codes. A source no snapshot can stand in for — value clips, or a
     /// value that composes — resolves as
     /// [`AttributeValueSource::PerTime`], and the query falls back to
-    /// `value_at` per call.
+    /// `value_at` per call. `declared` is whether a schema declares the
+    /// attribute ([`Self::ensure_attr_index`]).
     ///
     /// [`Stage::attribute_query`]: crate::usd::Stage::attribute_query
     pub(crate) fn resolve_value_source(
         &mut self,
         graph: &LayerView<'_>,
         attr_path: &Path,
-    ) -> Result<StampedValueSource, QueryError> {
-        let Some((prim, suffix)) = self.ensure_attr_index(graph, attr_path)? else {
-            return Ok(self.stamp_source(AttributeValueSource::Static(None), attr_path, None));
+        declared: bool,
+    ) -> Result<Gated<StampedValueSource>, QueryError> {
+        let index = self.ensure_attr_index(graph, attr_path, ResolveMode::Proximal, declared)?;
+        let (prim, suffix) = match index.read(|| self.stamp_source(AttributeValueSource::Static(None), attr_path, None))
+        {
+            Ok(found) => found,
+            Err(answer) => return Ok(answer),
         };
         let mut resolver = SourceResolver {
             graph,
@@ -1945,7 +2027,7 @@ impl IndexCache {
                 false => AttributeValueSource::Static(None),
             },
         };
-        Ok(self.stamp_source(source, attr_path, Some(prim)))
+        Ok(Gated::Answer(self.stamp_source(source, attr_path, Some(prim))))
     }
 
     /// Pairs a freshly resolved `source` with the stamp a cached view replays it
@@ -2003,9 +2085,10 @@ impl IndexCache {
         &mut self,
         graph: &LayerView<'_>,
         attr_path: &Path,
-    ) -> Result<Option<Vec<f64>>, QueryError> {
-        let resolved = self.sample_times(graph, attr_path, Want::Times)?;
-        Ok(resolved.answered.then(|| resolved.times()))
+        declared: bool,
+    ) -> Result<Gated<Option<Vec<f64>>>, QueryError> {
+        let resolved = self.sample_times(graph, attr_path, Want::Times, declared)?;
+        Ok(resolved.map(|resolved| resolved.answered.then(|| resolved.times())))
     }
 
     /// Resolves an attribute's composed `timeSamples` map, retimed to stage
@@ -2032,7 +2115,13 @@ impl IndexCache {
         attr_path: &Path,
         assets: AssetMode,
     ) -> Result<Option<sdf::TimeSampleMap>, QueryError> {
-        let SampleTimesResolver { map, map_site, .. } = self.sample_times(graph, attr_path, Want::Map)?;
+        // A clip answers with no map, so a declared attribute only a clip
+        // answers for has none either.
+        let Gated::Answer(SampleTimesResolver { map, map_site, .. }) =
+            self.sample_times(graph, attr_path, Want::Map, false)?
+        else {
+            return Ok(None);
+        };
         Ok(match (map, map_site) {
             (Some(map), Some(site)) if assets != AssetMode::Resolve => self
                 .resolve_asset_at(graph, Some(Value::TimeSamples(map)), &site, assets)
@@ -2044,8 +2133,15 @@ impl IndexCache {
     /// Resolves the number of composed sample times for an attribute, including
     /// value-clip contributions, without retiming the times themselves. Zero
     /// when no source has samples or the prim is masked out.
-    pub(crate) fn num_time_samples(&mut self, graph: &LayerView<'_>, attr_path: &Path) -> Result<usize, QueryError> {
-        Ok(self.sample_times(graph, attr_path, Want::Count)?.count())
+    pub(crate) fn num_time_samples(
+        &mut self,
+        graph: &LayerView<'_>,
+        attr_path: &Path,
+        declared: bool,
+    ) -> Result<Gated<usize>, QueryError> {
+        Ok(self
+            .sample_times(graph, attr_path, Want::Count, declared)?
+            .map(|resolved| resolved.count()))
     }
 
     /// Whether an attribute's value may vary over time, the introspection behind
@@ -2062,21 +2158,24 @@ impl IndexCache {
         &mut self,
         graph: &LayerView<'_>,
         attr_path: &Path,
-    ) -> Result<bool, QueryError> {
-        let resolved = self.sample_times(graph, attr_path, Want::Vary)?;
-        Ok(resolved.may_vary || resolved.count() > 1)
+        declared: bool,
+    ) -> Result<Gated<bool>, QueryError> {
+        let resolved = self.sample_times(graph, attr_path, Want::Vary, declared)?;
+        Ok(resolved.map(|resolved| resolved.may_vary || resolved.count() > 1))
     }
 
     /// The composed sample times of whichever source [`Self::value_at`] would
     /// resolve from, plus whether that source is a clip set whose schedule alone
-    /// can vary the value.
+    /// can vary the value. `declared` is whether a schema declares the
+    /// attribute ([`Self::ensure_attr_index`]).
     fn sample_times(
         &mut self,
         graph: &LayerView<'_>,
         attr_path: &Path,
         want: Want,
-    ) -> Result<SampleTimesResolver, QueryError> {
-        let mut resolver = SampleTimesResolver {
+        declared: bool,
+    ) -> Result<Gated<SampleTimesResolver>, QueryError> {
+        let resolver = || SampleTimesResolver {
             series: Series::default(),
             answered: false,
             map: None,
@@ -2086,11 +2185,14 @@ impl IndexCache {
             want,
             chains: want != Want::Map,
         };
-        let Some((prim, suffix)) = self.ensure_attr_index(graph, attr_path)? else {
-            return Ok(resolver);
+        let index = self.ensure_attr_index(graph, attr_path, ResolveMode::Proximal, declared)?;
+        let (prim, suffix) = match index.read(resolver) {
+            Ok(found) => found,
+            Err(answer) => return Ok(answer),
         };
+        let mut resolver = resolver();
         self.resolve_property(graph, &prim, &suffix, ResolveMode::Proximal, &mut resolver)?;
-        Ok(resolver)
+        Ok(Gated::Answer(resolver))
     }
 
     /// Ensures `anchor`'s index is composed and resolves its value-clip sets —
@@ -2165,26 +2267,53 @@ impl IndexCache {
 
     /// Redirects `attr_path` through [`Self::effective_path`] and ensures the
     /// owning prim's index is composed, returning the owned prim path and
-    /// property suffix for a subsequent [`Self::cached`] lookup. `None` when no
-    /// spec exists at the path (absent or masked out).
+    /// property suffix for a subsequent [`Self::cached`] lookup.
+    /// [`AttrIndex::Absent`] when value resolution has nothing to answer
+    /// for: no spec exists at the path (absent or masked out) and a walk in
+    /// `mode` consults no value clip there.
+    ///
+    /// A value clip answers for an attribute a schema declares and no layer
+    /// authors, as the C++ resolver consults the clip sets of each node of
+    /// the prim's index. A clip cannot add an attribute the stage does not
+    /// otherwise hold (C++ `UsdPrim::GetAttribute` finds none to read). Only
+    /// `usd` knows the declarations: `declared` says whether a schema
+    /// declares this attribute, and where it is unset for a spec-less
+    /// attribute a clip reaches, the answer is [`AttrIndex::NeedsDeclaration`].
     fn ensure_attr_index(
         &mut self,
         graph: &LayerView<'_>,
         attr_path: &Path,
-    ) -> Result<Option<(Path, String)>, QueryError> {
+        mode: ResolveMode,
+        declared: bool,
+    ) -> Result<AttrIndex, QueryError> {
         let attr_path = &self.effective_path(graph, attr_path)?;
-        if !self.has_spec_at(graph, attr_path)? {
-            return Ok(None);
-        }
+        let has_spec = self.has_spec_at(graph, attr_path)?;
         let (prim, suffix) = attr_path.split_prim();
         self.ensure_index(graph, &prim)?;
-        Ok(Some((prim, suffix.to_owned())))
+        if !has_spec {
+            if !self.consults_clips(mode, &prim) {
+                return Ok(AttrIndex::Absent);
+            }
+            if !declared {
+                return Ok(AttrIndex::NeedsDeclaration);
+            }
+        }
+        Ok(AttrIndex::Indexed(prim, suffix.to_owned()))
     }
 
     /// Read-only access to the cached indices and the dependency map they are
     /// registered in — the pair change-driven invalidation reads.
     pub(super) fn store(&self) -> &IndexStore {
         &self.store
+    }
+
+    /// Whether value clips may answer for the attributes of the prim at
+    /// `path`: clip metadata is authored there or on an ancestor (C++
+    /// `Usd_PrimData::MayHaveOpinionsInClips`).
+    pub(crate) fn prim_may_have_clips(&mut self, graph: &LayerView<'_>, path: &Path) -> Result<bool, QueryError> {
+        let path = self.effective_path(graph, path)?;
+        self.ensure_index(graph, &path)?;
+        Ok(self.may_have_clips(&path))
     }
 
     /// Whether value resolution has to consult value clips for `path`: clip
@@ -4490,6 +4619,17 @@ mod tests {
     use super::*;
     use crate::pcp::prim_graph::RelocateKind;
 
+    impl<T> Gated<T> {
+        /// The answer of a query that asked with no declaration and was not
+        /// gated on one.
+        fn answer(self) -> T {
+            match self {
+                Gated::Answer(answer) => answer,
+                Gated::NeedsDeclaration { .. } => panic!("the answer needs a declaration"),
+            }
+        }
+    }
+
     fn manifest_dir() -> String {
         std::env::var("CARGO_MANIFEST_DIR").unwrap()
     }
@@ -4647,7 +4787,16 @@ def "Unrelated"
     fn settled_value_at(graph: &mut LayerGraph, cache: &mut IndexCache, path: &Path, time: f64) -> Result<TimedValue> {
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         loop {
-            let value = cache.value_at(&graph.read_view(), path, Some(time), &interp, ValueRead::default())?;
+            let value = cache
+                .value_at(
+                    &graph.read_view(),
+                    path,
+                    Some(time),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)?;
             let mut pending = Vec::new();
             cache.swap_pending_loads(&mut pending);
             if !graph.intern_demanded(&pending) {
@@ -5146,13 +5295,16 @@ def \"Model\"
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         cache.ensure_index(&graph.read_view(), &sdf::path("/Inst")?)?;
         // Reading through the proxy mints and materializes the prototype.
-        cache.value_at(
-            &graph.read_view(),
-            &sdf::path("/Inst/Scope.x")?,
-            Some(0.0),
-            &interp,
-            ValueRead::default(),
-        )?;
+        cache
+            .value_at(
+                &graph.read_view(),
+                &sdf::path("/Inst/Scope.x")?,
+                Some(0.0),
+                &interp,
+                ValueRead::default(),
+                false,
+            )
+            .map(Gated::answer)?;
 
         let scope = sdf::path("/__Prototype_1/Scope")?;
         let index = cache.cached(&scope);
@@ -5395,13 +5547,16 @@ def "A" (
         cache.ensure_index(&graph.read_view(), &a)?;
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/A.marker")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/A.marker")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::String("ok".to_string())),
             "the prim's local opinion survives the broken expression arc"
         );
@@ -6252,7 +6407,7 @@ def "Anchor" (inherits = </Rig>) {}
         let attr = sdf::path(attr)?;
         loop {
             let reported = cache.query_diagnostic_count();
-            cache.time_sample_times(&graph.read_view(), &attr)?;
+            cache.time_sample_times(&graph.read_view(), &attr, false)?.answer();
             let mut clips = Vec::new();
             cache.swap_clip_loads(&mut clips, reported);
             if clips.is_empty() {
@@ -6276,13 +6431,16 @@ def "Anchor" (inherits = </Rig>) {}
             |samples: &sdf::TimeSampleMap, t: f64| samples.iter().find(|(time, _)| *time == t).map(|(_, v)| v.clone());
 
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &interp,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 1.0)?, TimedValue::Value(vt::Value::Float(10.0)));
         assert_eq!(size(&mut cache, 2.0)?, TimedValue::Value(vt::Value::Float(20.0)));
@@ -6298,13 +6456,16 @@ def "Anchor" (inherits = </Rig>) {}
         let (mut graph, mut cache) = collected_stack(&root);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &exact,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &exact,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 11.0)?, TimedValue::Value(Value::Float(10.0)));
         assert_eq!(size(&mut cache, 12.0)?, TimedValue::Value(Value::Float(20.0)));
@@ -6321,13 +6482,16 @@ def "Anchor" (inherits = </Rig>) {}
         let (mut graph, mut cache) = collected_stack(&root);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &exact,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &exact,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 0.0)?, TimedValue::Value(Value::Float(42.0)));
         Ok(())
@@ -6369,13 +6533,16 @@ def "Anchor" (inherits = </Rig>) {}
         let (mut graph, mut cache) = single_layer_stack(&root);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &exact,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &exact,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 0.0)?, TimedValue::Value(Value::Float(5.0)));
         assert_eq!(size(&mut cache, 10.0)?, TimedValue::Value(Value::Float(99.0)));
@@ -6392,13 +6559,16 @@ def "Anchor" (inherits = </Rig>) {}
         let (mut graph, mut cache) = collected_stack(&root);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &exact,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &exact,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 0.0)?, TimedValue::Value(Value::Float(5.0)));
         assert_eq!(size(&mut cache, 10.0)?, TimedValue::NoValue);
@@ -6418,14 +6588,16 @@ def "Anchor" (inherits = </Rig>) {}
 
         assert!(matches!(
             cache
-                .resolve_value_source(&graph.read_view(), &sdf::path("/Model.size")?)?
+                .resolve_value_source(&graph.read_view(), &sdf::path("/Model.size")?, false)?
+                .answer()
                 .source,
             AttributeValueSource::PerTime
         ));
         // `extra` is not in the manifest, so the clip set does not own it; the
         // source is the reference's time samples, queryable on the fast path.
         let AttributeValueSource::TimeSamples { samples, .. } = cache
-            .resolve_value_source(&graph.read_view(), &sdf::path("/Model.extra")?)?
+            .resolve_value_source(&graph.read_view(), &sdf::path("/Model.extra")?, false)?
+            .answer()
             .source
         else {
             panic!("undeclared clip attribute must resolve as arc time samples");
@@ -6448,18 +6620,22 @@ def "Anchor" (inherits = </Rig>) {}
         open_clips(&mut graph, &mut cache, "/Model.size")?;
 
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size")?,
-                Some(5.0),
-                &lerp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size")?,
+                    Some(5.0),
+                    &lerp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Float(50.0))
         );
         assert!(matches!(
             cache
-                .resolve_value_source(&graph.read_view(), &sdf::path("/Model.size")?)?
+                .resolve_value_source(&graph.read_view(), &sdf::path("/Model.size")?, false)?
+                .answer()
                 .source,
             AttributeValueSource::PerTime
         ));
@@ -6504,13 +6680,16 @@ def "Model" (
             (20.0, 7.0),
         ] {
             assert_eq!(
-                cache.value_at(
-                    &graph.read_view(),
-                    &sdf::path("/Model.size")?,
-                    Some(time),
-                    &lerp,
-                    ValueRead::default()
-                )?,
+                cache
+                    .value_at(
+                        &graph.read_view(),
+                        &sdf::path("/Model.size")?,
+                        Some(time),
+                        &lerp,
+                        ValueRead::default(),
+                        false
+                    )
+                    .map(Gated::answer)?,
                 TimedValue::Value(Value::Float(expected))
             );
         }
@@ -6528,14 +6707,18 @@ def "Model" (
         let (mut graph, mut cache) = collected_stack(&held);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         assert_eq!(
-            cache.time_sample_times(&graph.read_view(), &sdf::path("/Model.size")?)?,
+            cache
+                .time_sample_times(&graph.read_view(), &sdf::path("/Model.size")?, false)?
+                .answer(),
             Some(vec![0.0, 10.0])
         );
 
         let arc = format!("{}/fixtures/clip_undeclared_arc/root.usda", manifest_dir());
         let (mut graph, mut cache) = collected_stack(&arc);
         open_clips(&mut graph, &mut cache, "/Model.extra")?;
-        let extra = cache.time_sample_times(&graph.read_view(), &sdf::path("/Model.extra")?)?;
+        let extra = cache
+            .time_sample_times(&graph.read_view(), &sdf::path("/Model.extra")?, false)?
+            .answer();
         assert_eq!(extra, Some(vec![3.0]));
         Ok(())
     }
@@ -6550,13 +6733,16 @@ def "Model" (
         let (mut graph, mut cache) = single_layer_stack(&root);
         open_clips(&mut graph, &mut cache, "/Model.size")?;
         let size = |cache: &mut IndexCache, t: f64| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Model.size").unwrap(),
-                Some(t),
-                &lerp,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Model.size").unwrap(),
+                    Some(t),
+                    &lerp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(size(&mut cache, 0.0)?, TimedValue::Value(Value::Float(0.0)));
         assert_eq!(size(&mut cache, 15.0)?, TimedValue::Value(Value::Float(75.0)));
@@ -6576,13 +6762,16 @@ def "Model" (
 
         // Query /A first so it mints /__Prototype_1 for its key.
         let size = |cache: &mut IndexCache, p: &str| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path(p).unwrap(),
-                Some(0.0),
-                &interp,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path(p).unwrap(),
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
         assert_eq!(
             size(&mut cache, "/A/Child.size")?,
@@ -6619,13 +6808,16 @@ def "Model" (
         let (graph, mut cache) = single_layer_stack(&root);
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         let v = |cache: &mut IndexCache, p: &str| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path(p).unwrap(),
-                Some(0.0),
-                &interp,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path(p).unwrap(),
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
 
         // Reading the deep value walks the proxy ancestors (/A/Mid, /B/Mid),
@@ -6704,13 +6896,16 @@ def "Model" (
         let (graph, mut cache) = single_layer_stack(&root);
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         let v = |cache: &mut IndexCache, p: &str| {
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path(p).unwrap(),
-                Some(0.0),
-                &interp,
-                ValueRead::default(),
-            )
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path(p).unwrap(),
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)
         };
 
         // /A mints /__Prototype_1 (for /Outer); the nested instance mints
@@ -6791,13 +6986,16 @@ def "Model" (
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
 
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/A/Inner/Nested/Leaf.v")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/A/Inner/Nested/Leaf.v")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(1.0))
         );
         assert_eq!(cache.prototypes().len(), 3, "one prototype per nesting level");
@@ -6812,13 +7010,16 @@ def "Model" (
         // The chain re-registers from scratch and resolves again, so the drop
         // left behind no stale index, redirection, or key.
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/A/Inner/Nested/Leaf.v")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/A/Inner/Nested/Leaf.v")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(1.0))
         );
         assert_eq!(cache.prototypes().len(), 3);
@@ -6835,13 +7036,16 @@ def "Model" (
         let (graph, mut cache) = single_layer_stack(&root);
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
 
-        cache.value_at(
-            &graph.read_view(),
-            &sdf::path("/A/Inner/Nested/Leaf.v")?,
-            Some(0.0),
-            &interp,
-            ValueRead::default(),
-        )?;
+        cache
+            .value_at(
+                &graph.read_view(),
+                &sdf::path("/A/Inner/Nested/Leaf.v")?,
+                Some(0.0),
+                &interp,
+                ValueRead::default(),
+                false,
+            )
+            .map(Gated::answer)?;
         let registered = cache.prototypes();
         assert_eq!(registered.len(), 3, "one prototype per nesting level");
 
@@ -6882,13 +7086,16 @@ def "Model" (
                 .shares_data_with(cache.cached(&deep).graph())
         );
 
-        cache.value_at(
-            &graph.read_view(),
-            &sdf::path("/A/Inner/Nested/Leaf.v")?,
-            Some(0.0),
-            &interp,
-            ValueRead::default(),
-        )?;
+        cache
+            .value_at(
+                &graph.read_view(),
+                &sdf::path("/A/Inner/Nested/Leaf.v")?,
+                Some(0.0),
+                &interp,
+                ValueRead::default(),
+                false,
+            )
+            .map(Gated::answer)?;
         let shared_below_prototype = cache.prototypes().iter().any(|prototype| {
             let child = prototype.append_path("Leaf").expect("a prim path");
             cache.is_indexed(&child)
@@ -6921,13 +7128,16 @@ def "Model" (
         // /__Prototype_2 for /Library/Inner, and the outer proxy's descendant
         // stands in for a prim there.
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/A/Nested/Leaf.v")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/A/Nested/Leaf.v")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(3.0))
         );
         assert_eq!(
@@ -6981,24 +7191,30 @@ def "Model" (
         // The nested reference's opinions resolve on the shared descendant.
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/World/Inst/OtherChild.size")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/World/Inst/OtherChild.size")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(7.0)),
             "nested-reference descendant value survives in the shared subtree"
         );
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/World/Inst.otherAttr")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/World/Inst.otherAttr")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(5.0)),
             "nested-reference attribute survives on the instance root"
         );
@@ -7033,13 +7249,16 @@ def "Model" (
             vec![Token::from("ProtoChild")]
         );
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/__Prototype_1.protoAttr")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/__Prototype_1.protoAttr")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(3.0)),
         );
 
@@ -7049,13 +7268,16 @@ def "Model" (
             vec![Token::from("ProtoChild")]
         );
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Deep/G/A/ProtoChild.size")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Deep/G/A/ProtoChild.size")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(7.0)),
         );
         Ok(())
@@ -7105,23 +7327,29 @@ def "Model" (
             vec![Token::from("BodyChild")]
         );
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/__Prototype_1.bodyAttr")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/__Prototype_1.bodyAttr")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(4.0)),
         );
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/World/Place.bodyAttr")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/World/Place.bodyAttr")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(4.0)),
         );
         Ok(())
@@ -7147,13 +7375,16 @@ def "Model" (
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
 
         let value = |cache: &mut IndexCache, name: &str| -> Result<TimedValue> {
-            Ok(cache.value_at(
-                &graph.read_view(),
-                &proto.append_property(name)?,
-                Some(0.0),
-                &interp,
-                ValueRead::default(),
-            )?)
+            Ok(cache
+                .value_at(
+                    &graph.read_view(),
+                    &proto.append_property(name)?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false,
+                )
+                .map(Gated::answer)?)
         };
         assert_eq!(value(&mut cache, "shared")?, TimedValue::Value(Value::Double(1.0)));
         assert_eq!(value(&mut cache, "rootOnly")?, TimedValue::Fallback);
@@ -7169,13 +7400,16 @@ def "Model" (
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
 
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &proto.append_property("picked")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &proto.append_property("picked")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::Double(5.0))
         );
         Ok(())
@@ -8213,13 +8447,16 @@ def \"Ref\" {}
         let mut cache = fresh_cache();
         let interp = |_: &sdf::TimeSampleMap, _: f64| None;
         assert_eq!(
-            cache.value_at(
-                &graph.read_view(),
-                &sdf::path("/Inst.e")?,
-                Some(0.0),
-                &interp,
-                ValueRead::default()
-            )?,
+            cache
+                .value_at(
+                    &graph.read_view(),
+                    &sdf::path("/Inst.e")?,
+                    Some(0.0),
+                    &interp,
+                    ValueRead::default(),
+                    false
+                )
+                .map(Gated::answer)?,
             TimedValue::Value(Value::PathExpression(sdf::PathExpression::parse(
                 "/local// /Inst/child//"
             )))

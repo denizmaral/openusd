@@ -376,7 +376,7 @@ pub(crate) use asset_resolve::AssetMode;
 pub(crate) use change::{ApplyOutcome, Changes, LayerChanges};
 pub(crate) use diagnostics::Diagnostics;
 pub(crate) use index_cache::Standing;
-pub(crate) use index_cache::{AttributeValueSource, IndexCache, StampedValueSource, ValueRead};
+pub(crate) use index_cache::{AttributeValueSource, Gated, IndexCache, StampedValueSource, ValueRead};
 pub use index_cache::{GraphStats, SpecSiteRecord, Tally};
 pub(crate) use index_store::PrimRevision;
 pub(crate) use instancing::is_prototype_namespace;
@@ -394,7 +394,7 @@ pub(crate) use prim_index::Demand;
 pub use prim_index::{PrimIndex, PrimIndexView};
 pub(crate) use prim_resolve::Composing;
 pub(crate) use relocates::{BatchRelocate, analyze_relocate_occurrences, first_unrepresentable_relocate};
-pub(crate) use value_resolve::{Resolution, ResolveMode, ResolveSourceKind, TimedValue, ValueState};
+pub(crate) use value_resolve::{Resolution, ResolveMode, ResolveSourceKind, TimedValue};
 pub use value_resolve::{ResolveNode, ResolveStackIdentity};
 
 /// Maps variant set names to ordered lists of fallback selections.

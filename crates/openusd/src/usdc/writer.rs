@@ -24,12 +24,19 @@ use crate::{
 };
 
 use super::coding;
-use super::layout::{Bootstrap, Field, ListOpHeader, Section, Spec as FileSpec, Type, ValueRep, Version, version};
+use super::layout::{
+    Bootstrap, Field, ListOpHeader, PATH_EXPRESSION_VERSION, RELOCATES_VERSION, Section, Spec as FileSpec,
+    TIME_CODE_VERSION, Type, ValueRep, Version, version,
+};
 use super::reader::CrateFile;
 
-/// Crate format version this writer emits. Supports all features the reader
-/// handles (time samples, relocates, path expressions, etc.).
-const WRITER_VERSION: Version = version(0, 12, 0);
+/// The crate version a file is written as when it holds no newer value type:
+/// the default of C++ `USD_WRITE_NEW_USDC_FILES_AS_VERSION`. A reader older
+/// than a file's version refuses the file. A file is stamped no newer than its
+/// values need, as C++ `CrateFile` stamps a new file: it requests a
+/// write-version upgrade (`RequestWriteVersionUpgrade`) only for a value that
+/// needs one.
+const BASE_VERSION: Version = version(0, 8, 0);
 
 /// The token a crate file holds at index 0, as C++ `CrateFile::StartPacking`
 /// writes it. A property's element is written as the negated index of its
@@ -127,6 +134,11 @@ struct Packer<'w, W: Write + Seek> {
     /// How many nested values enclose the one being written, bounded by
     /// [`MAX_NESTING`](super::MAX_NESTING) as the reader bounds its decode.
     depth: usize,
+
+    /// The version the file is stamped with: [`BASE_VERSION`], raised by each
+    /// value written that holds an element of a type a newer version
+    /// introduced.
+    version: Version,
 }
 
 impl<'w, W: Write + Seek> Packer<'w, W> {
@@ -144,6 +156,17 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
             specs: Vec::new(),
             sections_written: Vec::new(),
             depth: 0,
+            version: BASE_VERSION,
+        }
+    }
+
+    /// Raises the stamped version to `needed`, the version that introduced a
+    /// value type, for a value that holds `elements` of that type. A value
+    /// with none leaves the version as it is, as C++ asks for the upgrade once
+    /// per element written.
+    fn require_version(&mut self, needed: Version, elements: usize) {
+        if elements > 0 {
+            self.version = self.version.max(needed);
         }
     }
 
@@ -382,9 +405,9 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
     fn write_bootstrap(&mut self, toc_offset: u64) -> Result<Bootstrap, FormatError> {
         let mut boot = Bootstrap::default();
         boot.ident = *b"PXR-USDC";
-        boot.version[0] = WRITER_VERSION.major;
-        boot.version[1] = WRITER_VERSION.minor;
-        boot.version[2] = WRITER_VERSION.patch;
+        boot.version[0] = self.version.major;
+        boot.version[1] = self.version.minor;
+        boot.version[2] = self.version.patch;
         boot.toc_offset = toc_offset;
 
         self.out.seek(SeekFrom::Start(0))?;
@@ -499,6 +522,10 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
         self.write_value(value)
     }
 
+    // TODO(perf): C++ `CrateFile` writes each distinct out-of-line value once
+    // (`_valueDedup`, `_arrayDedup`) and shares its rep; this writer writes a
+    // value each time a field holds it. A map from value to rep, per type,
+    // would share them.
     fn write_value(&mut self, value: &Value) -> Result<ValueRep, FormatError> {
         match value {
             // `Value::None` represents an absent opinion and has no crate
@@ -534,7 +561,10 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
             Value::Int64(v) => self.write_pod_out(Type::Int64, v),
             Value::Uint64(v) => self.write_pod_out(Type::Uint64, v),
             Value::Double(v) => self.write_pod_out(Type::Double, v),
-            Value::TimeCode(v) => self.write_pod_out(Type::TimeCode, &v.0),
+            Value::TimeCode(v) => {
+                self.require_version(TIME_CODE_VERSION, 1);
+                self.write_pod_out(Type::TimeCode, &v.0)
+            }
 
             // Inline vectors when all components fit in i8.
             Value::Vec2h(a) => self.write_pod_out(Type::Vec2h, a),
@@ -606,7 +636,10 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
             Value::Matrix2dVec(v) => self.write_array(Type::Matrix2d, v.len(), v),
             Value::Matrix3dVec(v) => self.write_array(Type::Matrix3d, v.len(), v),
             Value::Matrix4dVec(v) => self.write_array(Type::Matrix4d, v.len(), v),
-            Value::TimeCodeVec(v) => self.write_array_f64_type(Type::TimeCode, v.len(), v.iter().map(|t| t.0)),
+            Value::TimeCodeVec(v) => {
+                self.require_version(TIME_CODE_VERSION, v.len());
+                self.write_array_f64_type(Type::TimeCode, v.len(), v.iter().map(|t| t.0))
+            }
 
             // Strings stored in their own arrays (StringVec also via token lookup).
             Value::StringVec(v) => self.write_string_vec(Type::String, true, v),
@@ -618,7 +651,10 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
             Value::PathVec(v) => self.write_path_vec(v),
             Value::LayerOffsetVec(v) => self.write_layer_offset_vec(v),
             Value::VariantSelectionMap(m) => self.write_variant_selection_map(m),
-            Value::Relocates(v) => self.write_relocates(v),
+            Value::Relocates(v) => {
+                self.require_version(RELOCATES_VERSION, v.len());
+                self.write_relocates(v)
+            }
 
             Value::Payload(p) => self.write_payload(p),
 
@@ -697,11 +733,15 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
             Value::UnregisteredValue(s) => self.write_unregistered(|w| w.write_string_rep(s)),
             Value::UnregisteredDictionary(d) => self.write_unregistered(|w| w.write_dictionary(d)),
             Value::UnregisteredValueListOp(op) => self.write_unregistered(|w| w.write_unregistered_listop(op)),
+            // C++ never inlines a path expression: its text is a string index
+            // stored on the heap.
             Value::PathExpression(expr) => {
-                let idx = self.tokens.intern(expr.to_string());
-                Ok(rep_inline(Type::PathExpression, idx as u64))
+                self.require_version(PATH_EXPRESSION_VERSION, 1);
+                let idx = self.intern_string(expr.to_string());
+                self.write_pod_out(Type::PathExpression, &idx)
             }
             Value::PathExpressionVec(v) => {
+                self.require_version(PATH_EXPRESSION_VERSION, v.len());
                 let texts: Vec<String> = v.iter().map(|expr| expr.to_string()).collect();
                 self.write_string_vec(Type::PathExpression, true, &texts)
             }
@@ -727,8 +767,8 @@ impl<'w, W: Write + Seek> Packer<'w, W> {
     // Heap helpers
     // -----------------------------------------------------------------
 
-    fn intern_string(&mut self, s: &str) -> u32 {
-        let tok = self.tokens.intern(s.to_owned());
+    fn intern_string(&mut self, s: impl Into<String>) -> u32 {
+        let tok = self.tokens.intern(s.into());
         self.strings.intern(tok)
     }
 

@@ -1,14 +1,15 @@
 //! Layer loading and the format registry.
 //!
 //! [`LayerRegistry`] owns the [`ar::Resolver`] and load policy a stage opens
-//! layers with, and dispatches through the built-in format set
+//! layers with, and the file formats it reads them in: the built-in ones and
+//! any added with [`add_format`](LayerRegistry::add_format). It dispatches
 //! ([`find_by_extension`](LayerRegistry::find_by_extension) /
 //! [`find_by_id`](LayerRegistry::find_by_id)) to the
 //! [`FileFormat`](super::FileFormat) claiming each layer's extension. It is the
-//! Rust seam for C++ `Sdf_LayerRegistry` and `SdfFileFormat::FindByExtension`:
-//! it holds the layers [`find_or_open`](LayerRegistry::find_or_open) opens,
-//! one per identifier, shared through [`sdf::LayerHandle`]s. Custom format
-//! registration grows here too.
+//! Rust seam for C++ `Sdf_LayerRegistry` and `SdfFileFormat::FindByExtension`,
+//! with the format plugins C++ discovers process-wide held per registry: it
+//! holds the layers [`find_or_open`](LayerRegistry::find_or_open) opens, one
+//! per identifier, shared through [`sdf::LayerHandle`]s.
 //!
 //! References and payloads are not followed here. Composition opens each
 //! reference/payload target layer on demand when it reaches the arc (see
@@ -18,7 +19,7 @@
 //! (spec 10.3.1.1).
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::rc::{Rc, Weak};
@@ -35,10 +36,46 @@ static USDA: UsdaFileFormat = UsdaFileFormat;
 static USDC: UsdcFileFormat = UsdcFileFormat;
 static USDZ: UsdzFileFormat = UsdzFileFormat;
 
-/// The built-in formats, in lookup order — the Rust analog of C++
-/// `SdfFileFormat`'s static plugin set. Custom formats will register alongside
-/// these on a [`LayerRegistry`] in the future; today the set is fixed.
-static DEFAULT_FORMATS: &[&dyn sdf::FileFormat] = &[&USDA, &USDC, &USDZ];
+/// The built-in formats, in lookup order: the formats C++ `Sdf` itself
+/// registers. Every [`LayerRegistry`] reads these; one may add others after
+/// them ([`LayerRegistry::add_format`]).
+pub(crate) static BUILTIN_FORMATS: &[&dyn sdf::FileFormat] = &[&USDA, &USDC, &USDZ];
+
+/// A file format of a registry's set.
+type Format = &'static dyn sdf::FileFormat;
+
+/// The formats a [`LayerRegistry`] reads layers in, in lookup order: the
+/// built-in ones, then those added to it. A clone is the same set, which the
+/// registry's clones and the layers it holds share.
+#[derive(Clone)]
+pub(crate) struct FormatSet(Rc<RefCell<Rc<[Format]>>>);
+
+impl Default for FormatSet {
+    /// The built-in formats.
+    fn default() -> Self {
+        Self(Rc::new(RefCell::new(Rc::from(BUILTIN_FORMATS))))
+    }
+}
+
+impl FormatSet {
+    /// The formats as they stand, for a lookup to run over while a format it
+    /// calls into is free to reach the set.
+    pub(crate) fn list(&self) -> Rc<[Format]> {
+        Rc::clone(&self.0.borrow())
+    }
+
+    /// Adds `format` after the others, unless the set holds one with its
+    /// [`format_id`](sdf::FileFormat::format_id). Returns whether it was
+    /// added.
+    fn add(&self, format: Format) -> bool {
+        let formats = self.list();
+        let known = by_id(&formats, &format.format_id()).is_some();
+        if !known {
+            self.0.replace(formats.iter().copied().chain([format]).collect());
+        }
+        !known
+    }
+}
 
 /// An error encountered while opening a layer's sublayer stack that may be
 /// recoverable.
@@ -145,22 +182,21 @@ impl From<LoadError> for crate::Error {
 }
 
 /// Owns layer loading for a stage: the [`ar::Resolver`] that finds and opens
-/// layers, the built-in format set, and whether payload arcs are expanded.
+/// layers, the formats it reads them in, and whether payload arcs are expanded.
 ///
 /// The `pcp::LayerGraph` holds one and opens reference and payload targets on
 /// demand through it. The resolver is private: every path that resolves and
 /// reads a layer is a method here, and the registry stands in as the
 /// [`ar::Resolver`] it fronts where one is asked for, with the identifier
-/// rules below applied. This is the Rust analog of C++ `Sdf_LayerRegistry`,
-/// less custom format registration.
+/// rules below applied. This is the Rust analog of C++ `Sdf_LayerRegistry`.
 ///
 /// The registry also holds layers, one per identifier, shared through
 /// [`sdf::LayerHandle`]s: [`find_or_open`](Self::find_or_open) returns the
 /// layer already open at an identifier, unsaved edits included, and opens it
 /// only when none is (C++ `SdfLayer::FindOrOpen`). Cloning the registry shares
-/// its resolver and the layers it holds. Every stage opened on the registry
-/// holds its layers here, so stages on one registry share each layer and see
-/// each other's edits.
+/// its resolver, its formats and the layers it holds. Every stage opened on
+/// the registry holds its layers here, so stages on one registry share each
+/// layer and see each other's edits.
 ///
 /// A layer stays held while any handle to it exists. Once its last handle
 /// drops, it is freed at the next [`sweep`](Self::sweep), or at once when no
@@ -172,6 +208,10 @@ impl From<LoadError> for crate::Error {
 #[derive(Clone)]
 pub struct LayerRegistry {
     resolver: Rc<dyn ar::Resolver>,
+    /// The formats layers are read in, shared by every clone of the
+    /// registry, so the stages holding layers in one store read them in one
+    /// set of formats.
+    formats: FormatSet,
     /// The store of the layers handles share, shared by every clone of the
     /// registry. Weak: the handles own the store, and the registry starts a
     /// new one when it next holds a layer after the last handle has dropped.
@@ -318,8 +358,38 @@ impl LayerRegistry {
     pub fn new(resolver: Box<dyn ar::Resolver>) -> Self {
         Self {
             resolver: Rc::from(resolver),
+            formats: FormatSet::default(),
             store: Rc::default(),
         }
+    }
+
+    /// Reads layers in `format` too, after the formats the registry already
+    /// reads. Every clone of the registry reads it from then on, and so does
+    /// every layer the registry holds, as C++ registers a `SdfFileFormat`
+    /// plugin for the whole process.
+    ///
+    /// Returns whether the format was added: one whose
+    /// [`format_id`](sdf::FileFormat::format_id) the registry already reads is
+    /// not. A lookup takes the first format claiming an extension, so `format`
+    /// cannot take over one a built-in format claims.
+    ///
+    /// Add a format before the registry opens the layers that need it. A
+    /// stage already open does not compose again when a format is added: a
+    /// layer it failed to read stays unread until the stage reloads.
+    pub fn add_format(&self, format: &'static dyn sdf::FileFormat) -> bool {
+        self.formats.add(format)
+    }
+
+    /// This registry after [`add_format`](Self::add_format), for a registry
+    /// built in one expression. Its clones read the format too.
+    pub fn with_format(self, format: &'static dyn sdf::FileFormat) -> Self {
+        self.add_format(format);
+        self
+    }
+
+    /// The formats this registry reads layers in, in lookup order.
+    pub fn formats(&self) -> Rc<[&'static dyn sdf::FileFormat]> {
+        self.formats.list()
     }
 
     /// The layer open in this registry at `asset_path`, if any, unsaved edits
@@ -410,9 +480,12 @@ impl LayerRegistry {
     /// registry, or from a resolver a stage calls while it reads the registry's
     /// layers.
     pub fn adopt(&self, mut layer: sdf::Layer) -> Result<sdf::LayerHandle, sdf::AdoptError> {
-        layer.set_resolver(Rc::clone(&self.resolver));
+        let (resolver, formats) = layer.set_registry(Some(Rc::clone(&self.resolver)), Some(self.formats.clone()));
         let packages = self.package_listings(layer.real_path());
-        self.store().insert(layer, packages)
+        self.store().insert(layer, packages).map_err(|mut refused| {
+            refused.layer.set_registry(resolver, formats);
+            refused
+        })
     }
 
     /// What the package `package` holds, a package nested in another named
@@ -447,7 +520,7 @@ impl LayerRegistry {
     /// What the package at `package` holds, listed by the format its
     /// extension names, or `None` where no format lists it.
     pub(crate) fn list_package(resolver: &dyn ar::Resolver, package: &str) -> Option<sdf::PackageFiles> {
-        Self::find_by_extension(resolver.extension(package))?.package_files(resolver, &ar::ResolvedPath::new(package))
+        builtin_format(resolver.extension(package))?.package_files(resolver, &ar::ResolvedPath::new(package))
     }
 
     /// Free the layers whose last handle has dropped. A dropped handle leaves
@@ -515,13 +588,18 @@ impl LayerRegistry {
     /// not change the real path; a future `.usd` format with a non-identity
     /// `resolve_layer` would need the content sniff here too.
     pub(crate) fn resolve_layer(&self, identifier: &str) -> Option<ar::ResolvedPath> {
-        Self::resolve_layer_with(self.resolver.as_ref(), identifier)
+        Self::resolve_layer_with(&self.formats.list(), self.resolver.as_ref(), identifier)
     }
 
-    /// [`resolve_layer`](Self::resolve_layer) through `resolver`.
-    pub(crate) fn resolve_layer_with(resolver: &dyn ar::Resolver, identifier: &str) -> Option<ar::ResolvedPath> {
+    /// [`resolve_layer`](Self::resolve_layer) through `resolver`, choosing
+    /// among `formats`.
+    pub(crate) fn resolve_layer_with(
+        formats: &[Format],
+        resolver: &dyn ar::Resolver,
+        identifier: &str,
+    ) -> Option<ar::ResolvedPath> {
         let resolved = resolver.resolve(identifier)?;
-        match Self::find_by_extension(&resolved.extension()) {
+        match by_extension(formats, &resolved.extension()) {
             Some(format) => format.resolve_layer(resolver, &resolved),
             None => Some(resolved),
         }
@@ -548,32 +626,26 @@ impl LayerRegistry {
     ///
     /// Returns the data with the format that read it.
     pub fn read_bytes(
+        &self,
         bytes: ar::AssetBuffer,
         source_name: &str,
     ) -> Result<(sdf::LayerData, &'static dyn sdf::FileFormat), sdf::FormatError> {
-        let format = DEFAULT_FORMATS
-            .iter()
-            .copied()
-            .find(|format| format.matches_content(&bytes))
-            .ok_or_else(|| sdf::FormatError::Unrecognized(source_name.into()))?;
-        Ok((format.read_bytes(bytes, source_name)?, format))
+        read_bytes_in(&self.formats.list(), bytes, source_name)
     }
 
-    /// Find the format claiming `ext` (without the leading dot, case-insensitive),
-    /// e.g. `"usda"` or `"usd"`. C++ `SdfFileFormat::FindByExtension`.
-    pub fn find_by_extension(ext: &str) -> Option<&'static dyn sdf::FileFormat> {
-        DEFAULT_FORMATS
-            .iter()
-            .copied()
-            .find(|f| f.extensions().iter().any(|e| e.eq_ignore_ascii_case(ext)))
+    /// Find the format of this registry claiming `ext` (without the leading
+    /// dot, case-insensitive), e.g. `"usda"` or `"usd"`. C++
+    /// `SdfFileFormat::FindByExtension`.
+    pub fn find_by_extension(&self, ext: &str) -> Option<&'static dyn sdf::FileFormat> {
+        by_extension(&self.formats.list(), ext)
     }
 
-    /// The format that writes a layer at `filename`, chosen by its extension:
-    /// [`find_by_extension`](Self::find_by_extension) narrowed to a format
-    /// that can write, with the error an export reports otherwise.
-    pub(crate) fn export_format(filename: &str) -> Result<&'static dyn sdf::FileFormat, sdf::ExportError> {
+    /// The format that writes a layer at `filename`: the first of `formats`
+    /// claiming its extension, which must be able to write, with the error an
+    /// export reports otherwise.
+    pub(crate) fn export_format(formats: &[Format], filename: &str) -> Result<Format, sdf::ExportError> {
         let ext = ar::extension(filename);
-        let format = Self::find_by_extension(ext).ok_or_else(|| match ext {
+        let format = by_extension(formats, ext).ok_or_else(|| match ext {
             "" => sdf::ExportError::NoExtension {
                 filename: filename.to_owned(),
             },
@@ -613,7 +685,7 @@ impl LayerRegistry {
             .next()
             .or_else(|| Self::is_package(resolver.extension(real_path)).then(|| real_path.to_owned()));
         if let Some(package) = outermost
-            && let Some(format) = Self::find_by_extension(resolver.extension(&package))
+            && let Some(format) = builtin_format(resolver.extension(&package))
         {
             format.forget_package(resolver, &package);
         }
@@ -622,13 +694,14 @@ impl LayerRegistry {
     /// Whether the format claiming `ext` reads packages
     /// ([`FileFormat::is_package`](sdf::FileFormat::is_package)).
     pub(crate) fn is_package(ext: &str) -> bool {
-        Self::find_by_extension(ext).is_some_and(|format| format.is_package())
+        builtin_format(ext).is_some_and(|format| format.is_package())
     }
 
-    /// Find the format with the given [`format_id`](sdf::FileFormat::format_id),
-    /// e.g. `"usdc"`. C++ `SdfFileFormat::FindById`.
-    pub fn find_by_id(id: &str) -> Option<&'static dyn sdf::FileFormat> {
-        DEFAULT_FORMATS.iter().copied().find(|f| f.format_id() == id)
+    /// Find the format of this registry with the given
+    /// [`format_id`](sdf::FileFormat::format_id), e.g. `"usdc"`. C++
+    /// `SdfFileFormat::FindById`.
+    pub fn find_by_id(&self, id: &str) -> Option<&'static dyn sdf::FileFormat> {
+        by_id(&self.formats.list(), id)
     }
 
     /// The layer the registry holds under the canonical `identifier` or read
@@ -672,8 +745,18 @@ impl LayerRegistry {
         // TODO(perf): one more stat of the file per layer read; the asset the
         // read opens could carry its modification time.
         let modified = sdf::layer::asset_time(self.resolver.as_ref(), identifier, &resolved);
-        let prepared = Self::read(self.resolver.as_ref(), identifier.to_owned(), resolved, modified)?;
-        Ok(sdf::Layer::new_resolved(prepared, Rc::clone(&self.resolver)))
+        let prepared = Self::read(
+            &self.formats.list(),
+            self.resolver.as_ref(),
+            identifier.to_owned(),
+            resolved,
+            modified,
+        )?;
+        Ok(sdf::Layer::new_resolved(
+            prepared,
+            Rc::clone(&self.resolver),
+            self.formats.clone(),
+        ))
     }
 
     /// The layer at `asset_path`, the one the registry holds or else one read
@@ -827,12 +910,14 @@ impl LayerRegistry {
     }
 
     /// Reads the layer `identifier` resolved to at `resolved` through
-    /// `resolver`, dispatching to the registered format for its extension.
-    /// The `.usd` extension is the one ambiguous case — binary crate or text —
-    /// so it reads the bytes once and lets [`read_bytes`](Self::read_bytes)
-    /// choose by content. C++ `SdfFileFormat::FindByExtension` + `CanRead`.
+    /// `resolver`, dispatching to the format of `formats` claiming its
+    /// extension. The `.usd` extension is the one ambiguous case — binary
+    /// crate or text — so it reads the bytes once and lets them choose
+    /// among the built-in formats by content. C++
+    /// `SdfFileFormat::FindByExtension` + `CanRead`.
     /// `modified` is the asset's modification time, taken before the read.
     pub(crate) fn read(
+        formats: &[Format],
         resolver: &dyn ar::Resolver,
         identifier: String,
         resolved: ar::ResolvedPath,
@@ -844,9 +929,9 @@ impl LayerRegistry {
                 .open_asset(&resolved)
                 .and_then(|asset| asset.into_buffer())
                 .map_err(sdf::FormatError::from)?;
-            Self::read_bytes(bytes, &resolved.to_string())?
+            read_bytes_in(BUILTIN_FORMATS, bytes, &resolved.to_string())?
         } else {
-            let format = Self::find_by_extension(&ext).ok_or_else(|| LoadError::UnsupportedFormat {
+            let format = by_extension(formats, &ext).ok_or_else(|| LoadError::UnsupportedFormat {
                 resolved: resolved.to_string(),
             })?;
             (format.read(resolver, &resolved)?, format)
@@ -1012,11 +1097,55 @@ impl LayerRegistry {
     }
 }
 
+/// The first of `formats` claiming `ext` (without the leading dot,
+/// case-insensitive).
+pub(crate) fn by_extension(formats: &[Format], ext: &str) -> Option<Format> {
+    formats
+        .iter()
+        .copied()
+        .find(|f| f.extensions().iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
+/// The first of `formats` with the given
+/// [`format_id`](sdf::FileFormat::format_id).
+fn by_id(formats: &[Format], id: &str) -> Option<Format> {
+    formats.iter().copied().find(|f| f.format_id() == id)
+}
+
+/// The built-in format claiming `ext`, for a lookup no registry is in reach
+/// of: package listing and anchoring, the `usdz` archive's own entries and
+/// the asset walk.
+// TODO: these lookups do not find a format added to a registry: one that
+// reads packages, one the root layer of a `usdz` is in, or one a layer named
+// by an asset-valued attribute is in. They need the registry's set carried to
+// the package anchoring (`sdf::anchor`), the `usdz` reader and the asset walk
+// (`usd_utils::walk`).
+pub(crate) fn builtin_format(ext: &str) -> Option<Format> {
+    by_extension(BUILTIN_FORMATS, ext)
+}
+
+/// Decodes `bytes` as a layer in the first of `formats` whose
+/// [`matches_content`](sdf::FileFormat::matches_content) claims what they
+/// begin with ([`LayerRegistry::read_bytes`]).
+pub(crate) fn read_bytes_in(
+    formats: &[Format],
+    bytes: ar::AssetBuffer,
+    source_name: &str,
+) -> Result<(sdf::LayerData, Format), sdf::FormatError> {
+    let format = formats
+        .iter()
+        .copied()
+        .find(|format| format.matches_content(&bytes))
+        .ok_or_else(|| sdf::FormatError::Unrecognized(source_name.into()))?;
+    Ok((format.read_bytes(bytes, source_name)?, format))
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::Result;
     use crate::sdf::FileFormatCaps;
+    use crate::tf;
+    use std::{fs, str};
 
     /// `layer` held in `store`, or the live layer already carrying its
     /// identifier or real path, which a fixture repeating a layer collapses
@@ -1124,7 +1253,13 @@ pub(crate) mod tests {
         };
         visited.insert(identifier.clone());
         let modified = sdf::layer::AssetTime::Unknown;
-        let layer = LayerRegistry::read(registry.resolver.as_ref(), identifier, resolved, modified)?;
+        let layer = LayerRegistry::read(
+            &registry.formats(),
+            registry.resolver.as_ref(),
+            identifier,
+            resolved,
+            modified,
+        )?;
         let (data, resolved) = (layer.data.as_ref(), &layer.resolved);
         // Resolve this layer's arc/sublayer paths against its stack context (root
         // own overlaid by the inherited overrides). This eager test closure loads a
@@ -1140,7 +1275,11 @@ pub(crate) mod tests {
             };
             collect_with_arcs_in(registry, &dep_asset, Some(resolved), &stack_vars, layers, visited)?;
         }
-        layers.push(sdf::Layer::new_resolved(layer, Rc::clone(&registry.resolver)));
+        layers.push(sdf::Layer::new_resolved(
+            layer,
+            Rc::clone(&registry.resolver),
+            registry.formats.clone(),
+        ));
         Ok(())
     }
 
@@ -1180,7 +1319,7 @@ pub(crate) mod tests {
                 && let vt::Value::TokenVec(children) = value.into_owned()
             {
                 for name in children.iter().rev() {
-                    if let Ok(child) = path.append_path(name.as_str()) {
+                    if let Ok(child) = path.append_child(name) {
                         queue.push(child);
                     }
                 }
@@ -1231,30 +1370,182 @@ pub(crate) mod tests {
         LayerRegistry::default()
     }
 
+    /// A read-only format for `.planted` files, a prim name per line, each
+    /// read as a `def Scope`: a format another crate would add to a registry.
+    pub(crate) struct Planted;
+
+    /// The one [`Planted`] a registry is given.
+    pub(crate) static PLANTED: Planted = Planted;
+
+    impl sdf::FileFormat for Planted {
+        fn format_id(&self) -> tf::Token {
+            "planted".into()
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["planted"]
+        }
+
+        fn caps(&self) -> FileFormatCaps {
+            FileFormatCaps::READ
+        }
+
+        fn read_bytes(&self, bytes: ar::AssetBuffer, _: &str) -> Result<sdf::LayerData, sdf::FormatError> {
+            let text = str::from_utf8(&bytes).map_err(|error| sdf::FormatError::Decode(Box::new(error)))?;
+            let mut data = sdf::Data::rooted();
+            for name in text.lines().filter(|line| !line.is_empty()) {
+                let path = sdf::Path::abs_root()
+                    .append_child(name)
+                    .map_err(|error| sdf::FormatError::Decode(Box::new(error)))?;
+                sdf::PrimSpec::new(&mut data, path, sdf::Specifier::Def, "Scope")
+                    .map_err(|error| sdf::FormatError::Decode(Box::new(error)))?;
+            }
+            Ok(Box::new(data))
+        }
+
+        fn write(&self, _: &dyn sdf::AbstractData, _: &mut dyn sdf::WriteSeek) -> Result<(), sdf::FormatError> {
+            Err(sdf::FormatError::Encode {
+                reason: "planted is read-only".into(),
+            })
+        }
+    }
+
+    /// A format added to a registry reads its files; one without it does not.
+    #[test]
+    fn added_format_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a.planted");
+        fs::write(&path, "A\nB\n")?;
+        let path = path.to_str().expect("utf-8 path");
+
+        let added = registry().with_format(&PLANTED);
+        let layer = added.find_or_open(path)?.expect("resolves");
+        assert!(layer.borrow().prim("/B")?.is_some());
+        assert!(registry().find_or_open(path).is_err(), "no format reads it");
+        Ok(())
+    }
+
+    /// A format is looked up after the built-in ones, and added once.
+    #[test]
+    fn added_format_once() {
+        let added = registry().with_format(&PLANTED);
+        assert!(!added.add_format(&PLANTED), "its id is already read");
+        assert_eq!(added.formats().len(), BUILTIN_FORMATS.len() + 1);
+        assert_eq!(
+            added.find_by_id("planted").map(|f| f.format_id()),
+            Some("planted".into())
+        );
+        assert!(registry().find_by_extension("planted").is_none());
+        assert_eq!(
+            added.find_by_extension("usda").map(|f| f.format_id()),
+            Some("usda".into())
+        );
+    }
+
+    /// A format added through one clone of a registry is read through the
+    /// others, which hold their layers in the same store.
+    #[test]
+    fn added_format_shared() {
+        let registry = registry();
+        let clone = registry.clone();
+        registry.add_format(&PLANTED);
+        assert!(clone.find_by_extension("planted").is_some());
+    }
+
+    /// A layer is exported in a format added to its registry when that
+    /// format claims the destination's extension, so a read-only one refuses
+    /// the write, and in a built-in format otherwise.
+    #[test]
+    fn added_format_exports() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a.planted");
+        fs::write(&path, "A\n")?;
+        let layer = registry()
+            .with_format(&PLANTED)
+            .find_or_open(path.to_str().expect("utf-8 path"))?
+            .expect("resolves");
+        let copy = dir.path().join("b.planted");
+        let refused = layer.borrow().export(copy.to_str().expect("utf-8 path"));
+        assert!(matches!(refused, Err(sdf::ExportError::NotWritable { .. })));
+        let text = dir.path().join("b.usda");
+        layer.borrow().export(text.to_str().expect("utf-8 path"))?;
+        assert!(fs::read_to_string(text)?.contains("def Scope \"A\""));
+        Ok(())
+    }
+
+    /// A layer the registry refuses is handed back reading the formats it
+    /// came with.
+    #[test]
+    fn adopt_refused_unbound() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a.usda");
+        fs::write(&path, "#usda 1.0\n")?;
+        let path = path.to_str().expect("utf-8 path");
+        let registry = registry().with_format(&PLANTED);
+        let _held = registry.find_or_open(path)?.expect("resolves");
+        let refused = registry.adopt(sdf::Layer::open(path)?).expect_err("already open");
+        let copy = dir.path().join("b.planted");
+        let export = refused.layer.export(copy.to_str().expect("utf-8 path"));
+        assert!(matches!(export, Err(sdf::ExportError::UnsupportedExtension { .. })));
+        Ok(())
+    }
+
+    /// An anonymous layer tagged with an added format's extension keeps its
+    /// content through a reload, as that format asks.
+    #[test]
+    fn added_format_anonymous() -> Result<()> {
+        let mut layer = sdf::Layer::new_anonymous("scratch.planted");
+        layer.edit(|e| sdf::PrimSpec::new(e.data_mut(), "/A", sdf::Specifier::Def, "Scope").map(drop))?;
+        let layer = registry()
+            .with_format(&PLANTED)
+            .adopt(layer)
+            .map_err(|refused| refused.error)?;
+        layer.reload(true)?;
+        assert!(layer.borrow().prim("/A")?.is_some());
+        Ok(())
+    }
+
+    /// A layer reloads in the format it was read in.
+    #[test]
+    fn added_format_reloads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a.planted");
+        fs::write(&path, "A\n")?;
+        let layer = registry()
+            .with_format(&PLANTED)
+            .find_or_open(path.to_str().expect("utf-8 path"))?
+            .expect("resolves");
+        fs::write(&path, "A\nC\n")?;
+        assert!(layer.reload(true)?);
+        assert!(layer.borrow().prim("/C")?.is_some());
+        Ok(())
+    }
+
     /// Bytes are dispatched by what they begin with: the crate magic, the
     /// `usda` header, and nothing else. A guess would decode one format's
     /// bytes as another's and report that format's parse error.
     #[test]
     fn content_picks_format() {
-        let text = LayerRegistry::read_bytes(
-            b"#usda 1.0
+        let text = registry()
+            .read_bytes(
+                b"#usda 1.0
 "
-            .as_slice()
-            .into(),
-            "text",
-        )
-        .expect("text is recognized");
+                .as_slice()
+                .into(),
+                "text",
+            )
+            .expect("text is recognized");
         assert!(text.0.has_spec(&sdf::Path::abs_root()));
         assert_eq!(text.1.format_id(), "usda");
 
-        let unknown = LayerRegistry::read_bytes(b"nothing claims this".as_slice().into(), "mystery");
+        let unknown = registry().read_bytes(b"nothing claims this".as_slice().into(), "mystery");
         assert!(
             matches!(unknown, Err(sdf::FormatError::Unrecognized(_))),
             "unrecognized bytes are refused rather than guessed at"
         );
 
         // The lexer skips whitespace before the cookie, so detection must too.
-        let indented = LayerRegistry::read_bytes(b"\n#usda 1.0\n".as_slice().into(), "indented");
+        let indented = registry().read_bytes(b"\n#usda 1.0\n".as_slice().into(), "indented");
         assert!(indented.is_ok(), "a layer opening with a blank line is still text");
     }
 
@@ -1270,33 +1561,30 @@ pub(crate) mod tests {
 
     #[test]
     fn lookup_by_extension() {
-        assert_eq!(LayerRegistry::find_by_extension("usda").unwrap().format_id(), "usda");
-        assert_eq!(LayerRegistry::find_by_extension("usdc").unwrap().format_id(), "usdc");
-        assert_eq!(LayerRegistry::find_by_extension("usd").unwrap().format_id(), "usdc");
-        assert_eq!(LayerRegistry::find_by_extension("USDA").unwrap().format_id(), "usda");
-        assert_eq!(LayerRegistry::find_by_extension("usdz").unwrap().format_id(), "usdz");
-        assert!(LayerRegistry::find_by_extension("xyz").is_none());
-        assert!(LayerRegistry::find_by_extension("").is_none());
+        assert_eq!(registry().find_by_extension("usda").unwrap().format_id(), "usda");
+        assert_eq!(registry().find_by_extension("usdc").unwrap().format_id(), "usdc");
+        assert_eq!(registry().find_by_extension("usd").unwrap().format_id(), "usdc");
+        assert_eq!(registry().find_by_extension("USDA").unwrap().format_id(), "usda");
+        assert_eq!(registry().find_by_extension("usdz").unwrap().format_id(), "usdz");
+        assert!(registry().find_by_extension("xyz").is_none());
+        assert!(registry().find_by_extension("").is_none());
     }
 
     #[test]
     fn lookup_by_id() {
-        assert_eq!(
-            LayerRegistry::find_by_id("usdc").unwrap().extensions(),
-            &["usdc", "usd"]
-        );
-        assert!(LayerRegistry::find_by_id("usd").is_none());
+        assert_eq!(registry().find_by_id("usdc").unwrap().extensions(), &["usdc", "usd"]);
+        assert!(registry().find_by_id("usd").is_none());
     }
 
     #[test]
     fn builtin_capabilities() {
         for id in ["usda", "usdc"] {
-            let caps = LayerRegistry::find_by_id(id).unwrap().caps();
+            let caps = registry().find_by_id(id).unwrap().caps();
             assert_eq!(caps, FileFormatCaps::all(), "{id} should read, write, and edit");
         }
         // usdz is a package format: writable as a new archive, but not editable
         // (savable) in place.
-        let usdz = LayerRegistry::find_by_id("usdz").unwrap().caps();
+        let usdz = registry().find_by_id("usdz").unwrap().caps();
         assert!(usdz.can_read() && usdz.can_write());
         assert!(!usdz.can_edit(), "usdz should not be editable in place");
     }

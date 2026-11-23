@@ -3589,14 +3589,16 @@ impl Stage {
     /// source's map: a winning value-clip set contributes its times here.
     pub fn time_sample_times(&self, attr_path: impl sdf::IntoPath) -> Result<Option<Vec<f64>>> {
         let attr_path = sdf::try_into_path(attr_path)?;
-        Ok(self.masked_opinions(&attr_path, |g, c| c.time_sample_times(g, &attr_path))?)
+        self.attribute_opinions(&attr_path, |g, c, declared| {
+            c.time_sample_times(g, &attr_path, declared)
+        })
     }
 
     /// Returns the number of composed `timeSamples` for an attribute, zero when
     /// none are authored. Resolves the count without cloning the sample values.
     pub fn num_time_samples(&self, attr_path: impl sdf::IntoPath) -> Result<usize> {
         let attr_path = sdf::try_into_path(attr_path)?;
-        Ok(self.masked_opinions(&attr_path, |g, c| c.num_time_samples(g, &attr_path))?)
+        self.attribute_opinions(&attr_path, |g, c, declared| c.num_time_samples(g, &attr_path, declared))
     }
 
     /// Whether an attribute's value may vary over time, the introspection behind
@@ -3607,7 +3609,9 @@ impl Stage {
     /// even where the discrete sample count collapses to one (spec 12.3.4).
     pub fn value_might_be_time_varying(&self, attr_path: impl sdf::IntoPath) -> Result<bool> {
         let attr_path = sdf::try_into_path(attr_path)?;
-        Ok(self.masked_opinions(&attr_path, |g, c| c.value_might_be_time_varying(g, &attr_path))?)
+        self.attribute_opinions(&attr_path, |g, c, declared| {
+            c.value_might_be_time_varying(g, &attr_path, declared)
+        })
     }
 
     /// Evaluate an attribute's value at `time`, or at the default time when it
@@ -3637,7 +3641,9 @@ impl Stage {
         let attr_path = sdf::try_into_path(attr_path)?;
         let interp_type = self.interpolation.get();
         let interp = |samples: &sdf::TimeSampleMap, t: f64| interp::evaluate(samples, t, interp_type);
-        Ok(self.masked_opinions(&attr_path, |g, c| c.value_at(g, &attr_path, time, &interp, read))?)
+        self.attribute_opinions(&attr_path, |g, c, declared| {
+            c.value_at(g, &attr_path, time, &interp, read, declared)
+        })
     }
 
     /// Resolves the cacheable value source for an attribute, the source half of
@@ -3648,7 +3654,9 @@ impl Stage {
     /// `None` with no stamp when the attribute's prim is outside the population
     /// mask.
     pub(crate) fn resolve_value_source(&self, attr_path: &sdf::Path) -> Result<pcp::StampedValueSource> {
-        Ok(self.masked_opinions(attr_path, |g, c| c.resolve_value_source(g, attr_path))?)
+        self.attribute_opinions(attr_path, |g, c, declared| {
+            c.resolve_value_source(g, attr_path, declared)
+        })
     }
 
     /// Every spec contributing to the property at `path`, strongest first, with
@@ -3693,7 +3701,39 @@ impl Stage {
         // decides which samples answer exactly as the value read does.
         let interp_type = self.interpolation.get();
         let interp = |samples: &sdf::TimeSampleMap, t: f64| interp::evaluate(samples, t, interp_type);
-        Ok(self.masked_opinions(attr_path, |g, c| c.resolve_info(g, &stage_id, attr_path, mode, &interp))?)
+        self.attribute_opinions(attr_path, |g, c, declared| {
+            c.resolve_info(g, &stage_id, attr_path, mode, &interp, declared)
+        })
+    }
+
+    /// Runs an attribute query, and runs it again as a declared attribute
+    /// where composition reports that the answer turns on a declaration
+    /// ([`pcp::Gated::NeedsDeclaration`]).
+    ///
+    /// A value clip answers for an attribute a schema declares and no layer
+    /// authors, and only the schema registry knows which attributes those
+    /// are. The declaration is looked up only for such an attribute; where
+    /// none declares it, the query's own answer for that case stands.
+    // TODO(perf): a declared attribute composes twice, once to learn that its
+    // declaration decides and once to answer. The declaration, memoized per
+    // prim type beside the type info, would let the first pass carry it.
+    fn attribute_opinions<T: Default>(
+        &self,
+        attr_path: &sdf::Path,
+        mut query: impl FnMut(&pcp::LayerView<'_>, &mut pcp::IndexCache, bool) -> Result<pcp::Gated<T>, pcp::QueryError>,
+    ) -> Result<T> {
+        let undeclared = match self.masked_opinions(attr_path, |g, c| query(g, c, false))? {
+            pcp::Gated::Answer(answer) => return Ok(answer),
+            pcp::Gated::NeedsDeclaration { undeclared } => undeclared,
+        };
+        let attribute = super::Attribute::new(self, attr_path.clone());
+        if attribute.declared_spec_type()? != Some(sdf::SpecType::Attribute) {
+            return Ok(undeclared);
+        }
+        match self.masked_opinions(attr_path, |g, c| query(g, c, true))? {
+            pcp::Gated::Answer(answer) => Ok(answer),
+            pcp::Gated::NeedsDeclaration { .. } => unreachable!("a declared attribute needs no declaration"),
+        }
     }
 
     /// The epochs a memoized prim type stays valid under, read together from
@@ -4137,7 +4177,7 @@ impl Stage {
                 // that is not populated has none.
                 Ok(children) => {
                     for name in children.iter().rev() {
-                        if let Ok(child) = path.append_path(name.as_str()) {
+                        if let Ok(child) = path.append_child(name) {
                             stack.push(child);
                         }
                     }
@@ -4292,7 +4332,7 @@ impl Stage {
         let names = self.masked(parent, |g, cache| cache.populated_children(g, parent))?;
         let mut children = Vec::with_capacity(names.len());
         for name in names {
-            let Ok(child) = parent.append_path(name.as_str()) else {
+            let Ok(child) = parent.append_child(name) else {
                 continue;
             };
             let status = self.child_status_masked(&child, status, needed)?;
@@ -4638,7 +4678,7 @@ impl Stage {
             let children = self.masked(&path, |g, cache| cache.populated_children(g, &path))?;
             // Push in reverse so first child is visited first.
             for name in children.iter().rev() {
-                if let Ok(child) = path.append_path(name.as_str()) {
+                if let Ok(child) = path.append_child(name) {
                     stack.push((child, Some((epoch, status))));
                 }
             }
@@ -4671,6 +4711,9 @@ impl Drop for LoadRulesGuard<'_> {
 /// load through (resolver + file formats) and composition options.
 pub struct StageBuilder {
     registry: sdf::LayerRegistry,
+    /// The formats [`format`](Self::format) named, added to the registry
+    /// when the stage opens.
+    formats: Vec<&'static dyn sdf::FileFormat>,
     variant_fallbacks: pcp::VariantFallbackMap,
     session_layer: Option<String>,
     initial_load_set: InitialLoadSet,
@@ -4695,6 +4738,7 @@ impl StageBuilder {
     fn new() -> Self {
         Self {
             registry: sdf::LayerRegistry::default(),
+            formats: Vec::new(),
             variant_fallbacks: pcp::VariantFallbackMap::new(),
             session_layer: None,
             initial_load_set: InitialLoadSet::LoadAll,
@@ -4720,11 +4764,31 @@ impl StageBuilder {
     }
 
     /// Sets a custom asset resolver, wrapping it in a [`sdf::LayerRegistry`]
-    /// over the built-in formats. A convenience over
+    /// that takes the place of the builder's registry, the formats added to
+    /// that one directly included. A convenience over
     /// [`registry`](Self::registry).
-    pub fn resolver<R: ar::Resolver + 'static>(mut self, resolver: R) -> Self {
-        self.registry = sdf::LayerRegistry::new(Box::new(resolver));
+    pub fn resolver<R: ar::Resolver + 'static>(self, resolver: R) -> Self {
+        self.registry(sdf::LayerRegistry::new(Box::new(resolver)))
+    }
+
+    /// Reads layers in `format` too, beside the built-in formats, so a
+    /// reference, payload or sublayer naming one of its files composes, and
+    /// so does a root layer of it. Calls add up, in any order with
+    /// [`registry`](Self::registry) and [`resolver`](Self::resolver).
+    ///
+    /// The format is added to the stage's registry when the stage opens
+    /// ([`sdf::LayerRegistry::add_format`]). Every stage on that registry
+    /// reads it from then on.
+    pub fn format(mut self, format: &'static dyn sdf::FileFormat) -> Self {
+        self.formats.push(format);
         self
+    }
+
+    /// Adds the formats the builder names to its registry.
+    fn add_formats(&self) {
+        for &format in &self.formats {
+            self.registry.add_format(format);
+        }
     }
 
     /// Sets the stage-level interpolation mode for time-sampled
@@ -4873,6 +4937,7 @@ impl StageBuilder {
         // One cache scope spans the open. A packaged root is opened once for
         // its default-layer lookup, its probes and its entry reads.
         let _scope = ar::CacheScope::begin();
+        self.add_formats();
         let root = self.registry.prepare_root(root_path)?;
         self.open_root(root)
     }
@@ -4888,6 +4953,7 @@ impl StageBuilder {
     /// already holds a layer with its identifier or read from its file.
     pub fn open_layer(self, layer: sdf::Layer) -> Result<Stage> {
         let _scope = ar::CacheScope::begin();
+        self.add_formats();
         let root = self.registry.adopt(layer).map_err(|refused| refused.error)?;
         self.open_root(root.into())
     }
@@ -5183,6 +5249,56 @@ pub(crate) mod tests {
 
     pub(crate) fn stage() -> Result<Stage> {
         Stage::builder().in_memory("anon.usda")
+    }
+
+    /// A reference into a file of a format the builder adds composes, through
+    /// a resolver set after the format.
+    #[test]
+    fn builder_format_composes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("lib.planted"), "Thing\n")?;
+        let root = dir.path().join("root.usda");
+        fs::write(
+            &root,
+            "#usda 1.0\ndef \"W\" (references = @./lib.planted@</Thing>)\n{\n}\n",
+        )?;
+        let stage = Stage::builder()
+            .format(&sdf::layer_registry::tests::PLANTED)
+            .resolver(ar::DefaultResolver::new())
+            .open(root.to_str().expect("utf-8 path"))?;
+        let prim = stage.prim("/W")?;
+        assert_eq!(prim.type_name()?.as_ref().map(|t| t.as_str()), Some("Scope"));
+        Ok(())
+    }
+
+    /// A format added before the registry is set is added to that registry,
+    /// so a second stage on it composes the format's files too.
+    #[test]
+    fn builder_format_then_registry() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("lib.planted"), "Thing\n")?;
+        let root = dir.path().join("root.usda");
+        fs::write(
+            &root,
+            "#usda 1.0\ndef \"W\" (references = @./lib.planted@</Thing>)\n{\n}\n",
+        )?;
+        let root = root.to_str().expect("utf-8 path");
+        let registry = sdf::LayerRegistry::default();
+        let first = Stage::builder()
+            .format(&sdf::layer_registry::tests::PLANTED)
+            .registry(registry.clone())
+            .open(root)?;
+        assert_eq!(
+            first.prim("/W")?.type_name()?.as_ref().map(|t| t.as_str()),
+            Some("Scope")
+        );
+        drop(first);
+        let second = Stage::builder().registry(registry).open(root)?;
+        assert_eq!(
+            second.prim("/W")?.type_name()?.as_ref().map(|t| t.as_str()),
+            Some("Scope")
+        );
+        Ok(())
     }
 
     /// A stage whose `/Child` references `</R>` in `ref.usda`, with the edit

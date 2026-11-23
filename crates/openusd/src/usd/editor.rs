@@ -39,21 +39,23 @@
 //! silently merging.
 //!
 //! In both shapes the structural move is [`copy_spec_within`](crate::sdf::copy_spec_within)
-//! plus [`Layer::remove_spec`](crate::sdf::Layer::remove_spec), and the fixup
-//! remaps embedded paths in place through
+//! plus [`Layer::remove_spec`](crate::sdf::Layer::remove_spec). A rename then
+//! returns the new name to the old one's place in the owner's child list. The
+//! fixup remaps embedded paths in place through
 //! [`Value::filter_map_paths`](crate::vt::Value::filter_map_paths), preserving
 //! list-op structure rather than flattening opinions. The local-stack fixup
 //! remaps in stage namespace; the mapped fixup lifts each path to stage
 //! namespace, follows the batch's moves, then maps it back into the target
 //! layer's namespace.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use super::composition::StackPin;
 use super::{EditTarget, Prim, Stage, StageAuthoringError};
-use crate::{Result, pcp, sdf, vt};
+use crate::{Result, pcp, sdf, tf, vt};
 
 /// Batches namespace edits — prim/property renames, reparents, and deletes —
 /// and applies them to a [`Stage`] with full target/connection/reference fixup.
@@ -258,7 +260,7 @@ impl NamespaceEditor {
         let src = prim.path().clone();
         let parent = src.parent().ok_or(NamespaceEditError::PseudoRoot)?;
         let dst = parent
-            .append_path(new_name)
+            .append_child(new_name)
             .map_err(|_| NamespaceEditError::InvalidDestination(src.clone()))?;
         Ok(self.push_move(src, dst, ObjectKind::Prim))
     }
@@ -281,7 +283,7 @@ impl NamespaceEditor {
         let src = prim.path().clone();
         let dst = new_parent
             .path()
-            .append_path(new_name)
+            .append_child(new_name)
             .map_err(|_| NamespaceEditError::InvalidDestination(src.clone()))?;
         Ok(self.push_move(src, dst, ObjectKind::Prim))
     }
@@ -1633,13 +1635,76 @@ fn apply_mapped_edit(layers: &mut [sdf::LayerEdit<'_>], edit: &MappedEdit) -> Re
 
 /// Move the spec subtree at `src` to `dst` within one layer: copy it then remove
 /// the source, returning whether a spec was present to move. The structural move
-/// shared by the local-stack and mapped authoring paths.
+/// shared by the local-stack and mapped authoring paths. A rename keeps its
+/// place among its siblings, as C++ moves with `SdfNamespaceEdit::Same`.
+// TODO(perf): a rename writes the owner's child list three times: the copy
+// appends the new name, the removal drops the old one, and the slot restore
+// moves the new name back. A move-with-index in `sdf` (C++
+// `Sdf_ChildrenUtils::MoveChildForBatchNamespaceEdit`) would write it once.
 fn move_spec(layer: &mut sdf::LayerEdit<'_>, src: &sdf::Path, dst: &sdf::Path) -> Result<bool, sdf::AuthoringError> {
+    if !layer.data().has_spec(src) {
+        return Ok(false);
+    }
+    let slot = Slot::of(layer.data(), src, dst)?;
     let moved = sdf::copy_spec_within(layer.data_mut(), src, dst)?;
     if moved {
         layer.remove_spec(src)?;
+        if let Some(slot) = slot {
+            slot.restore(layer.data_mut())?;
+        }
     }
     Ok(moved)
+}
+
+/// The place a renamed spec holds in its owner's child list, which the spec
+/// keeps under its new name.
+struct Slot {
+    owner: sdf::Path,
+    key: sdf::ChildrenKey,
+    index: usize,
+    name: tf::Token,
+}
+
+impl Slot {
+    /// The place of `src` in this layer, when the move to `dst` is a rename:
+    /// one that keeps the owner.
+    fn of(data: &dyn sdf::AbstractData, src: &sdf::Path, dst: &sdf::Path) -> Result<Option<Self>, sdf::AuthoringError> {
+        let (Some((owner, key, old)), Some((dst_owner, _, new))) = (sdf::child_slot(src), sdf::child_slot(dst)) else {
+            return Ok(None);
+        };
+        if owner != dst_owner {
+            return Ok(None);
+        }
+        let names = data.try_field(&owner, key.as_str())?;
+        let Some(vt::Value::TokenVec(names)) = names.as_deref() else {
+            return Ok(None);
+        };
+        let Some(index) = names.iter().position(|n| n == old) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            owner,
+            key,
+            index,
+            name: tf::Token::from(new),
+        }))
+    }
+
+    /// Move the renamed spec's name back to this place in the owner's child
+    /// list.
+    fn restore(&self, data: &mut dyn sdf::AbstractData) -> Result<(), sdf::AuthoringError> {
+        let names = data.try_field(&self.owner, self.key.as_str())?.map(Cow::into_owned);
+        let Some(vt::Value::TokenVec(mut names)) = names else {
+            return Ok(());
+        };
+        let Some(at) = names.iter().position(|n| *n == self.name) else {
+            return Ok(());
+        };
+        let name = names.remove(at);
+        names.insert(self.index.min(names.len()), name);
+        data.set_field(&self.owner, self.key.as_str(), vt::Value::TokenVec(names));
+        Ok(())
+    }
 }
 
 /// Rewrite every embedded namespace path in `layer` for an identity local-stack
@@ -1953,6 +2018,32 @@ mod tests {
         assert_eq!(connections(&stage, "/Other.con"), vec!["/B.out"]);
     }
 
+    /// A new name must be one prim identifier, so a rename or a reparent
+    /// cannot move a prim deeper with a name like `B/C`.
+    #[test]
+    fn rename_refuses_path() {
+        let stage = sample();
+        let a = stage.prim(path("/A").unwrap()).unwrap();
+        let keep = stage.prim(path("/Keep").unwrap()).unwrap();
+        let mut editor = NamespaceEditor::new(&stage);
+        for name in ["B/C", "..", "B.x", ""] {
+            assert!(
+                matches!(
+                    editor.rename_prim(&a, name),
+                    Err(NamespaceEditError::InvalidDestination(_))
+                ),
+                "{name:?}"
+            );
+            assert!(
+                matches!(
+                    editor.reparent_prim_with_name(&a, &keep, name),
+                    Err(NamespaceEditError::InvalidDestination(_))
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
     #[test]
     fn reparent_under_parent() {
         let stage = sample();
@@ -2068,6 +2159,55 @@ mod tests {
 
         assert!(stage.has_spec(&path("/A.renamed").unwrap()).unwrap());
         assert!(!stage.has_spec(&path("/A.out").unwrap()).unwrap());
+    }
+
+    /// A renamed prim or property keeps its place among its siblings.
+    #[test]
+    fn rename_keeps_place() {
+        let stage = Stage::builder().in_memory("root.usda").unwrap();
+        for name in ["/A", "/B", "/C"] {
+            stage.define_prim(name).unwrap();
+        }
+        for name in ["/A.x", "/A.y", "/A.z"] {
+            stage.create_attribute(name, "double").unwrap();
+        }
+        NamespaceEditor::new(&stage)
+            .move_prim(path("/B").unwrap(), path("/B2").unwrap())
+            .unwrap()
+            .move_property(path("/A.y").unwrap(), path("/A.y2").unwrap())
+            .unwrap()
+            .apply()
+            .unwrap();
+
+        let children = |owner: &str, key: &str| {
+            let layer = stage.root_layer();
+            let names = layer
+                .borrow()
+                .data()
+                .field(&path(owner).unwrap(), key)
+                .unwrap()
+                .into_owned();
+            names.try_as_token_vec().unwrap()
+        };
+        assert_eq!(children("/", "primChildren"), ["A", "B2", "C"]);
+        assert_eq!(children("/A", "propertyChildren"), ["x", "y2", "z"]);
+        assert_eq!(stage.prim("/").unwrap().child_names().unwrap(), ["A", "B2", "C"]);
+    }
+
+    /// A move under another parent appends to that parent's children, as C++
+    /// does for any index past the end.
+    #[test]
+    fn reparent_appends() {
+        let stage = Stage::builder().in_memory("root.usda").unwrap();
+        for name in ["/A", "/P", "/P/x", "/P/y"] {
+            stage.define_prim(name).unwrap();
+        }
+        NamespaceEditor::new(&stage)
+            .move_prim(path("/A").unwrap(), path("/P/A").unwrap())
+            .unwrap()
+            .apply()
+            .unwrap();
+        assert_eq!(stage.prim("/P").unwrap().child_names().unwrap(), ["x", "y", "A"]);
     }
 
     #[test]
@@ -2810,6 +2950,29 @@ mod tests {
         // The deeper-arc content composes back at the moved path.
         assert!(valid(&stage, "/Ref/Moved"));
         assert!(!valid(&stage, "/Ref/Inner"));
+    }
+
+    /// A rename through a reference edit target keeps its place in the
+    /// target layer's child list.
+    #[test]
+    fn mapped_rename_keeps_place() {
+        let stage = mapped_stage(|_| {});
+        stage.define_prim("/Ref/C").unwrap();
+        NamespaceEditor::new(&stage)
+            .move_prim(path("/Ref/A").unwrap(), path("/Ref/A2").unwrap())
+            .unwrap()
+            .apply()
+            .unwrap();
+
+        let model = stage.layer("model.usda").unwrap().expect("model layer");
+        let names = model
+            .borrow()
+            .data()
+            .field(&path("/Model").unwrap(), "primChildren")
+            .unwrap()
+            .into_owned();
+        assert_eq!(names.try_as_token_vec().unwrap(), ["A2", "C"]);
+        assert_eq!(stage.prim("/Ref").unwrap().child_names().unwrap(), ["A2", "C"]);
     }
 
     /// A mapped delete of a source arriving across an arc nested below the

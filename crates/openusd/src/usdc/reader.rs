@@ -41,11 +41,9 @@ const MAX_DECOMPRESSED_BYTES: usize = if usize::BITS > 32 { 4 << 30 } else { usi
 /// moved either way, would say where it belongs.
 const MIN_ADVISED_BYTES: usize = 1 << 20;
 
-// Maximum supported USDC crate version.
-// See USD Core Specification v1.0.1 §16.3.8.2 for version history:
-//   0.10.0 — Path Expression value types
-//   0.11.0 — Relocates in layer metadata
-//   0.12.0 — Splines
+// Maximum supported USDC crate version: 0.12.0 added splines. The versions
+// that introduced the value types before it are named in `layout`, after USD
+// Core Specification v1.0.1 §16.3.8.2.
 const SW_VERSION: Version = version(0, 12, 0);
 
 /// A crate file: its structural sections, read once by [`open`](Self::open),
@@ -738,8 +736,9 @@ impl<'a> Decoder<'a> {
     ///
     /// Both encode an index that points into the token table when the value is
     /// inlined but into the string table when it is stored on the heap, so the
-    /// table is chosen by the inlined flag (mirrors `SdfAssetPath` /
-    /// `SdfPathExpression` handling in Pixar's crate reader).
+    /// table is chosen by the inlined flag. C++ `CrateFile` inlines an
+    /// `SdfAssetPath` as a token and stores an `SdfPathExpression` on the heap
+    /// as a string.
     fn read_asset_path(&mut self, value: ValueRep) -> Result<String, ReadError> {
         let index = self.unpack_value::<u32>(value)?;
         if value.is_inlined() {
@@ -1715,10 +1714,10 @@ fn build_compressed_paths(
     // sibling subtrees are independent and should be decoded in parallel, as
     // the C++ WorkDispatcher does.
     //
-    // TODO(perf): the append_property / append_variant_segment calls below
-    // validate each element token; if the PATHS decode shows in large-scene
-    // profiles, add a pub(crate) unchecked single-element append for
-    // machine-written crate files.
+    // TODO(perf): the append_child / append_property / append_variant_segment
+    // calls below validate each element token; if the PATHS decode shows in
+    // large-scene profiles, add a pub(crate) unchecked single-element append
+    // for machine-written crate files.
     //
     // TODO(diagnostics): a single malformed element token fails the whole
     // file load. C++ posts an error and skips the unaddressable subtree;
@@ -1758,7 +1757,7 @@ fn build_compressed_paths(
                     // to produce canonical paths like /Prim{set=sel}.
                     parent_path.append_variant_segment(element_token)?
                 } else {
-                    parent_path.append_path(element_token)?
+                    parent_path.append_child(element_token)?
                 };
             }
 

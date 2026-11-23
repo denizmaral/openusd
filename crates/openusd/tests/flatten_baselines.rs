@@ -1,8 +1,13 @@
 //! Flattened stages against the layers C++ flattened.
 //!
-//! `fixtures/usd_flatten2` holds the cases of C++ `testUsdFlatten2`, each a
-//! `root.usda` with the layers it composes and `flat.usda`, the text C++
-//! `UsdStage::ExportToString` wrote for it with no source-file comment.
+//! Each directory of `fixtures/flatten` is a case from the C++ test suite,
+//! the instancing cases of `testUsdFlatten2` and the `flatten` case of
+//! `testUsdValueClips`, or one written for this suite: `ValueClipsBlocked`, a
+//! clip set whose manifest declares an attribute no clip supplies, and
+//! `ValueClipsBlockedDefault`, a gap a blocked manifest default fills. A case
+//! holds a `root.usda` with the layers it composes and `flat.usda`, the text
+//! C++ `UsdStage::ExportToString` wrote for it with no source-file comment
+//! (for a case of this suite's own, run through the C++ Python bindings).
 //! Flattened and written, each root must come out as C++ wrote it.
 
 use std::fs;
@@ -10,9 +15,9 @@ use std::fs;
 use openusd::usd;
 
 #[test]
-fn cpp_flatten2_baselines() {
-    let mut cases: Vec<_> = fs::read_dir("fixtures/usd_flatten2")
-        .expect("fixtures/usd_flatten2")
+fn cpp_flatten_baselines() {
+    let mut cases: Vec<_> = fs::read_dir("fixtures/flatten")
+        .expect("fixtures/flatten")
         .map(|entry| entry.expect("a directory entry").path())
         .filter(|path| path.is_dir())
         .collect();
